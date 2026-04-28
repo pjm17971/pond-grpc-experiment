@@ -1,0 +1,291 @@
+# Frontend time-series with pond-ts
+
+A guide for React developers who want to ingest a stream of events, derive statistics over a moving window, and render the result as a live chart — without writing the data layer from scratch every time.
+
+This guide is structured around a working dashboard ([source](./src)) that streams synthetic per-host CPU/request metrics, computes per-host rolling baselines, flags anomalies against ±σ bands, and renders everything as live line and bar charts. The full app is ~600 lines of TypeScript including markup, layout, and CSS.
+
+The library doing the heavy lifting is [`pond-ts`](https://github.com/pjm17971/pond-ts) (data) and `@pond-ts/react` (React bindings). Charts are rendered with Recharts but the patterns work with any chart library that takes flat row arrays.
+
+---
+
+## What pond-ts is for
+
+**The problem:** real-time dashboards are a collision of three concerns that don't naturally compose:
+
+1. A **push-based data source** — WebSocket, SSE, polling fetch — that doesn't care about React's render cycle.
+2. **Stateful transformations** — rolling averages, percentiles, windowed counts — that need the data in time order with bounded memory.
+3. **Pull-based rendering** — React reads at its own cadence, which is decoupled from the rate of incoming data.
+
+**The model:** pond-ts splits the data layer into two shapes:
+
+- **`LiveSeries`** — a mutable, append-only buffer with a retention policy. Push events into it from anywhere. It enforces ordering and bounds memory.
+- **`TimeSeries`** — an immutable snapshot of a series at a point in time. You query, transform, and render off a snapshot.
+
+The React bindings turn that split into hooks: `useLiveSeries` creates and owns a `LiveSeries`; `useWindow` produces a throttled `TimeSeries` snapshot that updates at most every N milliseconds; everything downstream renders off the snapshot. Push happens on one schedule; render happens on another; the throttle guarantees they don't fight.
+
+If you've used `@tanstack/react-query`, the analogue is roughly: a `LiveSeries` is the cache; a `TimeSeries` is what you get out via `useQuery`; `useWindow` is the subscription.
+
+---
+
+## A two-minute setup
+
+```bash
+npm install pond-ts @pond-ts/react
+```
+
+Declare your event schema as a const so types narrow end-to-end:
+
+```ts
+// In this experiment the schema lives in `packages/shared` so producer,
+// aggregator, and web all bind to the same shape. In a single-package
+// app a local file (e.g. `src/schema.ts`) is fine.
+export const schema = [
+  { name: 'time', kind: 'time' },
+  { name: 'cpu', kind: 'number' },
+  { name: 'requests', kind: 'number' },
+  { name: 'host', kind: 'string' },
+] as const;
+```
+
+Mount a `LiveSeries` and push events:
+
+```tsx
+import { useLiveSeries } from '@pond-ts/react';
+import { schema } from '@pond-experiment/shared';
+
+function MyDashboard() {
+  const [live, snapshot] = useLiveSeries(
+    {
+      name: 'metrics',
+      schema,
+      retention: { maxAge: '6m' },   // bound the buffer to 6 minutes
+    },
+    { throttle: 200 },                // snapshot at most every 200ms
+  );
+
+  // Push events from anywhere — a WebSocket, an interval, a fetch loop.
+  useEffect(() => {
+    const id = setInterval(() => {
+      live.push([new Date(), Math.random(), 100, 'api-1']);
+    }, 500);
+    return () => clearInterval(id);
+  }, [live]);
+
+  return <pre>events seen: {snapshot?.length ?? 0}</pre>;
+}
+```
+
+That's the whole "ingest" half. `live.push(row)` is type-checked against the schema. `snapshot` is a `TimeSeries` (or `null` until the first event arrives) that re-renders the component at most every 200ms regardless of how fast events come in.
+
+---
+
+## Reading: snapshots and current values
+
+Once events are flowing, you have three reading patterns, in increasing order of "I just need a number":
+
+### Windowed snapshot — the chart's source of truth
+
+`useWindow(live, '5m')` returns a `TimeSeries` snapshot of the last 5 minutes, throttled. This is what every chart in the dashboard reads from:
+
+```tsx
+const timeSeries = useWindow(live, '5m', { throttle: 200 });
+// timeSeries: TimeSeries<S> | null
+```
+
+`TimeSeries` is immutable. You can call `.filter`, `.smooth`, `.aggregate`, `.partitionBy`, etc. on it without affecting the live buffer. Every chart in the dashboard is a chain of pure transforms off this snapshot.
+
+### `useCurrent` — one value at a time
+
+When you only want the *current* value of a reduction (a stat card, a header number), `useCurrent` is the lighter primitive:
+
+```tsx
+// Last-minute average CPU across all hosts:
+const { cpu: rollingCpu } = useCurrent(
+  live,
+  { cpu: 'avg' },
+  { tail: '1m', throttle: 200 },
+);
+// rollingCpu: number | undefined
+```
+
+The `tail` option restricts the reduction to a trailing window; omit it for whole-buffer roll-ups. The return type is narrowed per reducer — `'avg'` gives `number`, `'unique'` gives `ReadonlyArray<string>` — so no casts.
+
+`useCurrent` is also reference-stable: when the underlying values don't change between snapshots, you get back the same object reference. Downstream `useMemo` keyed on the result only re-runs when the values actually change.
+
+### Direct queries on a snapshot
+
+For arbitrary work, just operate on the `TimeSeries`:
+
+```tsx
+const lastEventCpu = timeSeries?.last()?.get('cpu');
+const recentArray = timeSeries?.toArray().slice(-20);   // last 20 events
+const filtered = timeSeries?.filter((e) => e.get('cpu') > 0.7);
+```
+
+`event.get('cpu')` is typed by the schema — `number | undefined` here. `e.key().timestampMs()` gives the millisecond timestamp.
+
+---
+
+## Per-host (or per-anything) computation
+
+Almost every real dashboard has a categorical column — host, region, user, channel — and most stateful operations (`rolling`, `smooth`, `fill`, `baseline`) silently cross category boundaries unless you scope them. `pond-ts` handles this with `partitionBy`:
+
+```ts
+// Per-host rolling 1-min average + standard deviation, in one pass:
+const perHostBaselines = timeSeries
+  .partitionBy('host')
+  .baseline('cpu', { window: '1m', sigma: 2 })   // appends avg/sd/upper/lower per row
+  .toMap((g) => g.toPoints());
+// Map<host, Array<{ ts, cpu, requests, avg, sd, upper, lower }>>
+```
+
+This is the workhorse pattern in the dashboard's CPU section ([useDashboardData.ts](./src/useDashboardData.ts) step 7). Three things to notice:
+
+1. **`partitionBy` keeps the rolling baseline scoped per host.** Without it, `baseline('cpu', { window: '1m' })` would average across hosts in the window — silently wrong, easy to miss in dev, broken at the visualization layer.
+2. **`baseline` is one rolling pass that produces four columns** (`avg`, `sd`, `upper`, `lower`) on every event. The bands and the outlier predicate read from the same row data; no second rolling pass.
+3. **`toMap(g => g.toPoints())` returns wide-row arrays** — `[{ ts, cpu, avg, upper, lower, ... }]` — one per host, ready for a chart library to consume. (Earlier pond versions used `.collect().groupBy(col, fn)` for the same shape; on v0.10+ prefer `toMap` — it skips the unified-buffer round-trip.)
+
+### Anomaly detection falls out for free
+
+Once you have the baseline columns on each row, an outlier is just a comparison:
+
+```ts
+for (const r of rows) {
+  if (r.cpu != null && r.upper != null && r.lower != null
+      && (r.cpu > r.upper || r.cpu < r.lower)) {
+    anomalies.push({ ts: r.ts, value: r.cpu });
+  }
+}
+```
+
+The dashboard renders these as red dots overlaid on the chart and as 15-second buckets on a bar chart underneath. Both views use the same `anomalies` array — the bar chart goes through `TimeSeries.fromPoints` and `aggregate(Sequence.every('15s'), { value: 'count' })` to bucket them.
+
+### Filter then derive vs. derive then filter
+
+You'll sometimes want to compute a transform across all events but display only some of them. Two rules:
+
+- **Filter on the snapshot when the predicate depends on React state** (a user toggle, a slider value). Filtering a `TimeSeries` is cheap — it's just an array walk — and avoids tearing down LiveView subscriptions.
+- **Filter on the live source when the predicate is stable and you want incremental maintenance.** A live `live.filter(...)` view processes each event once as it arrives instead of re-scanning the whole snapshot every render.
+
+The dashboard does both: enabled-host filtering happens on the snapshot (depends on state); per-host CPU-rate views in earlier versions of the code used `live.filter('host', cb).cumulative.rate` because the predicate was stable.
+
+---
+
+## Bridging to chart libraries
+
+`pond-ts` deliberately doesn't ship charts — the rendering is yours. The bridge surface is two methods:
+
+### `toPoints()` — long → wide
+
+```ts
+const data = timeSeries.toPoints();
+// Array<{ ts: number, cpu: number | undefined, requests: number | undefined, host: string | undefined }>
+```
+
+This is the universal shape mainstream chart libraries accept directly. Recharts uses it as `data={data}`; Observable Plot accepts it as `marks=[Plot.line(data, {x: 'ts', y: 'cpu'})]`; visx uses `data` plus accessor functions.
+
+For per-column extraction, compose with `select`:
+
+```ts
+const cpuPoints = timeSeries.select('cpu').toPoints();
+// Array<{ ts, cpu }>
+```
+
+### `fromPoints` — wide → TimeSeries
+
+The inverse, useful when you've built up an array of derived points and want to feed them back through pond's transforms:
+
+```ts
+const anomalyTs = TimeSeries.fromPoints(anomalies, {
+  name: 'anomalies',
+  schema: [
+    { name: 'time', kind: 'time' },
+    { name: 'value', kind: 'number' },
+  ] as const,
+});
+const buckets = anomalyTs.aggregate(Sequence.every('15s'), { value: 'count' });
+```
+
+The dashboard uses this for the anomaly bar chart — collect points, round-trip through a tiny TimeSeries, bucket via pond rather than hand-rolling the bucket loop.
+
+### A note on chart libraries and live data
+
+Most charting libraries default to animated transitions when their `data` prop changes. For live data ticking every 200ms, that's a constant flicker. You'll want to disable animations everywhere:
+
+```tsx
+<Line ... isAnimationActive={false} />
+<Bar ... isAnimationActive={false} />
+<Area ... isAnimationActive={false} />
+```
+
+Recharts defaults to wide-row data in a single `data` prop — exactly what `toPoints()` produces. For multi-series charts where each series comes from a different transform (e.g., per-host CPU lines + a baseline line + anomaly dots), you have two options:
+
+- **Wide rows** — merge per-host data into one wide array with prefixed keys (`api-1_cpu`, `api-2_cpu`, …). One `<Line>` per key. Works if all series share timestamps.
+- **Separate `data` props per `<Line>` / `<Area>` / `<Scatter>`** — Recharts allows each series to override `data`. Better when timestamps don't align (e.g., anomaly dots are sparse).
+
+The dashboard mixes both. See [`Chart.tsx`](./src/Chart.tsx) for the merge-and-render logic.
+
+---
+
+## Other patterns the dashboard demonstrates
+
+Skim these by section if you want to see how a specific bit is wired:
+
+- **Eviction tracking** — `live.on('evict', cb)` fires when retention kicks in. Used as a counter in the page summary. ([useDashboardData.ts](./src/useDashboardData.ts), step 2)
+- **Static reference series** — `useTimeSeries({ schema, rows })` mounts a fixed two-row series for the 70% threshold line. Demonstrates the static-data path. (step 9)
+- **Multi-reducer rollups** — `useCurrent(live, { requests: 'sum', cpu: 'avg' })` — a single subscription, multiple reductions, reference-stable return. (step 5)
+- **Bucketed counts** — `aggregate(Sequence.every('15s'), { col: 'count' })` for the alert/anomaly bar chart. (step 12)
+- **Smooth + slice for warmup** — EMA smoothing with `.slice(12)` to drop the warmup samples that haven't fully converged yet. (step 13)
+- **`partitionBy(...).toMap(transform)`** — when you want per-host *snapshots* rather than a fan-in, this returns `Map<group, R>` directly. The same pattern shows up in the CPU section (step 7) and the requests section (step 13).
+
+---
+
+## What you don't need pond-ts for
+
+To set expectations: pond's job ends at producing chart-ready data. You still pick:
+
+- **A chart library.** Recharts, Observable Plot, visx, ECharts, raw SVG — pond is agnostic.
+- **A wire format.** WebSocket / SSE / fetch / gRPC — pond is the receiver, not the transport.
+- **A layout / styling system.** `useLiveSeries` mounts in any React tree.
+- **State management.** Pond is the data layer for *time-series* data; user preferences, route state, etc. stay in `useState`/`zustand`/whatever you're already using.
+
+If your "real-time" data is one number that updates every second, pond is overkill — `useState` + `setInterval` is fine. Pond starts paying off at the point where you have *a stream*, *transforms*, and *charts*: any two of those drag in a third.
+
+---
+
+## Reading order for this codebase
+
+If you want to learn the patterns by reading code, in order:
+
+1. **[`packages/shared/src/schema.ts`](../shared/src/schema.ts)** — the event schema and the threshold-line schema. Lives in `@pond-experiment/shared` so producer/aggregator/web all bind to the same column shape. The whole app hangs off the `schema` const.
+2. **[`dashboardSchema.ts`](./src/dashboardSchema.ts)** — dashboard-local constants: host pool, palette, window size, threshold value.
+3. **[`useSimulator.ts`](./src/useSimulator.ts)** — how data gets into the LiveSeries. In your app this would be a WebSocket or fetch loop.
+4. **[`useDashboardData.ts`](./src/useDashboardData.ts)** — the entire pond pipeline. Numbered steps follow the data flow top to bottom.
+5. **[`Dashboard.tsx`](./src/Dashboard.tsx)** — pure layout shell. Pulls UI state, calls the hooks, hands data to sections.
+6. **[`sections/`](./src/sections)** — section components. Each is ~50 lines of JSX over the data hook's output.
+7. **[`Chart.tsx`](./src/Chart.tsx)** + **[`BarChart.tsx`](./src/BarChart.tsx)** — Recharts wrappers. The bridge layer; pond-agnostic past the `toPoints()` call.
+
+---
+
+## Running it
+
+```bash
+npm install
+npm run dev
+```
+
+Open the preview, watch numbers move. Slide events/sec to 10 and variability to ±0.6 to see the band/anomaly machinery work harder. Toggle host chips to scope the entire chart suite. Switch between threshold mode and anomaly mode (the bands checkbox) to see two completely different shapes of "what's wrong" emerge from the same data.
+
+---
+
+## When to reach for pond, summarized
+
+| Situation | Use pond? |
+|---|---|
+| Single value, occasional update | No, `useState` is fine |
+| Polled fetch, render the response | No, `useQuery` is fine |
+| **Stream of events with transforms (rolling avg, percentiles, anomalies) feeding charts** | **Yes** |
+| Stream of events with no transforms (just plot raw values) | Optional — pond's snapshot+throttle still helps but you could roll your own |
+| You're already using `react-timeseries-charts` (the predecessor) | Yes, this is the rewrite |
+
+The library's whole pitch is the second-to-last row. If that's your shape, it'll save you most of the data-layer code you'd otherwise hand-roll, and the result will compose with whatever chart library you bring.

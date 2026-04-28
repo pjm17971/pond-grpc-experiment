@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        ". ~/.nvm/nvm.sh && nvm use 22 --silent && pnpm dev:web"
+      ],
+      "port": 5173
+    }
+  ]
+}

@@ -1,0 +1,326 @@
+.app {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+}
+
+.chart svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+header h1 {
+  margin: 0 0 1.5rem;
+  font-size: 2rem;
+}
+
+.dashboard h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  opacity: 0.7;
+  font-weight: 600;
+}
+
+/* ── Simulator controls ───────────────────────────────── */
+.sim-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.25rem;
+  align-items: center;
+  padding: 0.6rem 0.9rem;
+  margin-bottom: 1rem;
+  border: 1px dashed rgba(127, 127, 127, 0.28);
+  border-radius: 8px;
+  background: rgba(76, 139, 245, 0.04);
+}
+
+.sim-control {
+  display: inline-flex;
+  gap: 0.5rem;
+  align-items: center;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.sim-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.65;
+  min-width: 5.2rem;
+}
+
+.sim-control input[type='range'] {
+  flex: 0 0 120px;
+  accent-color: #4c8bf5;
+  cursor: pointer;
+}
+
+.sim-value {
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  min-width: 2.5rem;
+}
+
+/* ── Page summary bar ─────────────────────────────────── */
+.page-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 0.6rem;
+  margin-bottom: 1rem;
+}
+
+/* ── Host toggle chips ────────────────────────────────── */
+.host-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+  margin-bottom: 1.5rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid rgba(127, 127, 127, 0.18);
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.03);
+}
+
+.toggles-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  opacity: 0.55;
+  margin-right: 0.25rem;
+}
+
+.host-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.65rem;
+  border: 2px solid;
+  border-radius: 999px;
+  background: transparent;
+  font-size: 0.8rem;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.host-chip.off {
+  border-color: rgba(127, 127, 127, 0.35) !important;
+  color: rgba(127, 127, 127, 0.6) !important;
+  opacity: 0.65;
+  text-decoration: line-through;
+}
+
+.host-chip .dot {
+  border: 1px solid currentColor;
+}
+
+/* ── Sections ─────────────────────────────────────────── */
+.metric-section,
+.logs-section {
+  margin-bottom: 2rem;
+}
+
+.section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.section-header h2 {
+  margin: 0;
+}
+
+.section-stats {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.section-note {
+  font-size: 0.75rem;
+  opacity: 0.55;
+}
+
+.section-charts {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+/* ── Stat cards ───────────────────────────────────────── */
+.stat {
+  padding: 0.9rem 1rem;
+  border: 1px solid rgba(127, 127, 127, 0.25);
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.06);
+  min-width: 120px;
+}
+
+.stat-sm {
+  padding: 0.5rem 0.75rem;
+}
+
+.stat-sm .stat-value {
+  font-size: 1.1rem;
+}
+
+.stat-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.7;
+  margin-bottom: 0.25rem;
+}
+
+.stat-value {
+  font-size: 1.4rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Chart base ───────────────────────────────────────── */
+.chart {
+  border: 1px solid rgba(127, 127, 127, 0.25);
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.04);
+  padding: 0.75rem;
+}
+
+.chart-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.85rem;
+  margin-bottom: 0.25rem;
+}
+
+.chart-title {
+  font-weight: 600;
+}
+
+.chart-legend {
+  display: inline-flex;
+  gap: 0.6rem;
+  align-items: center;
+  opacity: 0.85;
+  font-size: 0.75rem;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+}
+
+.legend-stat {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+  margin-left: 0.15rem;
+}
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 3px;
+  vertical-align: middle;
+}
+
+.bar-alert {
+  fill: #e23b3b;
+  opacity: 0.85;
+}
+
+.chart-toggles {
+  display: flex;
+  gap: 1rem;
+  padding: 0 0.25rem;
+  font-size: 0.8rem;
+  opacity: 0.8;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.toggle input {
+  cursor: pointer;
+}
+
+.sigma-slider {
+  flex: 0 0 140px;
+  accent-color: #4c8bf5;
+  cursor: pointer;
+}
+
+.sigma-slider:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.chart-grid {
+  stroke: rgba(127, 127, 127, 0.2);
+  stroke-dasharray: 2 3;
+}
+
+.chart-axis {
+  stroke: rgba(127, 127, 127, 0.55);
+  stroke-width: 1;
+}
+
+.chart-tick {
+  font-size: 10px;
+  fill: currentColor;
+  opacity: 0.6;
+}
+
+.chart-empty {
+  fill: currentColor;
+  opacity: 0.5;
+  font-size: 12px;
+}
+
+/* ── Logs table ───────────────────────────────────────── */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85rem;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid rgba(127, 127, 127, 0.15);
+}
+
+th {
+  font-size: 0.7rem;
+  opacity: 0.55;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.host-pill {
+  display: inline-block;
+  padding: 0.1rem 0.45rem;
+  border: 1px solid;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
