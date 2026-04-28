@@ -32,18 +32,25 @@ export function startSimulator(
   const id = setInterval(() => {
     const baseT = Date.now();
     const n = Math.min(opts.hostCount, HOSTS.length);
+    // Stagger per-host timestamps inside the tick so same-tick events
+    // don't share a time key (pond's `count` collapses same-ts events,
+    // friction-noted). Cap the per-host slot at `tickMs / n` so the
+    // last host's offset stays inside (baseT, baseT + tickMs) and
+    // can't bleed into the next tick.
+    //
+    // At M3-territory rates (eventsPerSec >> 100) the slot rounds
+    // down to 0 and we re-clamp to 1ms, at which point overlapping
+    // ticks become unavoidable at ms resolution. M3 will need a
+    // proper sub-ms path (Time instances or microsecond counters).
+    const slotMs = Math.max(1, Math.floor(tickMs / Math.max(n, 1)));
     for (let i = 0; i < n; i++) {
       const mean = HOST_MEANS[i % HOST_MEANS.length];
       const cpu = Math.max(
         0,
         Math.min(1, mean + (Math.random() - 0.5) * opts.variability),
       );
-      // Stagger per-host timestamps within a tick by 1ms each so
-      // same-tick events don't collide on the LiveSeries' time key.
-      // Friction note: pond's `count` collapsed same-ts events,
-      // making EVENT RATE under-report by hostCount.
       live.push([
-        new Date(baseT + i),
+        new Date(baseT + i * slotMs),
         cpu,
         Math.floor(Math.random() * 200),
         HOSTS[i],

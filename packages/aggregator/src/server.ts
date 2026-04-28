@@ -1,4 +1,4 @@
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify from 'fastify';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { type LiveSeries } from 'pond-ts';
 import { encode, type Schema } from '@pond-experiment/shared';
@@ -12,10 +12,6 @@ export type ServerOptions = {
 };
 
 export type RunningServer = {
-  fastify: FastifyInstance;
-  wss: WebSocketServer;
-  /** Open WS clients. Exposed for tests. */
-  clients: Set<WebSocket>;
   stop: () => Promise<void>;
 };
 
@@ -51,9 +47,6 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   });
 
   return {
-    fastify,
-    wss,
-    clients,
     stop: async () => {
       stopFanout();
       for (const c of clients) c.close();
