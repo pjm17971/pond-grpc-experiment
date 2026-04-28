@@ -20,7 +20,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   useCurrent,
-  useLiveSeries,
   useTimeSeries,
   useWindow,
 } from '@pond-ts/react';
@@ -37,13 +36,15 @@ import {
   type ChartSeries,
 } from './Chart';
 import { type Bar } from './BarChart';
-import { baselineSchema, schema } from '@pond-experiment/shared';
+import { HOSTS, baselineSchema, schema } from '@pond-experiment/shared';
 import {
   HIGH_CPU_THRESHOLD,
-  HOSTS,
   PALETTE,
   WINDOW_MS,
 } from './dashboardSchema';
+import { useRemoteLiveSeries } from './useRemoteLiveSeries';
+
+const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8080/live';
 
 export type ChartOpts = {
   /** Toggle between threshold mode (off) and anomaly mode (on). */
@@ -52,8 +53,6 @@ export type ChartOpts = {
   showRaw: boolean;
   /** Band width in standard deviations. */
   sigma: number;
-  /** Tick rate of the simulator — used to convert per-event request counts to req/sec. */
-  eventsPerSec: number;
 };
 
 export type DashboardArgs = {
@@ -68,6 +67,7 @@ export type DashboardData = {
   // basic counters
   totalEvents: number;
   totalRequests: number | undefined;
+  eventsPerSec: number | undefined;
   evictedTotal: number;
 
   // host model
@@ -99,12 +99,16 @@ export type DashboardData = {
 
 export function useDashboardData(args: DashboardArgs): DashboardData {
   const { hostCount, disabledHosts, chartOpts } = args;
-  const { showBands, showRaw, sigma, eventsPerSec } = chartOpts;
+  const { showBands, showRaw, sigma } = chartOpts;
 
-  // 1. LiveSeries — the single mutable buffer for ingest.
-  //    Retention by time so the windowed snapshot below has at least
-  //    its full window of data after a fresh page load.
-  const [liveSeries, snapshot] = useLiveSeries(
+  // 1. LiveSeries — the single mutable buffer for ingest. Identical
+  //    in shape to the M0 useLiveSeries call; the difference is the
+  //    source of events: useRemoteLiveSeries opens a WebSocket to the
+  //    aggregator, ingests the snapshot frame, then push()es each
+  //    append frame. Same retention so client and aggregator drop the
+  //    same rows at the same moment.
+  const [liveSeries, snapshot] = useRemoteLiveSeries(
+    WS_URL,
     {
       name: 'metrics',
       schema,
@@ -145,11 +149,22 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
 
   // 5. Whole-source rollups (computed live, not from the window).
   //    `useCurrent` is sugar for `useSnapshot(src).tail(t).reduce(map)`.
+  //    Event rate is the trailing 1-minute count of any non-null
+  //    column divided by 60. Picking `cpu` is arbitrary — pond's
+  //    `count` reducer needs a column to count non-null values of.
+  //    A column-free `count` would feel cleaner (friction note).
   const { requests: totalRequests } = useCurrent(
     liveSeries,
     { requests: 'sum' },
     { throttle: 500 },
   );
+  const { cpu: lastMinuteCount } = useCurrent(
+    liveSeries,
+    { cpu: 'count' },
+    { tail: '1m', throttle: 500 },
+  );
+  const eventsPerSec =
+    lastMinuteCount != null ? lastMinuteCount / 60 : undefined;
   const { cpu: rollingCpu } = useCurrent(
     liveSeries,
     { cpu: 'avg' },
@@ -353,7 +368,10 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //     produce the per-host smoothed points and the per-host scalar avg.
   const reqSeries = useMemo<ChartSeries[]>(() => {
     if (!timeSeries) return [];
-    const eps = eventsPerSec;
+    // eps is the measured event rate (events/sec). Pre-1m, the rolling
+    // count is undefined; fall back to 0 so the chart renders flat
+    // (rather than NaN) during the warm-up.
+    const eps = eventsPerSec ?? 0;
     const perHostSmooth = timeSeries
       .partitionBy('host')
       .smooth('requests', 'ema', { alpha: 0.25 })
@@ -394,6 +412,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     liveSeries,
     totalEvents: snapshot?.length ?? 0,
     totalRequests,
+    eventsPerSec,
     evictedTotal,
     hosts,
     enabledHosts,

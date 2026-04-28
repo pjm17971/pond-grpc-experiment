@@ -16,6 +16,8 @@ export const schema = [
   { name: 'host', kind: 'string' },
 ] as const satisfies SeriesSchema;
 
+export type Schema = typeof schema;
+
 /**
  * Two-column schema for the static threshold line. Used with
  * `useTimeSeries` to mount a fixed series the chart overlays in

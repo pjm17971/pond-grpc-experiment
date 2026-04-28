@@ -3,19 +3,19 @@ import { Stat } from '../Stat';
 type Props = {
   totalEvents: number;
   hostCount: number;
-  totalRequests: number | undefined;
+  eventsPerSec: number | undefined;
   evictedTotal: number;
 };
 
 /**
- * The top row of small stat cards. Numbers are computed across the
- * full live series (not the visible window), so "Total events" reflects
- * everything pond is currently buffering.
+ * The top row of small stat cards. Counters cover everything pond is
+ * currently buffering. Event rate is the trailing 1-minute count
+ * divided by 60.
  */
 export function PageSummary({
   totalEvents,
   hostCount,
-  totalRequests,
+  eventsPerSec,
   evictedTotal,
 }: Props) {
   return (
@@ -23,8 +23,8 @@ export function PageSummary({
       <Stat label="Total events" value={totalEvents} size="sm" />
       <Stat label="Hosts" value={hostCount} size="sm" />
       <Stat
-        label="Total requests"
-        value={totalRequests != null ? totalRequests.toLocaleString() : '—'}
+        label="Event rate"
+        value={eventsPerSec != null ? `${eventsPerSec.toFixed(1)}/s` : '—'}
         size="sm"
       />
       <Stat label="Evicted" value={evictedTotal} size="sm" />

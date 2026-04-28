@@ -1,35 +1,13 @@
 /**
- * Dashboard-local constants. The event `schema` and `baselineSchema`
- * have moved to `@pond-experiment/shared` so producer, aggregator, and
- * web all bind to the same column shape.
+ * Dashboard-local constants. The event `schema`, `baselineSchema`, and
+ * `HOSTS` have moved to `@pond-experiment/shared` so producer,
+ * aggregator, and web all bind to the same domain. Per-host CPU means
+ * are simulator-internal and live with whichever package runs the
+ * simulator (M1: aggregator).
  */
 
 /** Visible time axis for every chart in the dashboard. */
 export const WINDOW_MS = 5 * 60 * 1000;
-
-/**
- * Closed host pool. Declaring as `as const` gives downstream
- * `pivotByGroup`/`partitionBy` type inference a fixed set to work with;
- * the simulator slices by `hostCount` for the active subset.
- */
-export const HOSTS = [
-  'api-1',
-  'api-2',
-  'api-3',
-  'api-4',
-  'api-5',
-  'api-6',
-  'api-7',
-  'api-8',
-] as const;
-
-/**
- * Per-host CPU mean. Each host gets a distinct baseline so the chart
- * shows separable lines under bands.
- */
-export const HOST_MEANS: readonly number[] = [
-  0.55, 0.45, 0.65, 0.5, 0.6, 0.4, 0.7, 0.35,
-];
 
 /** Chart line/band colours. Indexed by host position in `HOSTS`. */
 export const PALETTE = [
