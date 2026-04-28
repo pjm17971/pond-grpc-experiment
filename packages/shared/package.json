@@ -10,5 +10,8 @@
   },
   "scripts": {
     "typecheck": "tsc -b"
+  },
+  "devDependencies": {
+    "pond-ts": "^0.11.3"
   }
 }
