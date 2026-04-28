@@ -12,3 +12,7 @@ coverage/
 .env
 .env.local
 .env.*.local
+
+# Claude Code per-developer state — keep launch.json so any agent can preview-start the dev server.
+.claude/*
+!.claude/launch.json

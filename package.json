@@ -1,0 +1,18 @@
+{
+  "name": "pond-grpc-experiment",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Real-ish three-tier (gRPC → aggregator → React) experiment for pond-ts. See PLAN.md.",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@8.10.2",
+  "scripts": {
+    "typecheck": "tsc -b",
+    "dev:web": "pnpm --filter @pond-experiment/web dev",
+    "build:web": "pnpm --filter @pond-experiment/web build"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.2"
+  }
+}
