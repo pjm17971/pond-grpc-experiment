@@ -36,7 +36,9 @@ npm install pond-ts @pond-ts/react
 Declare your event schema as a const so types narrow end-to-end:
 
 ```ts
-// src/dashboardSchema.ts
+// In this experiment the schema lives in `packages/shared` so producer,
+// aggregator, and web all bind to the same shape. In a single-package
+// app a local file (e.g. `src/schema.ts`) is fine.
 export const schema = [
   { name: 'time', kind: 'time' },
   { name: 'cpu', kind: 'number' },
@@ -49,7 +51,7 @@ Mount a `LiveSeries` and push events:
 
 ```tsx
 import { useLiveSeries } from '@pond-ts/react';
-import { schema } from './dashboardSchema';
+import { schema } from '@pond-experiment/shared';
 
 function MyDashboard() {
   const [live, snapshot] = useLiveSeries(
@@ -255,12 +257,13 @@ If your "real-time" data is one number that updates every second, pond is overki
 
 If you want to learn the patterns by reading code, in order:
 
-1. **[`dashboardSchema.ts`](./src/dashboardSchema.ts)** — the schema, the host pool, the constants. The whole app hangs off the `schema` const.
-2. **[`useSimulator.ts`](./src/useSimulator.ts)** — how data gets into the LiveSeries. In your app this would be a WebSocket or fetch loop.
-3. **[`useDashboardData.ts`](./src/useDashboardData.ts)** — the entire pond pipeline. Numbered steps follow the data flow top to bottom.
-4. **[`Dashboard.tsx`](./src/Dashboard.tsx)** — pure layout shell. Pulls UI state, calls the hooks, hands data to sections.
-5. **[`sections/`](./src/sections)** — section components. Each is ~50 lines of JSX over the data hook's output.
-6. **[`Chart.tsx`](./src/Chart.tsx)** + **[`BarChart.tsx`](./src/BarChart.tsx)** — Recharts wrappers. The bridge layer; pond-agnostic past the `toPoints()` call.
+1. **[`packages/shared/src/schema.ts`](../shared/src/schema.ts)** — the event schema and the threshold-line schema. Lives in `@pond-experiment/shared` so producer/aggregator/web all bind to the same column shape. The whole app hangs off the `schema` const.
+2. **[`dashboardSchema.ts`](./src/dashboardSchema.ts)** — dashboard-local constants: host pool, palette, window size, threshold value.
+3. **[`useSimulator.ts`](./src/useSimulator.ts)** — how data gets into the LiveSeries. In your app this would be a WebSocket or fetch loop.
+4. **[`useDashboardData.ts`](./src/useDashboardData.ts)** — the entire pond pipeline. Numbered steps follow the data flow top to bottom.
+5. **[`Dashboard.tsx`](./src/Dashboard.tsx)** — pure layout shell. Pulls UI state, calls the hooks, hands data to sections.
+6. **[`sections/`](./src/sections)** — section components. Each is ~50 lines of JSX over the data hook's output.
+7. **[`Chart.tsx`](./src/Chart.tsx)** + **[`BarChart.tsx`](./src/BarChart.tsx)** — Recharts wrappers. The bridge layer; pond-agnostic past the `toPoints()` call.
 
 ---
 

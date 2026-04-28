@@ -13,7 +13,6 @@
     "verbatimModuleSyntax": true,
     "declaration": true,
     "declarationMap": true,
-    "sourceMap": true,
     "composite": true,
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.tsbuildinfo",
     "outDir": "./dist",
