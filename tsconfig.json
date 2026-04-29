@@ -4,6 +4,7 @@
     { "path": "./packages/shared" },
     { "path": "./packages/producer" },
     { "path": "./packages/aggregator" },
+    { "path": "./packages/e2e" },
     { "path": "./packages/web/tsconfig.app.json" },
     { "path": "./packages/web/tsconfig.node.json" }
   ]
