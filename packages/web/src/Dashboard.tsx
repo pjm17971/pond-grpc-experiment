@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { HOSTS } from '@pond-experiment/shared';
 import { CpuSection } from './sections/CpuSection';
 import { HostToggles } from './sections/HostToggles';
 import { LogsSection } from './sections/LogsSection';
@@ -16,14 +17,11 @@ import { useDashboardData } from './useDashboardData';
  *   useDashboardData   → opens WS to aggregator, mirrors its LiveSeries
  *   data hook output   → section components
  *
- * The simulator-control sliders that owned `eventsPerSec`/`hostCount`/
- * `variability` in M0 are gone — the aggregator owns those now.
- * `eventsPerSec` is now measured from the data itself; `hostCount` is
- * pinned to the aggregator's default until M2's HTTP control endpoint
- * lets us recover dynamic discovery.
+ * The M0 simulator-control sliders are gone — the aggregator owns
+ * rate/host count now. Hosts populate via live discovery (pond's
+ * `unique` aggregator over the `host` column), so the dashboard
+ * adapts automatically to whatever subset the aggregator runs.
  */
-const AGGREGATOR_HOST_COUNT = 4;
-
 export function Dashboard() {
   const [chartOpts, setChartOpts] = useState<ChartOpts>({
     showBands: true,
@@ -35,19 +33,15 @@ export function Dashboard() {
     sigma: 2,
   });
   // The set of hosts the user has explicitly disabled. Hosts default
-  // to enabled; toggling adds/removes from this set.
-  const [disabledHosts, setDisabledHosts] = useState<Set<string>>(() => {
-    // Initial: only the first host enabled, the rest disabled. Keeps
-    // the chart readable while the band/raw toggles are exercised.
-    const all = ['api-1', 'api-2', 'api-3', 'api-4', 'api-5', 'api-6', 'api-7', 'api-8'];
-    return new Set(all.slice(1));
-  });
+  // to enabled; toggling adds/removes from this set. Hosts beyond
+  // `api-1` start disabled so the chart stays readable while the
+  // band/raw toggles are exercised — once a user toggles them on,
+  // the entry stays out of `disabledHosts`.
+  const [disabledHosts, setDisabledHosts] = useState<Set<string>>(
+    () => new Set(HOSTS.slice(1)),
+  );
 
-  const data = useDashboardData({
-    hostCount: AGGREGATOR_HOST_COUNT,
-    disabledHosts,
-    chartOpts,
-  });
+  const data = useDashboardData({ disabledHosts, chartOpts });
 
   const onToggleHost = (host: string) => {
     setDisabledHosts((prev) => {
@@ -65,6 +59,7 @@ export function Dashboard() {
         hostCount={data.hosts.length}
         eventsPerSec={data.eventsPerSec}
         evictedTotal={data.evictedTotal}
+        connectionStatus={data.connectionStatus}
       />
       <HostToggles
         hosts={data.hosts}

@@ -42,7 +42,10 @@ import {
   PALETTE,
   WINDOW_MS,
 } from './dashboardSchema';
-import { useRemoteLiveSeries } from './useRemoteLiveSeries';
+import {
+  useRemoteLiveSeries,
+  type ConnectionStatus,
+} from './useRemoteLiveSeries';
 
 const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8080/live';
 
@@ -56,7 +59,6 @@ export type ChartOpts = {
 };
 
 export type DashboardArgs = {
-  hostCount: number;
   disabledHosts: Set<string>;
   chartOpts: ChartOpts;
 };
@@ -74,6 +76,9 @@ export type DashboardData = {
   hosts: readonly string[];
   enabledHosts: Set<string>;
   hostColors: Record<string, string>;
+
+  // connection state
+  connectionStatus: ConnectionStatus;
 
   // CPU section
   rollingCpu: number | undefined;
@@ -98,7 +103,7 @@ export type DashboardData = {
 };
 
 export function useDashboardData(args: DashboardArgs): DashboardData {
-  const { hostCount, disabledHosts, chartOpts } = args;
+  const { disabledHosts, chartOpts } = args;
   const { showBands, showRaw, sigma } = chartOpts;
 
   // 1. LiveSeries — the single mutable buffer for ingest. Identical
@@ -106,8 +111,10 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //    source of events: useRemoteLiveSeries opens a WebSocket to the
   //    aggregator, ingests the snapshot frame, then push()es each
   //    append frame. Same retention so client and aggregator drop the
-  //    same rows at the same moment.
-  const [liveSeries, snapshot] = useRemoteLiveSeries(
+  //    same rows at the same moment. The third tuple slot is the
+  //    WS lifecycle status — surfaces in the page summary as a
+  //    connection indicator.
+  const [liveSeries, snapshot, connectionStatus] = useRemoteLiveSeries(
     WS_URL,
     {
       name: 'metrics',
@@ -130,12 +137,22 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //    we can chain transforms on without worrying about live mutation.
   const timeSeries = useWindow(liveSeries, '5m', { throttle: 200 });
 
-  // 4. Host model: active slice (from the simulator's hostCount) and
-  //    the user-toggled enabled set.
-  const hosts = useMemo(
-    () => HOSTS.slice(0, hostCount) as readonly string[],
-    [hostCount],
+  // 4. Host model: discovered live from the data via the `unique`
+  //    aggregator over the `host` column. Filtered through HOSTS so
+  //    the canonical declaration order drives palette assignment —
+  //    a host's color stays the same whatever order the data
+  //    arrives in. Hosts not in HOSTS won't render until added
+  //    there (M2's real producer may force this).
+  const { host: discoveredHosts } = useCurrent(
+    liveSeries,
+    { host: 'unique' },
+    { throttle: 500 },
   );
+  const hosts = useMemo(() => {
+    if (!discoveredHosts || discoveredHosts.length === 0) return [];
+    const seen = new Set(discoveredHosts);
+    return HOSTS.filter((h) => seen.has(h));
+  }, [discoveredHosts]);
   const enabledHosts = useMemo(() => {
     const set = new Set<string>();
     for (const h of hosts) if (!disabledHosts.has(h)) set.add(h);
@@ -143,9 +160,9 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   }, [hosts, disabledHosts]);
   const hostColors = useMemo(() => {
     const map: Record<string, string> = {};
-    hosts.forEach((h, i) => (map[h] = PALETTE[i % PALETTE.length]));
+    HOSTS.forEach((h, i) => (map[h] = PALETTE[i % PALETTE.length]));
     return map;
-  }, [hosts]);
+  }, []);
 
   // 5. Whole-source rollups (computed live, not from the window).
   //    `useCurrent` is sugar for `useSnapshot(src).tail(t).reduce(map)`.
@@ -414,6 +431,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     totalRequests,
     eventsPerSec,
     evictedTotal,
+    connectionStatus,
     hosts,
     enabledHosts,
     hostColors,

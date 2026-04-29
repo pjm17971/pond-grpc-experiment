@@ -10,6 +10,28 @@ import { decode, type Schema, type WireMsg } from '@pond-experiment/shared';
 const RECONNECT_DELAY_MS = 1000;
 
 /**
+ * Lifecycle of the WebSocket-backed mirror.
+ *
+ * - `connecting` — initial mount, before the first `open`.
+ * - `connected` — after `open`, ingesting frames.
+ * - `reconnecting` — server dropped us; waiting on the backoff
+ *   timer or an in-flight reopen.
+ * - `closed` — hook unmounted (terminal). The `LiveSeries` itself
+ *   keeps its data but no new frames will arrive.
+ *
+ * Friction note for the eventual `@pond-ts/react` shape: a
+ * generic `useRemoteLiveSeries` should expose this as a third
+ * tuple slot so dashboards can show a connection indicator
+ * without a parallel `useWebSocketStatus(url)` hook (which would
+ * open a second socket).
+ */
+export type ConnectionStatus =
+  | 'connecting'
+  | 'connected'
+  | 'reconnecting'
+  | 'closed';
+
+/**
  * Apply a snapshot or append frame to the local `LiveSeries`. Pulled
  * out as a pure function so it can be unit-tested without spinning
  * up a React tree or a real WebSocket.
@@ -46,21 +68,29 @@ export function useRemoteLiveSeries(
   url: string,
   options: LiveSeriesOptions<Schema>,
   hookOptions?: UseSnapshotOptions,
-): [LiveSeries<Schema>, TimeSeries<Schema> | null] {
+): [LiveSeries<Schema>, TimeSeries<Schema> | null, ConnectionStatus] {
   const [live] = useState(() => new LiveSeries(options));
+  const [status, setStatus] = useState<ConnectionStatus>('connecting');
 
   useEffect(() => {
     let cancelled = false;
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let isReconnect = false;
 
     const connect = () => {
+      setStatus(isReconnect ? 'reconnecting' : 'connecting');
       ws = new WebSocket(url);
+      ws.onopen = () => {
+        if (!cancelled) setStatus('connected');
+      };
       ws.onmessage = (ev) => {
         applyFrame(live, decode(ev.data as string));
       };
       ws.onclose = () => {
         if (cancelled) return;
+        setStatus('reconnecting');
+        isReconnect = true;
         reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
       };
       // onerror: do nothing. WS spec guarantees onclose fires after.
@@ -69,11 +99,12 @@ export function useRemoteLiveSeries(
 
     return () => {
       cancelled = true;
+      setStatus('closed');
       if (reconnectTimer) clearTimeout(reconnectTimer);
       ws?.close();
     };
   }, [url, live]);
 
   const snapshot = useSnapshot(live, hookOptions);
-  return [live, snapshot];
+  return [live, snapshot, status];
 }
