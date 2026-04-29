@@ -1,26 +1,19 @@
 {
-  "name": "@pond-experiment/aggregator",
+  "name": "@pond-experiment/e2e",
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "main": "./src/index.ts",
   "scripts": {
     "typecheck": "tsc -b",
-    "dev": "tsx watch src/index.ts",
-    "start": "tsx src/index.ts",
-    "test": "vitest run"
+    "test:e2e": "vitest run"
   },
   "dependencies": {
-    "@grpc/grpc-js": "^1.12.0",
     "@pond-experiment/shared": "workspace:*",
-    "fastify": "^5.0.0",
-    "pond-ts": "^0.11.6",
     "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.0",
-    "tsx": "^4.19.0",
     "vitest": "^2.1.0"
   }
 }

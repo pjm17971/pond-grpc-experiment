@@ -10,16 +10,21 @@ export type WireRow = JsonRowForSchema<Schema>;
 
 /**
  * Snapshot frame: sent once on connect. The client bulk-pushes `rows`
- * into a fresh client-side `LiveSeries`.
+ * into a fresh client-side `LiveSeries`. `ReadonlyArray` because the
+ * wire never mutates the rows after construction; consumers (notably
+ * `LiveSeries.pushJson`) accept readonly inputs unchanged.
  */
-export type SnapshotMsg = { type: 'snapshot'; rows: WireRow[] };
+export type SnapshotMsg = {
+  type: 'snapshot';
+  rows: ReadonlyArray<WireRow>;
+};
 
 /**
  * Append frame: one per aggregator-side `on('batch')` callback. The
  * client pushes `rows` into the same `LiveSeries` that received the
  * snapshot.
  */
-export type AppendMsg = { type: 'append'; rows: WireRow[] };
+export type AppendMsg = { type: 'append'; rows: ReadonlyArray<WireRow> };
 
 export type WireMsg = SnapshotMsg | AppendMsg;
 
