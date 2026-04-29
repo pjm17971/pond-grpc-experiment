@@ -10,16 +10,19 @@ import { decode, type Schema, type WireMsg } from '@pond-experiment/shared';
 const RECONNECT_DELAY_MS = 1000;
 
 /**
- * Apply a snapshot or append frame to the local `LiveSeries` by
- * per-row push. Pulled out as a pure function so it can be unit-tested
- * without spinning up a React tree or a real WebSocket. The cast to
- * `never` is needed because `JsonRowForSchema` permits null per
- * column while `RowForSchema` does not — friction-noted.
+ * Apply a snapshot or append frame to the local `LiveSeries`. Pulled
+ * out as a pure function so it can be unit-tested without spinning
+ * up a React tree or a real WebSocket.
+ *
+ * `pushJson` (added in 0.11.4) takes the wire shape directly — same
+ * `JsonRowForSchema<S>` `WireRow` is built from — and validates the
+ * column count / value shapes against the schema at compile time.
+ * Schema evolution now breaks this call site if the wire types and
+ * the LiveSeries schema drift apart, instead of being swallowed by
+ * an `as never` cast (the M1 hole, closed in 0.11.4).
  */
 export function applyFrame(live: LiveSeries<Schema>, msg: WireMsg): void {
-  for (const row of msg.rows) {
-    live.push(row as never);
-  }
+  live.pushJson(msg.rows);
 }
 
 /**

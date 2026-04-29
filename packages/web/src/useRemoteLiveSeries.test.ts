@@ -51,35 +51,24 @@ describe('applyFrame', () => {
     expect(live.length).toBe(0);
   });
 
-  it('demonstrates the `as never` hole: malformed wire rows reach push() unchecked', () => {
-    // `WireRow = JsonRowForSchema<Schema>` permits null per column;
-    // `LiveSeries.push` expects `RowForSchema` which does not. The
-    // `as never` cast in applyFrame bridges this gap silently.
-    // Capture the current runtime behavior so a future stricter pond
-    // (or an added wire-validator) surfaces here as a regression.
+  it('rejects wire rows with null in required columns (pushJson validation)', () => {
+    // `WireRow = JsonRowForSchema<Schema>` permits null per column at
+    // the type level, but `pushJson` enforces the schema at runtime —
+    // null translates to undefined per `parseJsonRow`, and undefined
+    // values for non-nullable columns throw a ValidationError.
+    // M1's `as never` cast silently accepted this; 0.11.4 closes
+    // the hole and surfaces the bad row at the call site.
     const live = new LiveSeries({
       name: 'metrics',
       schema,
       retention: { maxAge: '6m' },
     });
-    let threw: unknown = null;
-    try {
+    expect(() =>
       applyFrame(live, {
         type: 'snapshot',
         rows: [[1_700_000_000_000, null, null, 'api-x']],
-      });
-    } catch (err) {
-      threw = err;
-    }
-    if (threw == null) {
-      // Silent acceptance is the current behavior — pin it so a
-      // future change is loud.
-      expect(live.length).toBe(1);
-    } else {
-      // If pond starts rejecting null in non-nullable columns,
-      // celebrate and update friction-notes/M1.md item 4.
-      expect(threw).toBeInstanceOf(Error);
-      expect(live.length).toBe(0);
-    }
+      }),
+    ).toThrowError(/column 'cpu' is required/);
+    expect(live.length).toBe(0);
   });
 });

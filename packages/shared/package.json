@@ -12,6 +12,6 @@
     "typecheck": "tsc -b"
   },
   "devDependencies": {
-    "pond-ts": "^0.11.3"
+    "pond-ts": "^0.11.4"
   }
 }

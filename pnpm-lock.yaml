@@ -21,8 +21,8 @@ importers:
         specifier: ^5.0.0
         version: 5.8.5
       pond-ts:
-        specifier: ^0.11.3
-        version: 0.11.3
+        specifier: ^0.11.4
+        version: 0.11.4
       ws:
         specifier: ^8.18.0
         version: 8.20.0
@@ -43,8 +43,8 @@ importers:
   packages/shared:
     devDependencies:
       pond-ts:
-        specifier: ^0.11.3
-        version: 0.11.3
+        specifier: ^0.11.4
+        version: 0.11.4
 
   packages/web:
     dependencies:
@@ -52,11 +52,11 @@ importers:
         specifier: workspace:*
         version: link:../shared
       '@pond-ts/react':
-        specifier: ^0.11.3
-        version: 0.11.3(pond-ts@0.11.3)(react@19.2.5)
+        specifier: ^0.11.4
+        version: 0.11.4(pond-ts@0.11.4)(react@19.2.5)
       pond-ts:
-        specifier: ^0.11.3
-        version: 0.11.3
+        specifier: ^0.11.4
+        version: 0.11.4
       react:
         specifier: ^19.2.5
         version: 19.2.5
@@ -924,14 +924,14 @@ packages:
     resolution: {integrity: sha512-k2ENnmBugE/rzQfEcdWHcCY+/FM3VLzH9cYEsbdsoqrvzAKRhUZeRNhAZvB8OitQJ1TBed3yqWtdjzS6wJKBwg==}
     dev: false
 
-  /@pond-ts/react@0.11.3(pond-ts@0.11.3)(react@19.2.5):
-    resolution: {integrity: sha512-NzIskVWGE1fXr7E18+XTRR7i9PyBTxOssVJjITXiDuPByrv2LfD1Y+mp/rqT20/wRYMZV1bh0WS4iLiFkdxnWw==}
+  /@pond-ts/react@0.11.4(pond-ts@0.11.4)(react@19.2.5):
+    resolution: {integrity: sha512-0W0c14j76WzT6Y18xuhRZz0JoFsux0Dn1DHwWhsiFBiAk64WAtKfzsmLB1ChENOl1QxR9C0vaMWb7cox6zVIKA==}
     engines: {node: '>=18'}
     peerDependencies:
       pond-ts: ^0.11.0
       react: ^18.0.0 || ^19.0.0
     dependencies:
-      pond-ts: 0.11.3
+      pond-ts: 0.11.4
       react: 19.2.5
     dev: false
 
@@ -2709,8 +2709,8 @@ packages:
       thread-stream: 4.0.0
     dev: false
 
-  /pond-ts@0.11.3:
-    resolution: {integrity: sha512-N68cKsVb0MWkqft9fjzf9ZkWh4MnpmEzK9002h1xF9tHqa5E5qehNXjeCebMti7iigSP1xa1fKQ7dR62kTURCQ==}
+  /pond-ts@0.11.4:
+    resolution: {integrity: sha512-/7KkZEzXG3xa2YoNp8ctLLXDFybCTLgledRGLEiWZtq++hcTF6ESH92ulCJCKaWgM4qbz59fXD3vBFlCWk6VHg==}
     engines: {node: '>=18'}
     dependencies:
       '@js-temporal/polyfill': 0.5.1
