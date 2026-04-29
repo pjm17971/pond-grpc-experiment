@@ -5,9 +5,12 @@ import {
   type TimeSeries,
 } from 'pond-ts';
 import { useSnapshot, type UseSnapshotOptions } from '@pond-ts/react';
-import { decode, type Schema, type WireMsg } from '@pond-experiment/shared';
-
-const RECONNECT_DELAY_MS = 1000;
+import {
+  backoff,
+  decode,
+  type Schema,
+  type WireMsg,
+} from '@pond-experiment/shared';
 
 /**
  * Lifecycle of the WebSocket-backed mirror.
@@ -77,12 +80,17 @@ export function useRemoteLiveSeries(
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let isReconnect = false;
+    let attempt = 0;
 
     const connect = () => {
       setStatus(isReconnect ? 'reconnecting' : 'connecting');
       ws = new WebSocket(url);
       ws.onopen = () => {
         if (!cancelled) setStatus('connected');
+        // A successful open resets the backoff schedule so a stable
+        // connection that briefly hiccups doesn't inherit a long
+        // delay from earlier failures.
+        attempt = 0;
       };
       ws.onmessage = (ev) => {
         applyFrame(live, decode(ev.data as string));
@@ -91,7 +99,9 @@ export function useRemoteLiveSeries(
         if (cancelled) return;
         setStatus('reconnecting');
         isReconnect = true;
-        reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
+        const delay = backoff(attempt);
+        attempt += 1;
+        reconnectTimer = setTimeout(connect, delay);
       };
       // onerror: do nothing. WS spec guarantees onclose fires after.
     };

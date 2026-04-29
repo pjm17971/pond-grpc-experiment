@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package pond.experiment.v1;
+
+// One metric event. Field order and types mirror the `as const`
+// schema in packages/shared/src/schema.ts — drift between this file
+// and that one is caught at test time. M2 hand-writes both sides;
+// the eventual `pond-ts/codegen` should generate this proto from the
+// schema (friction-noted).
+message Event {
+  // Epoch milliseconds. Mirrors schema column 0 (`time`, kind 'time').
+  int64 time_ms = 1;
+  // Mirrors schema column 1 (`cpu`, kind 'number').
+  double cpu = 2;
+  // Mirrors schema column 2 (`requests`, kind 'number').
+  int64 requests = 3;
+  // Mirrors schema column 3 (`host`, kind 'string').
+  string host = 4;
+}
+
+// Empty for v1. Per-client filtering (host subset, rate cap) is M4
+// territory — once we add it, the SubscribeRequest fields land here.
+message SubscribeRequest {}
+
+service Producer {
+  // Server-streaming: producer pushes Events for as long as the
+  // stream is open. The aggregator dials once at startup and
+  // re-dials with shared exponential backoff on disconnect.
+  rpc Subscribe(SubscribeRequest) returns (stream Event);
+}
