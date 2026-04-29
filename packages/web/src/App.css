@@ -186,6 +186,54 @@ header h1 {
   font-variant-numeric: tabular-nums;
 }
 
+/* ── Connection indicator ─────────────────────────────── */
+.connection-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid rgba(127, 127, 127, 0.25);
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.06);
+  font-size: 0.85rem;
+}
+
+.connection-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(127, 127, 127, 0.4);
+}
+
+.connection-indicator-connected .connection-dot {
+  background: #2ec27e;
+  box-shadow: 0 0 0 3px rgba(46, 194, 126, 0.18);
+}
+
+.connection-indicator-connecting .connection-dot,
+.connection-indicator-reconnecting .connection-dot {
+  background: #f59f4c;
+  box-shadow: 0 0 0 3px rgba(245, 159, 76, 0.18);
+  animation: connection-pulse 1.2s ease-in-out infinite;
+}
+
+.connection-indicator-closed .connection-dot {
+  background: #e23b3b;
+  box-shadow: 0 0 0 3px rgba(226, 59, 59, 0.18);
+}
+
+.connection-label {
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.7rem;
+  opacity: 0.85;
+}
+
+@keyframes connection-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
 /* ── Chart base ───────────────────────────────────────── */
 .chart {
   border: 1px solid rgba(127, 127, 127, 0.25);
