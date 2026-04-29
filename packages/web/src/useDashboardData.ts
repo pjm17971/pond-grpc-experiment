@@ -20,6 +20,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   useCurrent,
+  useEventRate,
   useTimeSeries,
   useWindow,
 } from '@pond-ts/react';
@@ -166,22 +167,14 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
 
   // 5. Whole-source rollups (computed live, not from the window).
   //    `useCurrent` is sugar for `useSnapshot(src).tail(t).reduce(map)`.
-  //    Event rate is the trailing 1-minute count of any non-null
-  //    column divided by 60. Picking `cpu` is arbitrary — pond's
-  //    `count` reducer needs a column to count non-null values of.
-  //    A column-free `count` would feel cleaner (friction note).
+  //    Event rate uses 0.11.7's `useEventRate` — closes the M1
+  //    `useCurrent({ cpu: 'count' }).cpu / 60` boilerplate.
   const { requests: totalRequests } = useCurrent(
     liveSeries,
     { requests: 'sum' },
     { throttle: 500 },
   );
-  const { cpu: lastMinuteCount } = useCurrent(
-    liveSeries,
-    { cpu: 'count' },
-    { tail: '1m', throttle: 500 },
-  );
-  const eventsPerSec =
-    lastMinuteCount != null ? lastMinuteCount / 60 : undefined;
+  const eventsPerSec = useEventRate(liveSeries, '1m');
   const { cpu: rollingCpu } = useCurrent(
     liveSeries,
     { cpu: 'avg' },
