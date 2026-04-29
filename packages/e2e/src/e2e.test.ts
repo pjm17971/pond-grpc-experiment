@@ -106,13 +106,15 @@ describe('three-process E2E', () => {
     // already-scheduled reconnect lands on a fresh stream.
     producer = await spawnProducer({ grpcPort, eventsPerSec: 16 });
 
-    // Subsequent appends pick up. The shared backoff caps at 30s; at
-    // worst we wait one cap window. Use a generous 35s timeout.
+    // Subsequent appends pick up. The shared backoff caps at 30s
+    // with ±20% jitter, so the absolute worst-case retry interval is
+    // ~36s; use a 40s timeout to absorb that even if the test
+    // happens to hit the cap.
     await probe.waitFor(
       (frames) =>
         frames.filter((f) => f.type === 'append').length >
         noGrowthCount + 1,
-      35_000,
+      40_000,
       'post-restart append',
     );
     expect(
@@ -148,7 +150,9 @@ describe('three-process E2E', () => {
     expect(probe.isClosed()).toBe(true);
 
     // Restart the aggregator on the same port and connect a fresh
-    // probe; it should receive a snapshot frame as the first message.
+    // probe; it should receive a snapshot frame first, then append
+    // frames as the aggregator's gRPC ingest keeps pulling from
+    // the still-running producer.
     aggregator = await spawnAggregator({
       httpPort,
       producerUrl: `127.0.0.1:${grpcPort}`,
@@ -161,6 +165,19 @@ describe('three-process E2E', () => {
         'fresh snapshot',
       );
       expect(probe2.frames[0].type).toBe('snapshot');
+
+      // Appends follow as the aggregator forwards events from the
+      // (still-up) producer. Asserts the full flow recovered, not
+      // just the initial handshake.
+      await probe2.waitFor(
+        (frames) =>
+          frames.filter((f) => f.type === 'append').length >= 1,
+        5000,
+        'fresh append',
+      );
+      expect(
+        probe2.frames.filter((f) => f.type === 'append').length,
+      ).toBeGreaterThanOrEqual(1);
     } finally {
       probe2.close();
     }

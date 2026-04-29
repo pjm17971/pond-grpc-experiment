@@ -2,8 +2,8 @@ import WebSocket from 'ws';
 import { decode, type WireMsg } from '@pond-experiment/shared';
 
 export type Probe = {
-  /** All frames received so far, in arrival order. */
-  frames: WireMsg[];
+  /** All frames received so far, in arrival order. Read-only view; the probe owns the underlying buffer. */
+  frames: ReadonlyArray<WireMsg>;
   /** Resolves when `predicate(frames)` returns true; rejects after timeout. */
   waitFor: (
     predicate: (frames: ReadonlyArray<WireMsg>) => boolean,

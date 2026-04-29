@@ -40,18 +40,16 @@ type SpawnOptions = {
   env: Record<string, string>;
   /** stdout/stderr line that signals readiness. */
   readyMatch: RegExp;
-  /** How long to wait for `readyMatch` before failing. Default 15s. */
-  readyTimeoutMs?: number;
 };
+
+const READY_TIMEOUT_MS = 15_000;
 
 async function spawnReady(opts: SpawnOptions): Promise<{
   child: ChildProcess;
   pid: number;
 }> {
-  // Resolve `tsx` from the repo root's pnpm content store so we don't
-  // need to traverse pnpm's hoist / shadow / per-package binary
-  // conventions. The workspace install always materialises one tsx
-  // binary in node_modules/.bin at the package level.
+  // Resolve `tsx` from the package's node_modules/.bin. pnpm always
+  // materialises a binary symlink there for each package's devDeps.
   const tsx = resolvePath(opts.cwd, 'node_modules/.bin/tsx');
 
   const child = spawn(tsx, ['src/index.ts'], {
@@ -72,19 +70,30 @@ async function spawnReady(opts: SpawnOptions): Promise<{
     const timeout = setTimeout(() => {
       rejectReady(
         new Error(
-          `process did not match ready pattern within ${opts.readyTimeoutMs ?? 15_000}ms`,
+          `process did not match ready pattern within ${READY_TIMEOUT_MS}ms`,
         ),
       );
-    }, opts.readyTimeoutMs ?? 15_000);
+    }, READY_TIMEOUT_MS);
 
-    const onData = (chunk: Buffer) => {
-      if (opts.readyMatch.test(chunk.toString())) {
+    // Accumulate per-stream buffers so the ready regex sees full
+    // log lines even when stdio writes split across chunks.
+    let stdoutBuf = '';
+    let stderrBuf = '';
+    const checkBuffer = (which: 'stdout' | 'stderr') => {
+      const buf = which === 'stdout' ? stdoutBuf : stderrBuf;
+      if (opts.readyMatch.test(buf)) {
         clearTimeout(timeout);
         resolveReady();
       }
     };
-    child.stdout?.on('data', onData);
-    child.stderr?.on('data', onData);
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdoutBuf += chunk.toString();
+      checkBuffer('stdout');
+    });
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderrBuf += chunk.toString();
+      checkBuffer('stderr');
+    });
     child.once('exit', (code) => {
       clearTimeout(timeout);
       rejectReady(
