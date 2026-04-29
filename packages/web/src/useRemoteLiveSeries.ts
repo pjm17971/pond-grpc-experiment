@@ -99,6 +99,11 @@ export function useRemoteLiveSeries(
 
     return () => {
       cancelled = true;
+      // `'closed'` is only observable as a transient between this
+      // cleanup and the next effect run (e.g. a `[url, live]`
+      // dep change). On unmount the indicator unmounts before any
+      // render commits, so consumers never see it; on dep change
+      // it briefly appears before the next `'connecting'`.
       setStatus('closed');
       if (reconnectTimer) clearTimeout(reconnectTimer);
       ws?.close();
