@@ -36,11 +36,19 @@ export function startIngest(
     if (cancelled) return;
     const call = client.subscribe(SubscribeRequest.create());
     activeCall = call;
+    // Reset the backoff counter once per stream, on the first
+    // delivered frame. Resetting on every frame would make a stream
+    // that opens-delivers-drops repeatedly look healthy in logs and
+    // perpetually retry on the 1s base delay. A "stable for N
+    // seconds before reset" rule would be more robust under chronic
+    // flapping; deferring the design call to M3.
+    let firstFrame = true;
 
     call.on('data', (event) => {
-      // Reset the backoff counter on a successful frame — a stream
-      // that delivers data is healthy regardless of past failures.
-      attempt = 0;
+      if (firstFrame) {
+        attempt = 0;
+        firstFrame = false;
+      }
       live.push([
         new Date(event.timeMs),
         event.cpu,
