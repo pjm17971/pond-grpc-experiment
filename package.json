@@ -9,8 +9,11 @@
   "packageManager": "pnpm@8.10.2",
   "scripts": {
     "typecheck": "tsc -b",
+    "dev": "pnpm -r --parallel --stream dev",
     "dev:web": "pnpm --filter @pond-experiment/web dev",
-    "build:web": "pnpm --filter @pond-experiment/web build"
+    "dev:aggregator": "pnpm --filter @pond-experiment/aggregator dev",
+    "build:web": "pnpm --filter @pond-experiment/web build",
+    "test": "pnpm -r --stream test"
   },
   "devDependencies": {
     "typescript": "~6.0.2"

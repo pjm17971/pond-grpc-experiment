@@ -4,29 +4,27 @@ import { HostToggles } from './sections/HostToggles';
 import { LogsSection } from './sections/LogsSection';
 import { PageSummary } from './sections/PageSummary';
 import { RequestsSection } from './sections/RequestsSection';
-import { SimulatorControls } from './sections/SimulatorControls';
 import type { ChartOpts } from './useDashboardData';
 import { useDashboardData } from './useDashboardData';
-import { useSimulator } from './useSimulator';
-import type { SimulatorParams } from './useSimulator';
 
 /**
- * The dashboard is a layout shell. All state lives here as a small set
- * of plain `useState`s; everything derived from the live series flows
- * through `useDashboardData`. Each section is a pure renderer of the
- * data hook's output plus whatever UI state it needs to round-trip.
+ * The dashboard is a layout shell. State lives here as a small set of
+ * `useState`s; everything derived from the live series flows through
+ * `useDashboardData`. Each section is a pure renderer of the data
+ * hook's output plus whatever UI state it needs to round-trip.
  *
- *   simulator params  → useSimulator (drives the LiveSeries)
- *   simulator + UI    → useDashboardData (the pond pipeline)
- *   data hook output  → section components
+ *   useDashboardData   → opens WS to aggregator, mirrors its LiveSeries
+ *   data hook output   → section components
+ *
+ * The simulator-control sliders that owned `eventsPerSec`/`hostCount`/
+ * `variability` in M0 are gone — the aggregator owns those now.
+ * `eventsPerSec` is now measured from the data itself; `hostCount` is
+ * pinned to the aggregator's default until M2's HTTP control endpoint
+ * lets us recover dynamic discovery.
  */
+const AGGREGATOR_HOST_COUNT = 4;
+
 export function Dashboard() {
-  // ── UI state ─────────────────────────────────────────────────────
-  const [simParams, setSimParams] = useState<SimulatorParams>({
-    eventsPerSec: 2,
-    hostCount: 4,
-    variability: 0.4,
-  });
   const [chartOpts, setChartOpts] = useState<ChartOpts>({
     showBands: true,
     // Show raw samples by default — the most direct visual signal of
@@ -35,7 +33,6 @@ export function Dashboard() {
     // can lag because its rolling window still contains pre-pause data.
     showRaw: true,
     sigma: 2,
-    eventsPerSec: 2,
   });
   // The set of hosts the user has explicitly disabled. Hosts default
   // to enabled; toggling adds/removes from this set.
@@ -46,15 +43,12 @@ export function Dashboard() {
     return new Set(all.slice(1));
   });
 
-  // ── Data ─────────────────────────────────────────────────────────
   const data = useDashboardData({
-    hostCount: simParams.hostCount,
+    hostCount: AGGREGATOR_HOST_COUNT,
     disabledHosts,
-    chartOpts: { ...chartOpts, eventsPerSec: simParams.eventsPerSec },
+    chartOpts,
   });
-  useSimulator(data.liveSeries, simParams);
 
-  // ── Handlers ────────────────────────────────────────────────────
   const onToggleHost = (host: string) => {
     setDisabledHosts((prev) => {
       const next = new Set(prev);
@@ -66,11 +60,10 @@ export function Dashboard() {
 
   return (
     <div className="dashboard">
-      <SimulatorControls params={simParams} onChange={setSimParams} />
       <PageSummary
         totalEvents={data.totalEvents}
         hostCount={data.hosts.length}
-        totalRequests={data.totalRequests}
+        eventsPerSec={data.eventsPerSec}
         evictedTotal={data.evictedTotal}
       />
       <HostToggles

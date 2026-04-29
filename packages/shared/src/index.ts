@@ -1,1 +1,10 @@
-export { schema, baselineSchema } from './schema.js';
+export { schema, baselineSchema, type Schema } from './schema.js';
+export { HOSTS, type HostId } from './hosts.js';
+export {
+  type WireRow,
+  type SnapshotMsg,
+  type AppendMsg,
+  type WireMsg,
+  encode,
+  decode,
+} from './wire.js';

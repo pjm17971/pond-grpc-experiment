@@ -5,6 +5,21 @@
   "type": "module",
   "main": "./src/index.ts",
   "scripts": {
-    "typecheck": "tsc -b"
+    "typecheck": "tsc -b",
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@pond-experiment/shared": "workspace:*",
+    "fastify": "^5.0.0",
+    "pond-ts": "^0.11.3",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.19.0",
+    "vitest": "^2.1.0"
   }
 }

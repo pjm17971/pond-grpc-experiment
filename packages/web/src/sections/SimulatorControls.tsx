@@ -1,5 +1,10 @@
-import { HOSTS } from '../dashboardSchema';
-import type { SimulatorParams } from '../useSimulator';
+import { HOSTS } from '@pond-experiment/shared';
+
+type SimulatorParams = {
+  eventsPerSec: number;
+  hostCount: number;
+  variability: number;
+};
 
 type Props = {
   params: SimulatorParams;
