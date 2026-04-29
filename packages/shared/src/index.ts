@@ -8,3 +8,4 @@ export {
   encode,
   decode,
 } from './wire.js';
+export { backoff, type BackoffOptions } from './backoff.js';

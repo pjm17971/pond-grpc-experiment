@@ -1,12 +1,13 @@
 import { LiveSeries } from 'pond-ts';
 import { schema } from '@pond-experiment/shared';
-import { startSimulator } from './simulator.js';
+import { startIngest } from './ingest.js';
 import { startServer } from './server.js';
 
 const PORT = Number(process.env.AGGREGATOR_PORT ?? '8080');
-const EVENTS_PER_SEC = Number(process.env.EVENTS_PER_SEC ?? '2');
-const HOST_COUNT = Number(process.env.HOST_COUNT ?? '4');
-const VARIABILITY = Number(process.env.VARIABILITY ?? '0.4');
+// IPv4 explicit by default so macOS's IPv6-first `localhost` resolution
+// doesn't try `::1:50051` while the producer is bound to `0.0.0.0`
+// (IPv4-only). Friction-noted for M2 — see friction-notes/M2.md.
+const PRODUCER_URL = process.env.PRODUCER_URL ?? '127.0.0.1:50051';
 
 const live = new LiveSeries({
   name: 'metrics',
@@ -14,21 +15,16 @@ const live = new LiveSeries({
   retention: { maxAge: '6m' },
 });
 
-const stopSimulator = startSimulator(live, {
-  eventsPerSec: EVENTS_PER_SEC,
-  hostCount: HOST_COUNT,
-  variability: VARIABILITY,
-});
-
+const stopIngest = startIngest(live, { producerUrl: PRODUCER_URL });
 const server = await startServer({ port: PORT, live });
 
 console.log(
-  `aggregator listening on :${PORT} (events=${EVENTS_PER_SEC}/s, hosts=${HOST_COUNT}, variability=±${VARIABILITY})`,
+  `aggregator listening on :${PORT} (producer=${PRODUCER_URL})`,
 );
 
 const shutdown = async (signal: string) => {
   console.log(`received ${signal}, shutting down…`);
-  stopSimulator();
+  stopIngest();
   await server.stop();
   process.exit(0);
 };

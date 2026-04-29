@@ -12,10 +12,13 @@
     "dev": "pnpm -r --parallel --stream dev",
     "dev:web": "pnpm --filter @pond-experiment/web dev",
     "dev:aggregator": "pnpm --filter @pond-experiment/aggregator dev",
+    "dev:producer": "pnpm --filter @pond-experiment/producer dev",
     "build:web": "pnpm --filter @pond-experiment/web build",
-    "test": "pnpm -r --stream test"
+    "test": "pnpm -r --stream test",
+    "codegen": "protoc --plugin=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=packages/shared/src/grpc --ts_proto_opt=forceLong=number,esModuleInterop=true,outputServices=grpc-js,outputJsonMethods=false,useOptionals=none,unrecognizedEnum=false --proto_path=packages/shared/proto packages/shared/proto/events.proto"
   },
   "devDependencies": {
+    "ts-proto": "^2.6.0",
     "typescript": "~6.0.2"
   }
 }
