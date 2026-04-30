@@ -52,7 +52,15 @@ function pct(sorted: ReadonlyArray<number>, p: number): number {
 
 // ── State ───────────────────────────────────────────────────────
 const ingestToFanout = new Histogram();
-const arrivalTimes = new Map<string, number>();
+/**
+ * Per-key FIFO queue of arrival timestamps. Keyed by `host:timeMs`,
+ * which is NOT unique — at high producer rates `setInterval` can
+ * fire twice within the same wall-clock ms, so the same `(host,
+ * timeMs)` shows up multiple times. Storing arrivals as a list and
+ * pairing FIFO on fanout matches the in-order processing of pond's
+ * batch listener.
+ */
+const arrivalTimes = new Map<string, number[]>();
 let eventsIngested = 0;
 let eventsFannedOut = 0;
 let bytesFannedOut = 0;
@@ -100,24 +108,32 @@ export function startGcObserver(): () => void {
 
 // ── Recording APIs ──────────────────────────────────────────────
 /**
- * Called from ingest at gRPC arrival. Stores the wall-clock arrival
- * for later end-to-end latency calculation.
+ * Called from ingest at gRPC arrival. Appends the wall-clock arrival
+ * to the per-key queue for later latency calculation.
  */
 export function recordIngest(host: string, timeMs: number): void {
-  arrivalTimes.set(`${host}:${timeMs}`, performance.now());
+  const key = `${host}:${timeMs}`;
+  const list = arrivalTimes.get(key);
+  const t = performance.now();
+  if (list) list.push(t);
+  else arrivalTimes.set(key, [t]);
   eventsIngested += 1;
 }
 
 /**
  * Called from fanout once per event when its batch is about to be
- * broadcast. Records the ingest→fanout latency and counts the event.
+ * broadcast. Pulls the front of the per-key queue and records the
+ * ingest→fanout latency. Pairs FIFO so collisions
+ * (multiple same-`(host, timeMs)` events from the same producer
+ * tick) get matched in arrival order.
  */
 export function recordFanout(host: string, timeMs: number): void {
   const key = `${host}:${timeMs}`;
-  const t0 = arrivalTimes.get(key);
-  if (t0 != null) {
+  const list = arrivalTimes.get(key);
+  if (list && list.length > 0) {
+    const t0 = list.shift()!;
     ingestToFanout.add(performance.now() - t0);
-    arrivalTimes.delete(key);
+    if (list.length === 0) arrivalTimes.delete(key);
   }
   eventsFannedOut += 1;
 }
@@ -175,6 +191,12 @@ export type MetricsSnapshot = {
   gc: Record<string, GcBucket>;
 };
 
+function countArrivalEntries(): number {
+  let total = 0;
+  for (const list of arrivalTimes.values()) total += list.length;
+  return total;
+}
+
 export function snapshot(args: {
   liveSeriesLength: number;
   wsClientBufferedAmounts: ReadonlyArray<number>;
@@ -194,7 +216,7 @@ export function snapshot(args: {
       maxBatchSize: pushManyBatchSizeMax,
     },
     liveSeriesLength: args.liveSeriesLength,
-    arrivalQueueLength: arrivalTimes.size,
+    arrivalQueueLength: countArrivalEntries(),
     latency: { ingestToFanoutMs: ingestToFanout.snapshot() },
     ws: {
       clientCount: args.wsClientBufferedAmounts.length,

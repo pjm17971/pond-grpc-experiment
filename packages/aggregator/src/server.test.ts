@@ -156,6 +156,43 @@ describe('GET /metrics', () => {
     await server.stop();
   });
 
+  it('FIFO-pairs same-(host, timeMs) collisions in the arrival map', async () => {
+    // The producer simulator (post M3 stagger removal) emits all
+    // hosts at the same tick `Date.now()`; under setInterval jitter
+    // the same `(host, timeMs)` can also appear across ticks within
+    // the same wall-clock ms. Verify that two identical-key
+    // recordIngest calls each get paired to one fanout via FIFO.
+    const probe = new WebSocket(`ws://127.0.0.1:${port}/live`);
+    await new Promise<void>((res, rej) => {
+      probe.on('open', () => res());
+      probe.on('error', rej);
+    });
+
+    const before = (await fetchMetrics(port)).latency.ingestToFanoutMs?.count ?? 0;
+
+    // Two events for the same (host, timeMs), pushed one after the
+    // other. The map keys collide; FIFO pairing means both should
+    // produce a histogram sample.
+    const tCollide = Date.now() + 1000;
+    recordIngest('api-collide', tCollide);
+    recordIngest('api-collide', tCollide);
+    live.push([new Date(tCollide), 0.5, 100, 'api-collide']);
+    live.push([new Date(tCollide), 0.6, 110, 'api-collide']);
+
+    await new Promise((res) => setTimeout(res, 100));
+
+    const after = (await fetchMetrics(port)).latency.ingestToFanoutMs?.count ?? 0;
+    // Both events should have produced histogram samples.
+    expect(after - before).toBeGreaterThanOrEqual(2);
+
+    probe.close();
+  });
+
+  async function fetchMetrics(p: number): Promise<MetricsSnapshot> {
+    const r = await fetch(`http://127.0.0.1:${p}/metrics`);
+    return (await r.json()) as MetricsSnapshot;
+  }
+
   it('reports event counters, latency histogram, memory, and ws state', async () => {
     // Connect a probe so the fanout has someone to send to (otherwise
     // bytesFannedOut stays 0 and the ws.clientCount assertion fails).
