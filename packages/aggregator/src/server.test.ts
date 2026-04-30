@@ -10,6 +10,7 @@ import {
   type SnapshotMsg,
 } from '@pond-experiment/shared';
 import { startServer, type RunningServer } from './server.js';
+import { recordIngest, type MetricsSnapshot } from './metrics.js';
 
 describe('wire codec', () => {
   it('roundtrips a snapshot frame', () => {
@@ -133,6 +134,126 @@ describe('server WS protocol', () => {
     expect(r2[1].type).toBe('append');
     expect((r1[1] as AppendMsg).rows[0][3]).toBe('api-3');
     expect((r2[1] as AppendMsg).rows[0][3]).toBe('api-3');
+  });
+});
+
+describe('GET /metrics', () => {
+  let live: LiveSeries<typeof schema>;
+  let server: RunningServer;
+  let port: number;
+
+  beforeEach(async () => {
+    live = new LiveSeries({
+      name: 'metrics',
+      schema,
+      retention: { maxAge: '6m' },
+    });
+    port = 9900 + Math.floor(Math.random() * 80);
+    server = await startServer({ port, host: '127.0.0.1', live });
+  });
+
+  afterEach(async () => {
+    await server.stop();
+  });
+
+  it('FIFO-pairs same-(host, timeMs) collisions in the arrival map', async () => {
+    // The producer simulator (post M3 stagger removal) emits all
+    // hosts at the same tick `Date.now()`; under setInterval jitter
+    // the same `(host, timeMs)` can also appear across ticks within
+    // the same wall-clock ms. Verify that two identical-key
+    // recordIngest calls each get paired to one fanout via FIFO.
+    const probe = new WebSocket(`ws://127.0.0.1:${port}/live`);
+    await new Promise<void>((res, rej) => {
+      probe.on('open', () => res());
+      probe.on('error', rej);
+    });
+
+    const before = (await fetchMetrics(port)).latency.ingestToFanoutMs?.count ?? 0;
+
+    // Two events for the same (host, timeMs), pushed one after the
+    // other. The map keys collide; FIFO pairing means both should
+    // produce a histogram sample.
+    const tCollide = Date.now() + 1000;
+    recordIngest('api-collide', tCollide);
+    recordIngest('api-collide', tCollide);
+    live.push([new Date(tCollide), 0.5, 100, 'api-collide']);
+    live.push([new Date(tCollide), 0.6, 110, 'api-collide']);
+
+    await new Promise((res) => setTimeout(res, 100));
+
+    const after = (await fetchMetrics(port)).latency.ingestToFanoutMs?.count ?? 0;
+    // Both events should have produced histogram samples.
+    expect(after - before).toBeGreaterThanOrEqual(2);
+
+    probe.close();
+  });
+
+  async function fetchMetrics(p: number): Promise<MetricsSnapshot> {
+    const r = await fetch(`http://127.0.0.1:${p}/metrics`);
+    return (await r.json()) as MetricsSnapshot;
+  }
+
+  it('reports event counters, latency histogram, memory, and ws state', async () => {
+    // Connect a probe so the fanout has someone to send to (otherwise
+    // bytesFannedOut stays 0 and the ws.clientCount assertion fails).
+    const probe = new WebSocket(`ws://127.0.0.1:${port}/live`);
+    await new Promise<void>((res, rej) => {
+      probe.on('open', () => res());
+      probe.on('error', rej);
+    });
+
+    // Simulate two events through the ingest path: recordIngest tags
+    // arrival, live.push triggers the fanout's recordFanout which
+    // records the latency sample.
+    const t0 = Date.now();
+    recordIngest('api-1', t0);
+    live.push([new Date(t0), 0.5, 100, 'api-1']);
+    recordIngest('api-2', t0 + 1);
+    live.push([new Date(t0 + 1), 0.6, 110, 'api-2']);
+
+    // Wait for pond's batch listener to fire (microtask-deferred).
+    await new Promise((res) => setTimeout(res, 100));
+
+    const res = await fetch(`http://127.0.0.1:${port}/metrics`);
+    expect(res.status).toBe(200);
+    const m = (await res.json()) as MetricsSnapshot;
+
+    // The two ingest calls and at least the two events through fanout
+    // should be reflected. Other tests in this file also run through
+    // the fanout and increment these counters, so use >= rather than
+    // ==.
+    expect(m.events.ingested).toBeGreaterThanOrEqual(2);
+    expect(m.events.fannedOut).toBeGreaterThanOrEqual(2);
+    expect(m.events.bytesFannedOut).toBeGreaterThan(0);
+
+    // Latency histogram has the two samples we just submitted.
+    expect(m.latency.ingestToFanoutMs).not.toBeNull();
+    expect(m.latency.ingestToFanoutMs!.count).toBeGreaterThanOrEqual(2);
+    expect(m.latency.ingestToFanoutMs!.p50).toBeGreaterThanOrEqual(0);
+    expect(m.latency.ingestToFanoutMs!.p95).toBeGreaterThanOrEqual(
+      m.latency.ingestToFanoutMs!.p50,
+    );
+    expect(m.latency.ingestToFanoutMs!.p99).toBeGreaterThanOrEqual(
+      m.latency.ingestToFanoutMs!.p95,
+    );
+
+    // WS state: one connected client tracked.
+    expect(m.ws.clientCount).toBe(1);
+    expect(m.ws.bufferedAmount).toHaveLength(1);
+
+    // Memory snapshot has the standard fields.
+    expect(m.memory.rss).toBeGreaterThan(0);
+    expect(m.memory.heapUsed).toBeGreaterThan(0);
+
+    // GC bucket structure exists; entries appear over time, may be 0
+    // at this point — the existence shape is the assertion, not the
+    // count.
+    expect(typeof m.gc).toBe('object');
+
+    // LiveSeries length matches the two events pushed.
+    expect(m.liveSeriesLength).toBe(2);
+
+    probe.close();
   });
 });
 

@@ -1,7 +1,11 @@
 import { credentials, type ChannelCredentials } from '@grpc/grpc-js';
+import type { RowForSchema } from 'pond-ts/types';
 import { type LiveSeries } from 'pond-ts';
 import { backoff, type Schema } from '@pond-experiment/shared';
 import { ProducerClient, SubscribeRequest } from '@pond-experiment/shared/grpc';
+import { recordIngest, recordPushMany } from './metrics.js';
+
+type IngestRow = RowForSchema<Schema>;
 
 export type IngestOptions = {
   /** Producer address, e.g. `localhost:50051`. */
@@ -44,17 +48,40 @@ export function startIngest(
     // flapping; deferring the design call to M3.
     let firstFrame = true;
 
+    // Per-stream macrotask-coalescing buffer. Every gRPC 'data'
+    // event appends to `pending`; the first append per macrotask
+    // schedules a `setImmediate` flush that pushes the whole batch
+    // via `live.pushMany(rows)`. Coalescing collapses N synchronous
+    // pond.push() calls into one pushMany() per event-loop tick —
+    // M3 measurement showed this is ~3-5× the per-event regime at
+    // saturation rates.
+    let pending: IngestRow[] = [];
+    let scheduled = false;
+    const flush = () => {
+      scheduled = false;
+      if (pending.length === 0) return;
+      const batch = pending;
+      pending = [];
+      recordPushMany(batch.length);
+      live.pushMany(batch);
+    };
+
     call.on('data', (event) => {
       if (firstFrame) {
         attempt = 0;
         firstFrame = false;
       }
-      live.push([
+      recordIngest(event.host, event.timeMs);
+      pending.push([
         new Date(event.timeMs),
         event.cpu,
         event.requests,
         event.host,
       ]);
+      if (!scheduled) {
+        scheduled = true;
+        setImmediate(flush);
+      }
     });
 
     const onEnd = (err?: Error) => {

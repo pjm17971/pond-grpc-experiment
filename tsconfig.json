@@ -2,6 +2,7 @@
   "files": [],
   "references": [
     { "path": "./packages/shared" },
+    { "path": "./packages/dev-utils" },
     { "path": "./packages/producer" },
     { "path": "./packages/aggregator" },
     { "path": "./packages/e2e" },

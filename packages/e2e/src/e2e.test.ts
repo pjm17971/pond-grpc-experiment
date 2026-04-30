@@ -4,7 +4,7 @@ import {
   spawnAggregator,
   spawnProducer,
   type SpawnedProcess,
-} from './spawn.js';
+} from '@pond-experiment/dev-utils';
 import { connectProbe, type Probe } from './probe.js';
 
 /**

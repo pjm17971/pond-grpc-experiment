@@ -8,6 +8,7 @@
     "test:e2e": "vitest run"
   },
   "dependencies": {
+    "@pond-experiment/dev-utils": "workspace:*",
     "@pond-experiment/shared": "workspace:*",
     "ws": "^8.18.0"
   },
