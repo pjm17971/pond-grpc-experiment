@@ -8,8 +8,8 @@ import { useSnapshot, type UseSnapshotOptions } from '@pond-ts/react';
 import {
   backoff,
   decode,
+  type RawWireMsg,
   type Schema,
-  type WireMsg,
 } from '@pond-experiment/shared';
 
 /**
@@ -39,6 +39,12 @@ export type ConnectionStatus =
  * out as a pure function so it can be unit-tested without spinning
  * up a React tree or a real WebSocket.
  *
+ * Narrowed to `RawWireMsg` (the `/live` stream's frame shape) — the
+ * M3.5 aggregate stream `/live-agg` carries `HostTick` rows that
+ * don't match this `LiveSeries`'s schema, so accepting them here
+ * would be a typing error waiting to happen. The aggregate stream
+ * gets its own hook in a follow-up.
+ *
  * `pushJson` (added in 0.11.4) takes the wire shape directly — same
  * `JsonRowForSchema<S>` `WireRow` is built from — and validates the
  * column count / value shapes against the schema at compile time.
@@ -46,7 +52,7 @@ export type ConnectionStatus =
  * the LiveSeries schema drift apart, instead of being swallowed by
  * an `as never` cast (the M1 hole, closed in 0.11.4).
  */
-export function applyFrame(live: LiveSeries<Schema>, msg: WireMsg): void {
+export function applyFrame(live: LiveSeries<Schema>, msg: RawWireMsg): void {
   live.pushJson(msg.rows);
 }
 
@@ -93,7 +99,12 @@ export function useRemoteLiveSeries(
         attempt = 0;
       };
       ws.onmessage = (ev) => {
-        applyFrame(live, decode(ev.data as string));
+        const msg = decode(ev.data as string);
+        // Narrow to the raw-event firehose; ignore aggregate-stream
+        // frames a misconfigured server might send on this socket.
+        if (msg.type === 'snapshot' || msg.type === 'append') {
+          applyFrame(live, msg);
+        }
       };
       ws.onclose = () => {
         if (cancelled) return;

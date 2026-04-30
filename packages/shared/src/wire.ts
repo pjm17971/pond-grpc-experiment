@@ -26,7 +26,84 @@ export type SnapshotMsg = {
  */
 export type AppendMsg = { type: 'append'; rows: ReadonlyArray<WireRow> };
 
-export type WireMsg = SnapshotMsg | AppendMsg;
+/**
+ * Per-host, per-tick aggregate row on the `/live-agg` stream. The
+ * aggregator computes rolling 1m mean and sd from raw CPU samples it
+ * ingested over gRPC, and emits one `HostTick` per host per tick on a
+ * synchronized 200ms clock — every host's frame for tick `T` carries
+ * the same `ts`. See `WIRE.md` at the repo root for the design.
+ *
+ * Step 1 of the M3.5 aggregate-wire work ships only the band-rendering
+ * stats (`cpu_avg`/`cpu_sd`/`cpu_n`); the full target shape from
+ * `WIRE.md` (anomaly counts, requests stats, min/max) is staged in
+ * follow-ups.
+ *
+ * `cpu_avg` and `cpu_sd` are over the rolling 1m window; `cpu_n` is
+ * the count of raw samples that arrived during this tick. Hosts with
+ * no samples in the rolling 1m window are omitted from the row set
+ * entirely (per `WIRE.md`'s "either omit or null" allowance) — the
+ * client renders a gap until the host re-appears. The fields keep
+ * `| null` in the type for forward compatibility: subsequent steps
+ * may emit `null` stats when a host has new samples this tick but
+ * none in the window (a regime that's not reachable in step 1).
+ */
+export type HostTick = {
+  ts: number;
+  host: string;
+  cpu_avg: number | null;
+  cpu_sd: number | null;
+  cpu_n: number;
+};
+
+/**
+ * Snapshot frame for `/live-agg`. Sent once on connect.
+ *
+ * - `thresholds` is the σ-threshold list anomaly density will use
+ *   (deploy-time server config; default `[1, 1.5, 2, 2.5, 3]`). Step 1
+ *   doesn't populate anomaly counts but ships the field so the client
+ *   knows the buckets up front and the contract is forward-compatible.
+ * - `rows` is the recent-history backfill. Step 1 ships an empty
+ *   array — a connecting client fills the chart in as ticks arrive,
+ *   trading first-paint coverage for protocol simplicity. Snapshot
+ *   history lands when M4 measures whether the cost is real.
+ */
+export type AggregateSnapshotMsg = {
+  type: 'aggregate-snapshot';
+  thresholds: ReadonlyArray<number>;
+  rows: ReadonlyArray<HostTick>;
+};
+
+/**
+ * Append frame for `/live-agg`. One per 200ms tick. `rows` carries
+ * one `HostTick` per host that had any samples in the rolling 1m
+ * window at tick time; silent hosts are omitted (client renders the
+ * column as a gap until the host re-appears).
+ */
+export type AggregateAppendMsg = {
+  type: 'aggregate-append';
+  rows: ReadonlyArray<HostTick>;
+};
+
+/**
+ * Raw-event firehose message — the `/live` stream's frame shape.
+ * Snapshot or append, both carrying `WireRow`s. Kept as a named alias
+ * so `applyFrame` and friends can narrow on the raw side without
+ * leaking the aggregate-stream variants into their type.
+ */
+export type RawWireMsg = SnapshotMsg | AppendMsg;
+
+/**
+ * Aggregate-tick message — the `/live-agg` stream's frame shape. See
+ * `WIRE.md` for the design.
+ */
+export type AggregateWireMsg = AggregateSnapshotMsg | AggregateAppendMsg;
+
+export type WireMsg = RawWireMsg | AggregateWireMsg;
+
+/** Default σ-threshold list emitted in `AggregateSnapshotMsg.thresholds`. */
+export const DEFAULT_AGGREGATE_THRESHOLDS: ReadonlyArray<number> = [
+  1, 1.5, 2, 2.5, 3,
+];
 
 /**
  * Encode a wire message for transport. v1 ships JSON; the codec is
