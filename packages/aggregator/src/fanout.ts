@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import { type LiveSeries } from 'pond-ts';
 import {
   type AppendMsg,
@@ -5,7 +6,7 @@ import {
   encode,
   schema,
 } from '@pond-experiment/shared';
-import { recordFanout } from './metrics.js';
+import { recordFanout, recordFanoutPhases } from './metrics.js';
 
 /**
  * Subscribe to `live.on('batch', …)` and broadcast each batch as an
@@ -15,20 +16,35 @@ import { recordFanout } from './metrics.js';
  * serialization the schema dictates, so the fanout no longer hand-
  * walks columns and stays correct under schema evolution.
  *
- * Records the ingest→fanout latency for each event in the batch
- * before serialization, keyed by `host:timeMs` against the arrival
- * map populated by `recordIngest`.
+ * Records both the ingest→fanout end-to-end latency (per event,
+ * keyed against the arrival map) and the per-phase wall-clock
+ * breakdown of the listener body — recordFanout loop, JSON
+ * serialize, WS broadcast — so a `/metrics` consumer can attribute
+ * the latency.
  */
 export function startFanout(
   live: LiveSeries<Schema>,
   broadcast: (frame: string) => void,
 ): () => void {
   return live.on('batch', (events) => {
+    const t0 = performance.now();
     for (const e of events) {
       recordFanout(e.get('host'), e.key().timestampMs());
     }
+    const tAfterRecord = performance.now();
+
     const rows = events.map((e) => e.toJsonRow(schema));
     const msg: AppendMsg = { type: 'append', rows };
-    broadcast(encode(msg));
+    const frame = encode(msg);
+    const tAfterSerialize = performance.now();
+
+    broadcast(frame);
+    const tAfterBroadcast = performance.now();
+
+    recordFanoutPhases({
+      recordMs: tAfterRecord - t0,
+      serializeMs: tAfterSerialize - tAfterRecord,
+      broadcastMs: tAfterBroadcast - tAfterSerialize,
+    });
   });
 }

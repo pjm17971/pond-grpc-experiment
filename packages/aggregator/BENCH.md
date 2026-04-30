@@ -88,6 +88,22 @@ Wire shape changed from `stream Event` to `stream EventBatch` where `EventBatch 
 | P=1000, N=100 | 65,208 /s | 72,722 /s | **92,080 /s** | **+41 %** |
 | P=1000, N=1000 | 20,190 /s | 23,628 /s | **486,116 /s** | **+24×** |
 
+## Per-phase latency breakdown (P=1000, N=1000)
+
+To answer "where does the 61.45 ms p99 go," the bench script and `/metrics` now expose 4 wall-clock histograms inside the synchronous gRPC `'data'` handler:
+
+| Phase | What it measures | p99 (ms) at saturation |
+| --- | --- | --- |
+| `pushManyTotalMs` | wall-clock from before `live.pushMany(rows)` to after it returns; includes pond's synchronous batch listener fire | **0.88** |
+| `fanoutRecordMs` | inside the listener: the `recordFanout` loop (Map FIFO shift + histogram add per event) | 0.26 |
+| `fanoutSerializeMs` | inside the listener: `events.map(e.toJsonRow(schema))` + `JSON.stringify(msg)` | **0.44** |
+| `fanoutBroadcastMs` | inside the listener: per-client `ws.send(frame)` loop | 0.05 |
+| pond-only pushMany | `pushManyTotalMs − (record + serialize + broadcast)` | ~0.13 |
+
+**Pond's library work is ~15 % of the per-pushMany synchronous budget.** Within the batch-listener fire, the dominant cost is JSON serialization (`toJsonRow` + `JSON.stringify`, ~50 % of the synchronous wall-clock). The `recordFanout` loop is ~30 %, the WS broadcast is ~5 %.
+
+The 61.45 ms p99 ingest→fanout figure observed in the original 30 s sweep (across all 12 configs back-to-back) is NOT explained by per-pushMany work, which sums to <1 ms. It's event-loop scheduling pressure between gRPC frame arrival and the next `'data'` callback firing — when the aggregator's event loop spends 30 % of wall-clock in minor GC, queued frames wait for their turn. Captured at recordIngest *inside* the data handler, the wait time *before* the handler starts is invisible to that histogram. Per-phase histograms confirm pond's own work isn't where the time goes.
+
 ## Findings
 
 ### EventBatch closes the gap to the library bench

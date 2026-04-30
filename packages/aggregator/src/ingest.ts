@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import { credentials, type ChannelCredentials } from '@grpc/grpc-js';
 import type { RowForSchema } from 'pond-ts/types';
 import { type LiveSeries } from 'pond-ts';
@@ -67,8 +68,10 @@ export function startIngest(
         ];
       }
       if (rows.length > 0) {
-        recordPushMany(rows.length);
+        const t0 = performance.now();
         live.pushMany(rows);
+        const totalMs = performance.now() - t0;
+        recordPushMany(rows.length, totalMs);
       }
     });
 
