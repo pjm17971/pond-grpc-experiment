@@ -8,6 +8,9 @@ import {
   type WireMsg,
   type AppendMsg,
   type SnapshotMsg,
+  type AggregateAppendMsg,
+  type AggregateSnapshotMsg,
+  DEFAULT_AGGREGATE_THRESHOLDS,
 } from '@pond-experiment/shared';
 import { startServer, type RunningServer } from './server.js';
 import { recordIngest, type MetricsSnapshot } from './metrics.js';
@@ -134,6 +137,111 @@ describe('server WS protocol', () => {
     expect(r2[1].type).toBe('append');
     expect((r1[1] as AppendMsg).rows[0][3]).toBe('api-3');
     expect((r2[1] as AppendMsg).rows[0][3]).toBe('api-3');
+  });
+});
+
+describe('/live-agg WS (M3.5 aggregate stream)', () => {
+  let live: LiveSeries<typeof schema>;
+  let server: RunningServer;
+  let port: number;
+
+  beforeEach(async () => {
+    live = new LiveSeries({
+      name: 'metrics',
+      schema,
+      retention: { maxAge: '6m' },
+    });
+    port = 9300 + Math.floor(Math.random() * 600);
+    // Tight tick cadence keeps the test fast; the production default
+    // is 200ms.
+    server = await startServer({
+      port,
+      host: '127.0.0.1',
+      live,
+      aggregateTickMs: 50,
+    });
+  });
+
+  afterEach(async () => {
+    await server.stop();
+  });
+
+  it('sends an aggregate-snapshot frame on connect, then aggregate-append per tick', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/live-agg`);
+    const received: WireMsg[] = [];
+    ws.on('message', (d) => received.push(decode(d.toString())));
+
+    await new Promise<void>((resolve, reject) => {
+      ws.on('error', reject);
+      ws.on('open', () => resolve());
+    });
+
+    // Push three samples for one host. The next tick should fold them
+    // into an aggregate row carrying all three in cpu_n.
+    const t0 = Date.now();
+    live.push([new Date(t0), 0.4, 100, 'api-1']);
+    live.push([new Date(t0 + 1), 0.6, 110, 'api-1']);
+    live.push([new Date(t0 + 2), 0.5, 120, 'api-1']);
+
+    // Wait for the snapshot + at least one append.
+    await waitForCount(received, 2);
+
+    ws.close();
+
+    const snap = received[0] as AggregateSnapshotMsg;
+    expect(snap.type).toBe('aggregate-snapshot');
+    expect(snap.thresholds).toEqual(DEFAULT_AGGREGATE_THRESHOLDS);
+    expect(snap.rows).toEqual([]);
+
+    const append = received.find(
+      (m) => m.type === 'aggregate-append',
+    ) as AggregateAppendMsg | undefined;
+    expect(append).toBeDefined();
+    expect(append!.rows.length).toBeGreaterThanOrEqual(1);
+    const apiOne = append!.rows.find((r) => r.host === 'api-1');
+    expect(apiOne).toBeDefined();
+    expect(apiOne!.cpu_n).toBeGreaterThanOrEqual(3);
+    expect(apiOne!.cpu_avg!).toBeCloseTo(0.5, 6);
+    // SD over [0.4, 0.6, 0.5] is sqrt((0.01 + 0.01 + 0)/3) ≈ 0.0816.
+    expect(apiOne!.cpu_sd!).toBeCloseTo(0.0816, 3);
+  });
+
+  it('does not interfere with the existing /live raw firehose', async () => {
+    const wsRaw = new WebSocket(`ws://127.0.0.1:${port}/live`);
+    const wsAgg = new WebSocket(`ws://127.0.0.1:${port}/live-agg`);
+    const rawRecv: WireMsg[] = [];
+    const aggRecv: WireMsg[] = [];
+    wsRaw.on('message', (d) => rawRecv.push(decode(d.toString())));
+    wsAgg.on('message', (d) => aggRecv.push(decode(d.toString())));
+
+    await Promise.all([
+      new Promise<void>((res, rej) => {
+        wsRaw.on('open', () => res());
+        wsRaw.on('error', rej);
+      }),
+      new Promise<void>((res, rej) => {
+        wsAgg.on('open', () => res());
+        wsAgg.on('error', rej);
+      }),
+    ]);
+    await waitForCount(rawRecv, 1);
+    await waitForCount(aggRecv, 1);
+
+    live.push([new Date(), 0.7, 200, 'api-x']);
+    // Raw side should see the append; agg side should see at least
+    // one tick frame.
+    await waitForCount(rawRecv, 2);
+    await waitForCount(aggRecv, 2);
+
+    wsRaw.close();
+    wsAgg.close();
+
+    expect(rawRecv[0].type).toBe('snapshot');
+    expect(rawRecv[1].type).toBe('append');
+    expect(aggRecv[0].type).toBe('aggregate-snapshot');
+    expect(aggRecv.slice(1).every((m) => m.type === 'aggregate-append')).toBe(
+      true,
+    );
   });
 });
 
