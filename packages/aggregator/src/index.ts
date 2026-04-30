@@ -1,6 +1,7 @@
 import { LiveSeries } from 'pond-ts';
 import { schema } from '@pond-experiment/shared';
 import { startIngest } from './ingest.js';
+import { startGcObserver } from './metrics.js';
 import { startServer } from './server.js';
 
 const PORT = Number(process.env.AGGREGATOR_PORT ?? '8080');
@@ -8,6 +9,8 @@ const PORT = Number(process.env.AGGREGATOR_PORT ?? '8080');
 // doesn't try `::1:50051` while the producer is bound to `0.0.0.0`
 // (IPv4-only). Friction-noted for M2 — see friction-notes/M2.md.
 const PRODUCER_URL = process.env.PRODUCER_URL ?? '127.0.0.1:50051';
+
+const stopGc = startGcObserver();
 
 const live = new LiveSeries({
   name: 'metrics',
@@ -25,6 +28,7 @@ console.log(
 const shutdown = async (signal: string) => {
   console.log(`received ${signal}, shutting down…`);
   stopIngest();
+  stopGc();
   await server.stop();
   process.exit(0);
 };

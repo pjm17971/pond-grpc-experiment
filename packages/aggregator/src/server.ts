@@ -4,6 +4,7 @@ import { type LiveSeries } from 'pond-ts';
 import { encode, type Schema } from '@pond-experiment/shared';
 import { buildSnapshot } from './snapshot.js';
 import { startFanout } from './fanout.js';
+import { recordBytesSent, snapshot as metricsSnapshot } from './metrics.js';
 
 export type ServerOptions = {
   port: number;
@@ -28,6 +29,15 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
 
   fastify.get('/health', async () => ({ ok: true }));
 
+  fastify.get('/metrics', async () => {
+    const bufferedAmount: number[] = [];
+    for (const c of clients) bufferedAmount.push(c.bufferedAmount);
+    return metricsSnapshot({
+      liveSeriesLength: opts.live.length,
+      wsClientBufferedAmounts: bufferedAmount,
+    });
+  });
+
   await fastify.listen({ port: opts.port, host: opts.host ?? '0.0.0.0' });
 
   const wss = new WebSocketServer({ server: fastify.server, path: '/live' });
@@ -41,9 +51,16 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   });
 
   const stopFanout = startFanout(opts.live, (frame) => {
+    let openCount = 0;
     for (const c of clients) {
-      if (c.readyState === c.OPEN) c.send(frame);
+      if (c.readyState === c.OPEN) {
+        c.send(frame);
+        openCount += 1;
+      }
     }
+    // Total bytes pushed onto the wire across all clients for this
+    // frame — used by /metrics for aggregate egress accounting.
+    if (openCount > 0) recordBytesSent(frame.length * openCount);
   });
 
   return {

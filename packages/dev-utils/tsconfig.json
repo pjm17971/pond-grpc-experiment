@@ -19,6 +19,5 @@
     "outDir": "./dist",
     "rootDir": "./src"
   },
-  "include": ["src/**/*"],
-  "references": [{ "path": "../shared" }, { "path": "../dev-utils" }]
+  "include": ["src/**/*"]
 }

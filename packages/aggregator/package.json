@@ -8,10 +8,13 @@
     "typecheck": "tsc -b",
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "bench:dev": "tsx scripts/bench.ts",
+    "bench:full": "tsx scripts/bench.ts --full"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.12.0",
+    "@pond-experiment/dev-utils": "workspace:*",
     "@pond-experiment/shared": "workspace:*",
     "fastify": "^5.0.0",
     "pond-ts": "^0.11.7",
