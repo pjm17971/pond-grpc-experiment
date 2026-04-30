@@ -164,6 +164,12 @@ export function startAggregate(
 ): { stop: () => void; aggregator: HostAggregator } {
   const tickMs = opts.tickMs ?? 200;
   const aggregator = new HostAggregator();
+  // Strictly monotonic so a clock backstep (NTP jump, manual change)
+  // or two timer fires within one tick boundary can't produce two
+  // frames with the same `ts`. `tickAt(t)` resets `newSinceTick` for
+  // every host, so a duplicate `ts` would also report `cpu_n=0` —
+  // bad signal both ways.
+  let lastTickTs = -1;
 
   const unsubscribe = live.on('batch', (events) => {
     for (const e of events) {
@@ -173,6 +179,8 @@ export function startAggregate(
 
   const interval = setInterval(() => {
     const tickTimeMs = Math.floor(Date.now() / tickMs) * tickMs;
+    if (tickTimeMs <= lastTickTs) return;
+    lastTickTs = tickTimeMs;
     const rows = aggregator.tick(tickTimeMs);
     if (rows.length === 0) return;
     const msg: AggregateAppendMsg = { type: 'aggregate-append', rows };

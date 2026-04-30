@@ -62,20 +62,23 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
 
   const wss = new WebSocketServer({
     server: fastify.server,
-    // Reject anything that isn't one of our paths so noVerifyClient
-    // doesn't grant /foo a connection. ws emits 'wsClientError' on
-    // mismatch; the default behaviour is to close the socket cleanly.
+    // Reject anything that isn't one of our paths so a stray /foo
+    // doesn't open a half-handled socket. The verify callback's
+    // second arg is the HTTP status returned during handshake (NOT a
+    // WebSocket close code), so 404 — there's no path here.
     verifyClient: (info, cb) => {
-      const url = info.req.url ?? '';
-      const ok = url === '/live' || url === '/live-agg';
-      cb(ok, ok ? undefined : 1008, ok ? undefined : 'unknown path');
+      const path = pathnameOf(info.req.url);
+      const ok = path === '/live' || path === '/live-agg';
+      cb(ok, ok ? undefined : 404, ok ? undefined : 'unknown path');
     },
   });
   const clients = new Set<WebSocket>();
   const aggClients = new Set<WebSocket>();
 
   wss.on('connection', (socket, req) => {
-    if (req.url === '/live-agg') {
+    // Tolerate `?foo=1` in case a client appends query params later
+    // for cache busting / debug. Path is the dispatch key.
+    if (pathnameOf(req.url) === '/live-agg') {
       aggClients.add(socket);
       const snap: AggregateSnapshotMsg = {
         type: 'aggregate-snapshot',
@@ -87,7 +90,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       socket.on('error', () => aggClients.delete(socket));
       return;
     }
-    // Default `/live` (also reached on the legacy unprefixed connect).
+    // Default `/live` — verifyClient already rejected anything else.
     clients.add(socket);
     socket.send(encode(buildSnapshot(opts.live)));
     socket.on('close', () => clients.delete(socket));
@@ -132,4 +135,15 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       await fastify.close();
     },
   };
+}
+
+/**
+ * Extract the pathname of a request URL. WS handshake `req.url` is
+ * just the path-and-query (`/foo?bar=1`), not a full URL — split on
+ * `?` rather than constructing a `URL` (cheap, no allocation).
+ */
+function pathnameOf(url: string | undefined): string {
+  if (!url) return '/';
+  const q = url.indexOf('?');
+  return q === -1 ? url : url.slice(0, q);
 }

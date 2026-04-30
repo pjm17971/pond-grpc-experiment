@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { HostAggregator } from './aggregate.js';
+import { LiveSeries } from 'pond-ts';
+import { schema } from '@pond-experiment/shared';
+import { HostAggregator, startAggregate } from './aggregate.js';
 
 describe('HostAggregator', () => {
   it('returns no rows before any sample arrives', () => {
@@ -79,6 +81,20 @@ describe('HostAggregator', () => {
     expect(rows.map((r) => r.host)).toEqual(['api-2']);
   });
 
+  it('tick(t) called twice with the same t emits cpu_n=0 the second time (no double-counting)', () => {
+    const agg = new HostAggregator();
+    agg.record('api-1', 1_000_000, 0.5);
+    agg.record('api-1', 1_000_001, 0.5);
+    const t1 = agg.tick(1_000_010);
+    expect(t1[0].cpu_n).toBe(2);
+    // The window data is unchanged but cpu_n was reset, so a duplicate
+    // tick at the same boundary reports zero new samples — never the
+    // original 2 again. (`startAggregate` additionally guards against
+    // the duplicate emission entirely.)
+    const t2 = agg.tick(1_000_010);
+    expect(t2[0].cpu_n).toBe(0);
+  });
+
   it('survives many ticks under steady-state churn (compaction smoke test)', () => {
     // 30 minutes of samples at 1ms cadence with one tick every 200ms.
     // A naive shift-on-every-trim implementation would O(n²) here; if
@@ -100,5 +116,39 @@ describe('HostAggregator', () => {
     // Window is 1m at 1 sample/ms; live count converges to 60_000.
     // We don't assert the exact internal length, just that the avg is
     // numerically stable across the 18k ticks.
+  });
+});
+
+describe('startAggregate tick clock', () => {
+  it('does not emit two append frames for the same tick boundary', async () => {
+    // Tight 5ms cadence: many ticks fire inside the test window. The
+    // monotonic guard in `startAggregate` should ensure every emitted
+    // frame has a strictly increasing `ts` even under timer jitter.
+    const live = new LiveSeries({
+      name: 'metrics',
+      schema,
+      retention: { maxAge: '6m' },
+    });
+    const frames: string[] = [];
+    const { stop } = startAggregate(live, (f) => frames.push(f), {
+      tickMs: 5,
+    });
+    try {
+      // Push enough events to trigger ticks; 50ms is 10 tick boundaries.
+      for (let i = 0; i < 20; i++) {
+        live.push([new Date(Date.now() + i), 0.5, 100, 'api-1']);
+      }
+      await new Promise((res) => setTimeout(res, 80));
+      const tickTimes = frames
+        .map((f) => JSON.parse(f) as { rows: { ts: number }[] })
+        .map((m) => m.rows[0]?.ts)
+        .filter((t): t is number => t !== undefined);
+      // Strictly monotonic — never equal, never decreasing.
+      for (let i = 1; i < tickTimes.length; i++) {
+        expect(tickTimes[i]).toBeGreaterThan(tickTimes[i - 1]);
+      }
+    } finally {
+      stop();
+    }
   });
 });

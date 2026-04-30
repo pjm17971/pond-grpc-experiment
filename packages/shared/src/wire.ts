@@ -40,8 +40,12 @@ export type AppendMsg = { type: 'append'; rows: ReadonlyArray<WireRow> };
  *
  * `cpu_avg` and `cpu_sd` are over the rolling 1m window; `cpu_n` is
  * the count of raw samples that arrived during this tick. Hosts with
- * no samples in the rolling window emit `cpu_avg`/`cpu_sd` as `null`
- * (the client treats this as a render gap).
+ * no samples in the rolling 1m window are omitted from the row set
+ * entirely (per `WIRE.md`'s "either omit or null" allowance) — the
+ * client renders a gap until the host re-appears. The fields keep
+ * `| null` in the type for forward compatibility: subsequent steps
+ * may emit `null` stats when a host has new samples this tick but
+ * none in the window (a regime that's not reachable in step 1).
  */
 export type HostTick = {
   ts: number;
