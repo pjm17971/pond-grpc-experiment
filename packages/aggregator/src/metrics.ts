@@ -52,6 +52,14 @@ function pct(sorted: ReadonlyArray<number>, p: number): number {
 
 // ── State ───────────────────────────────────────────────────────
 const ingestToFanout = new Histogram();
+/** Wall-clock ms `live.pushMany(rows)` took, per call (includes pond's synchronous batch listener fire). */
+const pushManyTotalMs = new Histogram();
+/** Wall-clock ms spent in fanout's `recordFanout` loop, per pond batch. */
+const fanoutRecordMs = new Histogram();
+/** Wall-clock ms spent in `events.map(toJsonRow)` + `JSON.stringify`, per pond batch. */
+const fanoutSerializeMs = new Histogram();
+/** Wall-clock ms spent in the WS broadcast loop (per-client `ws.send`), per pond batch. */
+const fanoutBroadcastMs = new Histogram();
 /**
  * Per-key FIFO queue of arrival timestamps. Keyed by `host:timeMs`,
  * which is NOT unique — at high producer rates `setInterval` can
@@ -148,13 +156,35 @@ export function recordBytesSent(totalBytes: number): void {
 
 /**
  * Called once per `live.pushMany(rows)` invocation in `ingest.ts`.
- * The phase-5 batching experiment uses this to measure how many
- * events the macrotask coalescer actually gathers per flush.
+ * Tracks batch sizes (how many events per call) and per-phase
+ * durations. `total` is the wall-clock from before pushMany to
+ * after it returns — includes pond's synchronous batch listener
+ * fire and everything inside it.
  */
-export function recordPushMany(batchSize: number): void {
+export function recordPushMany(batchSize: number, totalMs: number): void {
   pushManyCalls += 1;
   pushManyEventsTotal += batchSize;
   if (batchSize > pushManyBatchSizeMax) pushManyBatchSizeMax = batchSize;
+  pushManyTotalMs.add(totalMs);
+}
+
+/**
+ * Called once per pond `'batch'` listener fire (inside `fanout.ts`).
+ * Records how the listener's wall-clock budget breaks down across
+ * the recordFanout loop, JSON serialization, and WS broadcast.
+ *
+ * Subtracting `recordMs + serializeMs + broadcastMs` from the
+ * matching `pushManyTotalMs` sample gives "pond-only pushMany cost"
+ * (validation + insertion + listener dispatch overhead).
+ */
+export function recordFanoutPhases(args: {
+  recordMs: number;
+  serializeMs: number;
+  broadcastMs: number;
+}): void {
+  fanoutRecordMs.add(args.recordMs);
+  fanoutSerializeMs.add(args.serializeMs);
+  fanoutBroadcastMs.add(args.broadcastMs);
 }
 
 // ── Snapshot ────────────────────────────────────────────────────
@@ -178,6 +208,22 @@ export type MetricsSnapshot = {
   arrivalQueueLength: number;
   latency: {
     ingestToFanoutMs:
+      | { p50: number; p95: number; p99: number; count: number }
+      | null;
+    /** Per-pushMany-call total, includes pond's synchronous batch listener. */
+    pushManyTotalMs:
+      | { p50: number; p95: number; p99: number; count: number }
+      | null;
+    /** Per-batch wall-clock in the fanout's `recordFanout` loop. */
+    fanoutRecordMs:
+      | { p50: number; p95: number; p99: number; count: number }
+      | null;
+    /** Per-batch wall-clock in `events.map(toJsonRow)` + `JSON.stringify`. */
+    fanoutSerializeMs:
+      | { p50: number; p95: number; p99: number; count: number }
+      | null;
+    /** Per-batch wall-clock in the WS broadcast loop (per-client `ws.send`). */
+    fanoutBroadcastMs:
       | { p50: number; p95: number; p99: number; count: number }
       | null;
   };
@@ -217,7 +263,13 @@ export function snapshot(args: {
     },
     liveSeriesLength: args.liveSeriesLength,
     arrivalQueueLength: countArrivalEntries(),
-    latency: { ingestToFanoutMs: ingestToFanout.snapshot() },
+    latency: {
+      ingestToFanoutMs: ingestToFanout.snapshot(),
+      pushManyTotalMs: pushManyTotalMs.snapshot(),
+      fanoutRecordMs: fanoutRecordMs.snapshot(),
+      fanoutSerializeMs: fanoutSerializeMs.snapshot(),
+      fanoutBroadcastMs: fanoutBroadcastMs.snapshot(),
+    },
     ws: {
       clientCount: args.wsClientBufferedAmounts.length,
       bufferedAmount: args.wsClientBufferedAmounts,

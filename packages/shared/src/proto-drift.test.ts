@@ -58,4 +58,37 @@ describe('proto ↔ schema drift', () => {
       ).toContain(f.type);
     });
   });
+
+  it('EventBatch wraps `repeated Event events` and nothing else', () => {
+    // The wire shape: each gRPC frame carries one EventBatch with
+    // many Events. Pin the body so a refactor that adds extra
+    // fields (sequence numbers, sender clock) lands in this test
+    // before consumers see it.
+    const source = readFileSync(protoPath, 'utf8');
+
+    const m = /message\s+EventBatch\s*\{([\s\S]*?)\}/m.exec(source);
+    expect(m, 'EventBatch message not found in events.proto').toBeTruthy();
+    const body = m![1].replace(/\/\/[^\n]*/g, '');
+
+    // Cardinality keyword + type + name + field number, terminated.
+    const fieldRegex =
+      /^\s*(repeated|optional|required)?\s*([a-zA-Z0-9_]+)\s+([a-z0-9_]+)\s*=\s*\d+\s*;/gim;
+    const fields: Array<{
+      cardinality: string | undefined;
+      type: string;
+      name: string;
+    }> = [];
+    for (const match of body.matchAll(fieldRegex)) {
+      fields.push({
+        cardinality: match[1] || undefined,
+        type: match[2],
+        name: match[3],
+      });
+    }
+
+    expect(fields).toHaveLength(1);
+    expect(fields[0].cardinality).toBe('repeated');
+    expect(fields[0].type).toBe('Event');
+    expect(fields[0].name).toBe('events');
+  });
 });

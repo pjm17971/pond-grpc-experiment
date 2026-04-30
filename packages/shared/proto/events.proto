@@ -18,13 +18,26 @@ message Event {
   string host = 4;
 }
 
+// Wraps a per-tick group of `Event`s. Producer accumulates the
+// tick's events and writes one `EventBatch` per gRPC frame; the
+// aggregator unpacks into a single `pushMany`. Closes the per-event
+// gRPC bottleneck observed in M3 — see `friction-notes/M3.md`.
+//
+// Wrapping rather than streaming naked `repeated Event` because
+// proto3 doesn't allow `stream repeated`; the grouped message gives
+// us framing + room for batch-level metadata if M4+ wants it
+// (sequence numbers, sender clock, etc.).
+message EventBatch {
+  repeated Event events = 1;
+}
+
 // Empty for v1. Per-client filtering (host subset, rate cap) is M4
 // territory — once we add it, the SubscribeRequest fields land here.
 message SubscribeRequest {}
 
 service Producer {
-  // Server-streaming: producer pushes Events for as long as the
-  // stream is open. The aggregator dials once at startup and
+  // Server-streaming: producer pushes EventBatches for as long as
+  // the stream is open. The aggregator dials once at startup and
   // re-dials with shared exponential backoff on disconnect.
-  rpc Subscribe(SubscribeRequest) returns (stream Event);
+  rpc Subscribe(SubscribeRequest) returns (stream EventBatch);
 }

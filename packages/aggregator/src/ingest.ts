@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import { credentials, type ChannelCredentials } from '@grpc/grpc-js';
 import type { RowForSchema } from 'pond-ts/types';
 import { type LiveSeries } from 'pond-ts';
@@ -15,14 +16,15 @@ export type IngestOptions = {
 };
 
 /**
- * Dial the producer's `Subscribe` RPC and pump every Event into the
- * local LiveSeries. On stream end / error, reconnect with shared
- * exponential backoff. Returns a stop() function that cancels any
- * in-flight stream and prevents further reconnects.
+ * Dial the producer's `Subscribe` RPC and pump every `EventBatch`'s
+ * events into the local `LiveSeries`. On stream end / error,
+ * reconnect with shared exponential backoff. Returns a stop()
+ * function that cancels any in-flight stream and prevents further
+ * reconnects.
  *
- * The aggregator is a pure relay in M2 — no local simulator. The
- * producer owns event generation; this function is the bridge from
- * the gRPC stream to pond's `LiveSeries.push`.
+ * Each gRPC frame carries one `EventBatch`; the aggregator unpacks
+ * it into one `pushMany` call. The setImmediate-coalescer the M3
+ * baseline ingest used is gone — the wire IS the batch.
  */
 export function startIngest(
   live: LiveSeries<Schema>,
@@ -48,39 +50,28 @@ export function startIngest(
     // flapping; deferring the design call to M3.
     let firstFrame = true;
 
-    // Per-stream macrotask-coalescing buffer. Every gRPC 'data'
-    // event appends to `pending`; the first append per macrotask
-    // schedules a `setImmediate` flush that pushes the whole batch
-    // via `live.pushMany(rows)`. Coalescing collapses N synchronous
-    // pond.push() calls into one pushMany() per event-loop tick —
-    // M3 measurement showed this is ~3-5× the per-event regime at
-    // saturation rates.
-    let pending: IngestRow[] = [];
-    let scheduled = false;
-    const flush = () => {
-      scheduled = false;
-      if (pending.length === 0) return;
-      const batch = pending;
-      pending = [];
-      recordPushMany(batch.length);
-      live.pushMany(batch);
-    };
-
-    call.on('data', (event) => {
+    call.on('data', (batch) => {
       if (firstFrame) {
         attempt = 0;
         firstFrame = false;
       }
-      recordIngest(event.host, event.timeMs);
-      pending.push([
-        new Date(event.timeMs),
-        event.cpu,
-        event.requests,
-        event.host,
-      ]);
-      if (!scheduled) {
-        scheduled = true;
-        setImmediate(flush);
+      const events = batch.events;
+      const rows: IngestRow[] = new Array(events.length);
+      for (let i = 0; i < events.length; i++) {
+        const event = events[i];
+        recordIngest(event.host, event.timeMs);
+        rows[i] = [
+          new Date(event.timeMs),
+          event.cpu,
+          event.requests,
+          event.host,
+        ];
+      }
+      if (rows.length > 0) {
+        const t0 = performance.now();
+        live.pushMany(rows);
+        const totalMs = performance.now() - t0;
+        recordPushMany(rows.length, totalMs);
       }
     });
 

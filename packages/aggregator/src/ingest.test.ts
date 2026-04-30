@@ -3,7 +3,7 @@ import { LiveSeries } from 'pond-ts';
 import { schema } from '@pond-experiment/shared';
 import {
   ProducerService,
-  type Event,
+  type EventBatch,
   type ProducerServer,
   type SubscribeRequest,
 } from '@pond-experiment/shared/grpc';
@@ -15,13 +15,14 @@ import { startIngest } from './ingest.js';
  * `startIngest`, and assert events flow into the LiveSeries.
  *
  * This is the symmetric counterpart of `producer/src/grpc.test.ts`:
- * that test verifies the server delivers Events to a client; this
- * verifies the aggregator's client correctly pushes them into pond.
+ * that test verifies the server delivers EventBatches to a client;
+ * this verifies the aggregator's client correctly unpacks them and
+ * pushes the events into pond.
  */
 describe('aggregator gRPC ingest', () => {
   let server: Server;
   let port: number;
-  let writers: Set<(event: Event) => void>;
+  let writers: Set<(batch: EventBatch) => void>;
   let live: LiveSeries<typeof schema>;
   let stopIngest: () => void;
 
@@ -29,9 +30,9 @@ describe('aggregator gRPC ingest', () => {
     writers = new Set();
     server = new Server();
     const impl: ProducerServer = {
-      subscribe(call: ServerWritableStream<SubscribeRequest, Event>) {
-        const write = (event: Event) => {
-          call.write(event);
+      subscribe(call: ServerWritableStream<SubscribeRequest, EventBatch>) {
+        const write = (batch: EventBatch) => {
+          call.write(batch);
         };
         writers.add(write);
         const cleanup = () => writers.delete(write);
@@ -63,13 +64,17 @@ describe('aggregator gRPC ingest', () => {
     await new Promise<void>((res) => server.tryShutdown(() => res()));
   });
 
-  it('pushes streamed Events into the local LiveSeries', async () => {
+  it('unpacks an EventBatch and pushMany-s its events into the LiveSeries', async () => {
     // Wait for the ingest client's stream to register.
     await waitFor(() => writers.size === 1);
 
     for (const write of writers) {
-      write({ timeMs: 1_700_000_000_000, cpu: 0.5, requests: 100, host: 'api-1' });
-      write({ timeMs: 1_700_000_000_050, cpu: 0.6, requests: 110, host: 'api-2' });
+      write({
+        events: [
+          { timeMs: 1_700_000_000_000, cpu: 0.5, requests: 100, host: 'api-1' },
+          { timeMs: 1_700_000_000_050, cpu: 0.6, requests: 110, host: 'api-2' },
+        ],
+      });
     }
 
     await waitFor(() => live.length === 2, 1500);

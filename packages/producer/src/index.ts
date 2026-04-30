@@ -1,4 +1,4 @@
-import type { Event } from '@pond-experiment/shared/grpc';
+import type { EventBatch } from '@pond-experiment/shared/grpc';
 import { startSimulator } from './simulator.js';
 import { startGrpcServer } from './grpc.js';
 
@@ -7,11 +7,11 @@ const EVENTS_PER_SEC = Number(process.env.EVENTS_PER_SEC ?? '2');
 const HOST_COUNT = Number(process.env.HOST_COUNT ?? '4');
 const VARIABILITY = Number(process.env.VARIABILITY ?? '0.4');
 
-// One subscriber per open Subscribe stream. The simulator emits to
-// every subscriber on each tick; subscribers close themselves on
-// stream cancel/close/error via the unsubscribe returned by
-// `subscribe()`.
-const subscribers = new Set<(event: Event) => void>();
+// One subscriber per open Subscribe stream. The simulator emits one
+// EventBatch per tick to every subscriber; subscribers close
+// themselves on stream cancel/close/error via the unsubscribe
+// returned by `subscribe()`.
+const subscribers = new Set<(batch: EventBatch) => void>();
 
 const stopSimulator = startSimulator(
   {
@@ -19,8 +19,8 @@ const stopSimulator = startSimulator(
     hostCount: HOST_COUNT,
     variability: VARIABILITY,
   },
-  (event) => {
-    for (const write of subscribers) write(event);
+  (batch) => {
+    for (const write of subscribers) write(batch);
   },
 );
 
