@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { HOSTS } from '@pond-experiment/shared';
+import { AggregateProbe } from './sections/AggregateProbe';
 import { CpuSection } from './sections/CpuSection';
 import { HostToggles } from './sections/HostToggles';
 import { LogsSection } from './sections/LogsSection';
@@ -7,6 +8,20 @@ import { PageSummary } from './sections/PageSummary';
 import { RequestsSection } from './sections/RequestsSection';
 import type { ChartOpts } from './useDashboardData';
 import { useDashboardData } from './useDashboardData';
+
+/**
+ * Aggregate-stream URL (`/live-agg`). Defaults to deriving the path
+ * from `VITE_WS_URL` so a single env var configures both endpoints;
+ * `VITE_WS_AGG_URL` is the explicit override when the two streams
+ * land on different hosts (e.g. M4 fan-out across aggregators).
+ */
+const RAW_WS_URL =
+  import.meta.env.VITE_WS_URL ?? 'ws://localhost:8080/live';
+const AGG_WS_URL =
+  import.meta.env.VITE_WS_AGG_URL ??
+  (RAW_WS_URL.endsWith('/live')
+    ? `${RAW_WS_URL.slice(0, -'/live'.length)}/live-agg`
+    : `${RAW_WS_URL}-agg`);
 
 /**
  * The dashboard is a layout shell. State lives here as a small set of
@@ -74,6 +89,7 @@ export function Dashboard() {
       />
       <RequestsSection data={data} />
       <LogsSection data={data} />
+      <AggregateProbe url={AGG_WS_URL} />
     </div>
   );
 }
