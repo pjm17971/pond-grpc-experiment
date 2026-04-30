@@ -2,7 +2,7 @@ import { credentials } from '@grpc/grpc-js';
 import {
   ProducerClient,
   SubscribeRequest,
-  type Event,
+  type EventBatch,
 } from '@pond-experiment/shared/grpc';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { startGrpcServer, type RunningGrpcServer } from './grpc.js';
@@ -10,7 +10,7 @@ import { startGrpcServer, type RunningGrpcServer } from './grpc.js';
 describe('producer gRPC server', () => {
   let server: RunningGrpcServer;
   let port: number;
-  let subscribers = new Set<(event: Event) => void>();
+  let subscribers = new Set<(batch: EventBatch) => void>();
 
   beforeEach(async () => {
     subscribers = new Set();
@@ -31,21 +31,21 @@ describe('producer gRPC server', () => {
     await server.stop();
   });
 
-  it('streams Events from onSubscribe to the client', async () => {
+  it('streams EventBatches from onSubscribe to the client', async () => {
     const client = new ProducerClient(
       `127.0.0.1:${port}`,
       credentials.createInsecure(),
     );
-    const received: Event[] = [];
+    const received: EventBatch[] = [];
     const call = client.subscribe(SubscribeRequest.create());
 
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(
-        () => reject(new Error('no events received within 1500ms')),
+        () => reject(new Error('no batches received within 1500ms')),
         1500,
       );
-      call.on('data', (event: Event) => {
-        received.push(event);
+      call.on('data', (batch: EventBatch) => {
+        received.push(batch);
         if (received.length === 2) {
           clearTimeout(timeout);
           resolve();
@@ -56,11 +56,20 @@ describe('producer gRPC server', () => {
         reject(err);
       });
 
-      // Synthesize two events into the producer's fan-out.
+      // Synthesize two EventBatches into the producer's fan-out.
       setTimeout(() => {
         for (const write of subscribers) {
-          write({ timeMs: 1_700_000_000_000, cpu: 0.5, requests: 100, host: 'api-1' });
-          write({ timeMs: 1_700_000_000_001, cpu: 0.6, requests: 110, host: 'api-2' });
+          write({
+            events: [
+              { timeMs: 1_700_000_000_000, cpu: 0.5, requests: 100, host: 'api-1' },
+              { timeMs: 1_700_000_000_001, cpu: 0.55, requests: 105, host: 'api-2' },
+            ],
+          });
+          write({
+            events: [
+              { timeMs: 1_700_000_001_000, cpu: 0.6, requests: 110, host: 'api-1' },
+            ],
+          });
         }
       }, 100);
     });
@@ -69,9 +78,11 @@ describe('producer gRPC server', () => {
     client.close();
 
     expect(received).toHaveLength(2);
-    expect(received[0].host).toBe('api-1');
-    expect(received[0].cpu).toBeCloseTo(0.5);
-    expect(received[1].host).toBe('api-2');
+    expect(received[0].events).toHaveLength(2);
+    expect(received[0].events[0].host).toBe('api-1');
+    expect(received[0].events[1].host).toBe('api-2');
+    expect(received[1].events).toHaveLength(1);
+    expect(received[1].events[0].cpu).toBeCloseTo(0.6);
   });
 
   it('unsubscribes the writer when the stream is cancelled', async () => {

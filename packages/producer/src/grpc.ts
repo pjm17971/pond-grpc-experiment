@@ -1,7 +1,7 @@
 import { Server, ServerCredentials, type ServerWritableStream } from '@grpc/grpc-js';
 import {
   ProducerService,
-  type Event,
+  type EventBatch,
   type ProducerServer,
   type SubscribeRequest,
 } from '@pond-experiment/shared/grpc';
@@ -10,11 +10,11 @@ export type GrpcServerOptions = {
   port: number;
   host?: string;
   /**
-   * Called once per opened Subscribe stream. Pass each event to
-   * `write` to forward it to that client. Return an unsubscribe
+   * Called once per opened Subscribe stream. Pass each `EventBatch`
+   * to `write` to forward it as one gRPC frame. Return an unsubscribe
    * function that the server invokes on stream end / cancel / error.
    */
-  onSubscribe: (write: (event: Event) => void) => () => void;
+  onSubscribe: (write: (batch: EventBatch) => void) => () => void;
 };
 
 export type RunningGrpcServer = {
@@ -32,12 +32,12 @@ export async function startGrpcServer(
   const server = new Server();
 
   const impl: ProducerServer = {
-    subscribe(call: ServerWritableStream<SubscribeRequest, Event>) {
-      const unsubscribe = opts.onSubscribe((event) => {
+    subscribe(call: ServerWritableStream<SubscribeRequest, EventBatch>) {
+      const unsubscribe = opts.onSubscribe((batch) => {
         // ServerWritableStream.write returns a boolean for backpressure
         // signalling. v1 ignores it — slow-client policy is M4. The
         // stream's internal queue absorbs short bursts.
-        call.write(event);
+        call.write(batch);
       });
       const cleanup = () => {
         unsubscribe();

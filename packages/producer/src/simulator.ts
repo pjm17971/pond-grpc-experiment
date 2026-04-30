@@ -1,5 +1,5 @@
 import { HOSTS } from '@pond-experiment/shared';
-import type { Event } from '@pond-experiment/shared/grpc';
+import type { Event, EventBatch } from '@pond-experiment/shared/grpc';
 
 /**
  * Per-host CPU baseline. Each host gets a distinct mean so the chart
@@ -33,45 +33,46 @@ export type SimulatorOptions = {
 
 /**
  * Generate synthetic metric events on a setInterval. Each tick emits
- * one Event per host through the `onEvent` callback, all sharing the
- * tick's `Date.now()` timestamp.
+ * one Event per host, packaged into a single `EventBatch` and
+ * delivered through the `onBatch` callback. The producer's gRPC
+ * Subscribe stream forwards each batch as one frame.
  *
- * M1 staggered per-host timestamps inside the tick to dodge a
- * misdiagnosed `count()` collapse. The pond-ts 0.11.6 docs clarified
- * that same-`Time` events do **not** collapse — they each contribute
- * to count, reduce, etc. independently. Removing the stagger:
- *  - lets the simulator scale past M3 stress rates (at 1ms
- *    `tickMs` the staggered offsets `[0..n-1]ms` would bleed into
- *    the next tick and trigger `out-of-order` ValidationError on
- *    the consumer side);
- *  - simplifies the timeline (one wall-clock ms per tick).
+ * Per-tick batching closes the per-event gRPC bottleneck observed
+ * in M3 (avg coalesced batch was 1.4 events on the consumer side
+ * because gRPC delivers events one per event-loop tick). With
+ * EventBatch the wire IS the batch — at P=100 each frame carries
+ * ~100 events, which matches library-bench territory for `pushMany`.
  *
- * Across ticks, timestamps are monotonically non-decreasing because
- * `Date.now()` is monotonic. Pond's `ordering: 'strict'` (default)
+ * Across ticks, timestamps are monotonically non-decreasing
+ * (`Date.now()` is monotonic). Pond's `ordering: 'strict'` (default)
  * accepts equal timestamps but rejects strictly-earlier ones, so
- * the simulator stays compatible with the default mode.
+ * same-tick events sharing one `Date.now()` ms are fine — they each
+ * contribute independently to `count`, `reduce`, etc. (clarified in
+ * pond-ts 0.11.6 docs).
  */
 export function startSimulator(
   opts: SimulatorOptions,
-  onEvent: (event: Event) => void,
+  onBatch: (batch: EventBatch) => void,
 ): () => void {
   const tickMs = 1000 / opts.eventsPerSec;
   const id = setInterval(() => {
     const baseT = Date.now();
     const n = opts.hostCount;
+    const events: Event[] = new Array(n);
     for (let i = 0; i < n; i++) {
       const mean = HOST_MEANS[i % HOST_MEANS.length];
       const cpu = Math.max(
         0,
         Math.min(1, mean + (Math.random() - 0.5) * opts.variability),
       );
-      onEvent({
+      events[i] = {
         timeMs: baseT,
         cpu,
         requests: Math.floor(Math.random() * 200),
         host: hostNameAt(i),
-      });
+      };
     }
+    onBatch({ events });
   }, tickMs);
   return () => clearInterval(id);
 }
