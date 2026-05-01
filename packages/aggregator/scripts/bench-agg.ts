@@ -230,8 +230,19 @@ async function main(): Promise<void> {
       `Hosts per frame ........ p50 ${hostsP50}, p99 ${hostsP99}` +
         `   (target ~${args.P} once warm)`,
     );
-    console.log(`Raw events folded in ... ${num(Math.round(aggRawEventsPerSec))}/s`);
-    console.log(`Fan-in (raw/frame) ..... ${fanInRaw.toFixed(1)}`);
+    // `cpu_n` semantics:
+    //   - per-tick (M3.5 v1, manual HostAggregator): cpu_n = samples
+    //     in this tick interval. Sum × frames/sec ≈ raw rows/sec is
+    //     a meaningful conservation check.
+    //   - bucket-count (M3.5 v3, pond AggregateOutputMap rolling):
+    //     cpu_n = samples in the rolling-1m bucket the stats came
+    //     from. Same events appear in many buckets at steady state;
+    //     no direct conservation check against raw rows/sec.
+    // The script can't tell which semantic is in use; print both
+    // raw values and let the reader interpret.
+    console.log(`cpu_n sum/sec .......... ${num(Math.round(aggRawEventsPerSec))}` +
+      `   (per-tick: ≈ raw rows/sec; bucket-count: ≈ rate × window × frames/sec)`);
+    console.log(`cpu_n per host per frm . ${(fanInRaw / Math.max(1, hostsP50)).toFixed(1)}`);
     console.log('');
     console.log('── Aggregator pressure ──────────────────');
     if (lat) {
@@ -252,14 +263,22 @@ async function main(): Promise<void> {
     );
     console.log('');
 
-    // Sanity: aggregate fan-in × frames/sec should ≈ raw rows/sec.
-    // If not, the aggregate listener is dropping events somewhere.
+    // Conservation check (only valid for per-tick `cpu_n` semantics).
+    // Skip for bucket-count cpu_n; the reader can spot it by the
+    // cpu_n-per-host-per-frame value being much larger than
+    // raw_rate / hosts / 5 frames/sec.
     const fanInTotalPerSec = fanInRaw * aggFramesPerSec;
     const drift =
       rawRowsPerSec === 0 ? 0 : (fanInTotalPerSec / rawRowsPerSec) * 100 - 100;
-    console.log(
-      `Sanity: fan-in × frames/sec = ${num(Math.round(fanInTotalPerSec))}/s vs raw rows/sec ${num(Math.round(rawRowsPerSec))}/s (${drift.toFixed(1)}% drift)`,
-    );
+    if (Math.abs(drift) < 30) {
+      console.log(
+        `Conservation check: cpu_n_sum × frames/sec = ${num(Math.round(fanInTotalPerSec))}/s vs raw rows/sec ${num(Math.round(rawRowsPerSec))}/s (${drift.toFixed(1)}% drift) — per-tick cpu_n is conserving events`,
+      );
+    } else {
+      console.log(
+        `Conservation check: skipped (cpu_n looks like bucket-count semantics — same events appear in many frames at steady state)`,
+      );
+    }
   } finally {
     rawProbe?.close();
     aggProbe?.close();

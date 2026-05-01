@@ -8,11 +8,16 @@ import {
 import { startAggregate } from './aggregate.js';
 
 /**
- * Tests now exercise `startAggregate` end-to-end against a real
- * `LiveSeries`, not a hand-rolled `HostAggregator`. The math itself
- * lives in pond's reducers (`avg`, `stdev`, `count`); we assert the
- * pipeline composition: synchronised tick clock, three-way merge by
- * (ts, host), no double-emission, monotonic frame ts.
+ * Tests exercise `startAggregate` end-to-end against a real
+ * `LiveSeries`. With pond 0.13's `AggregateOutputMap` overload on
+ * `LivePartitionedSeries.rolling`, all three CPU stats (`cpu_avg`,
+ * `cpu_sd`, `cpu_n`) come from one rolling pipeline; we assert the
+ * pipeline composition: synchronised tick clock, single-frame-per-ts
+ * collation, monotonic frame ts.
+ *
+ * `cpu_n` here is the bucket's own sample count (the gating signal),
+ * not a per-tick count. The 200ms parallel window earlier drafts had
+ * is gone — see PR #14 / friction-notes/M3.5.md.
  *
  * Numerically-precise reducer behaviour is pond's responsibility and
  * is covered in its own test suite.
@@ -169,12 +174,11 @@ describe('startAggregate', () => {
       expect(apiOne).toBeDefined();
       expect(apiOne!.cpu_avg).toBeCloseTo(0.5, 5);
       expect(apiOne!.cpu_sd).toBeCloseTo(0, 5);
-      // `cpu_n` is the count over the per-tick window (`tickMs`
-      // here = 30), so it carries the samples that landed in the
-      // most recent tick — not the rolling-1m total. Lower bound
-      // is "at least one" since this test only confirms the column
-      // is populated.
-      expect(apiOne!.cpu_n).toBeGreaterThanOrEqual(1);
+      // `cpu_n` is the bucket's own count (samples in the rolling
+      // 1m window) — gating signal for "are mean/sd backed by
+      // enough samples?" The trigger only controls *when* the
+      // bucket reports, not what's in it.
+      expect(apiOne!.cpu_n).toBeGreaterThanOrEqual(5);
     } finally {
       stop();
     }
