@@ -1,4 +1,11 @@
-import { type LiveSeries } from 'pond-ts';
+import {
+  Sequence,
+  Trigger,
+  type LiveSeries,
+  type LiveSource,
+  type SeriesSchema,
+  type EventForSchema,
+} from 'pond-ts';
 import {
   type AggregateAppendMsg,
   type HostTick,
@@ -7,194 +14,142 @@ import {
 } from '@pond-experiment/shared';
 
 /**
- * Rolling 1-minute window of CPU samples for one host. Stored as two
- * parallel `number[]`s (timestamps + values) so we can trim by time
- * without allocating a tuple per sample. `head` is the index of the
- * oldest live sample; entries below `head` are dead but not yet
- * compacted.
+ * Server-side aggregate-stream emitter, M3.5 step 1 shape.
  *
- * We compact (`splice`) lazily — when at least 25% of the array is
- * dead — so the steady-state cost per push is amortised O(1) and we
- * avoid an array shift on every sample at high rates.
+ * Builds the per-host tick aggregates the `/live-agg` wire ships
+ * (`{ ts, host, cpu_avg, cpu_sd, cpu_n }`) by composing pond 0.13's
+ * partitioned-rolling primitives. With pond 0.13's `AggregateOutputMap`
+ * overload on `LivePartitionedSeries.rolling`, three named outputs
+ * come from one source column off a single rolling buffer:
+ *
+ *     live.partitionBy('host').rolling('1m', {
+ *       cpu_avg: { from: 'cpu', using: 'avg' },
+ *       cpu_sd:  { from: 'cpu', using: 'stdev' },
+ *       cpu_n:   { from: 'cpu', using: 'count' },
+ *     }, { trigger: Trigger.clock(seq) });
+ *
+ * Each emission is one synchronised row per known partition every
+ * time any partition's source event crosses a sequence boundary.
+ * Partition tag (`host`) is auto-injected into the unified output's
+ * schema; the experiment reads it via `e.get('host')`.
+ *
+ * Conceptual frame (the library agent's correction during this
+ * milestone): `cpu_n` is the **bucket's own count** — gating signal
+ * for the consumer ("are mean/sd backed by enough samples to be
+ * meaningful?"). It is NOT a per-tick sample count. The trigger only
+ * controls *when the bucket reports*; the bucket is still the bucket.
+ *
+ * The 200ms current-slice window earlier drafts of this file used
+ * was speculative work for an unbuilt feature; it's gone. When step
+ * 4+ adds anomaly density, a SECOND parallel rolling on a short
+ * leading-edge window (current state vs baseline) will come back —
+ * but with structurally different fields (`n_current`,
+ * `anomalies_above[]`, `anomalies_below[]`), not duplicated stats.
+ *
+ * What pond owns:
+ * - The rolling-window storage (one buffer per partition)
+ * - All three reducers, numerically correct and library-tested
+ * - The synchronised tick clock (`Trigger.clock`)
+ * - Auto-injection of the partition tag in the unified output
+ *
+ * What the experiment still owns:
+ * - The wire envelope encoding (`AggregateAppendMsg` → JSON)
+ * - The microtask-deferred per-`ts` row collation (one frame per
+ *   boundary across all partitions)
  */
-type HostBuffer = {
-  times: number[];
-  values: number[];
-  head: number;
-  /** Count of samples that arrived since the last `tick()` call. */
-  newSinceTick: number;
-};
-
-const WINDOW_MS = 60_000;
-const COMPACT_THRESHOLD = 0.25;
-
-/**
- * Per-host rolling-window aggregator. Wired to the aggregator's
- * `LiveSeries` via `live.on('batch', …)`: every event observed by the
- * fanout's batch listener also flows through `record()` here. On a
- * fixed 200ms tick a `HostTick` is emitted per host that has any
- * sample in the live window — silent hosts drop out of the frame.
- *
- * Step 1 of M3.5 computes mean and (population) standard deviation
- * over the rolling 1m window directly from the buffer. The full
- * `WIRE.md` shape (anomalies arrays at fixed σ thresholds, requests
- * stats, min/max) is staged in follow-up PRs.
- *
- * Computation is deliberately manual rather than driven through pond
- * (`partitionBy('host').baseline('cpu', { window: '1m' })`) for
- * step 1: pond's server-side partition+baseline-as-aggregate API
- * isn't surfaced for tick-driven sampling yet, and rolling here keeps
- * the wire-format work decoupled from a library RFC. See
- * `friction-notes/M3.5.md` for the API gap that drives the M5 sweep.
- */
-export class HostAggregator {
-  private readonly buffers = new Map<string, HostBuffer>();
-
-  /** Called once per CPU sample observed in the fanout's batch listener. */
-  record(host: string, sampleTimeMs: number, cpu: number): void {
-    let buf = this.buffers.get(host);
-    if (!buf) {
-      buf = { times: [], values: [], head: 0, newSinceTick: 0 };
-      this.buffers.set(host, buf);
-    }
-    buf.times.push(sampleTimeMs);
-    buf.values.push(cpu);
-    buf.newSinceTick += 1;
-  }
-
-  /**
-   * Snapshot every host's window at tick time. `tickTimeMs` is the
-   * wall-clock used both as the emitted `ts` (so the dashboard
-   * receives a synchronized clock across all host frames) and as the
-   * trim cutoff (`tickTimeMs - 60s`). Resets the per-host
-   * `newSinceTick` counter so the next tick measures the next window.
-   */
-  tick(tickTimeMs: number): HostTick[] {
-    const cutoff = tickTimeMs - WINDOW_MS;
-    const rows: HostTick[] = [];
-
-    for (const [host, buf] of this.buffers) {
-      // Advance head past anything older than the cutoff.
-      while (buf.head < buf.times.length && buf.times[buf.head] < cutoff) {
-        buf.head += 1;
-      }
-      // Compact when the dead prefix grows large enough — bounds the
-      // unsplice cost without paying it on every push.
-      const liveCount = buf.times.length - buf.head;
-      if (
-        buf.head > 0 &&
-        buf.head / buf.times.length >= COMPACT_THRESHOLD
-      ) {
-        buf.times.splice(0, buf.head);
-        buf.values.splice(0, buf.head);
-        buf.head = 0;
-      }
-
-      const cpu_n = buf.newSinceTick;
-      buf.newSinceTick = 0;
-
-      if (liveCount === 0) {
-        // Silent host this minute — drop the row entirely (the client
-        // renders a gap until the host re-appears).
-        continue;
-      }
-
-      let sum = 0;
-      for (let i = buf.head; i < buf.times.length; i++) {
-        sum += buf.values[i];
-      }
-      const mean = sum / liveCount;
-      let sqSum = 0;
-      for (let i = buf.head; i < buf.times.length; i++) {
-        const d = buf.values[i] - mean;
-        sqSum += d * d;
-      }
-      const sd = Math.sqrt(sqSum / liveCount);
-
-      rows.push({
-        ts: tickTimeMs,
-        host,
-        cpu_avg: mean,
-        cpu_sd: sd,
-        cpu_n,
-      });
-    }
-
-    return rows;
-  }
-
-  /**
-   * Drop the per-host buffer entirely. Used by the GC sweep when a
-   * host has been silent for long enough that we don't even want it
-   * occupying a key in the map. Step 1 doesn't run a sweep; left as
-   * an explicit primitive for follow-up work.
-   */
-  forget(host: string): void {
-    this.buffers.delete(host);
-  }
-
-  /** Test-only — number of hosts currently tracked. */
-  get hostCount(): number {
-    return this.buffers.size;
-  }
-}
-
 export type AggregateOptions = {
-  /** Tick cadence in milliseconds. WIRE.md target is 200ms. */
+  /** Tick cadence in milliseconds. Default 200, matches `WIRE.md`. */
   tickMs?: number;
 };
 
-/**
- * Subscribe to the live series's batch fire, feed CPU samples into a
- * `HostAggregator`, and emit one `aggregate-append` frame per tick on
- * the supplied broadcast callback. Returns a `stop()` that disconnects
- * both the listener and the tick interval.
- *
- * Tick clock is `Date.now()` rounded down to the nearest tick boundary
- * — gives every frame in a tick the same `ts` regardless of when the
- * `setInterval` callback actually fires (which jitters under load).
- *
- * The aggregator process is the single producer of ticks; all clients
- * connected to `/live-agg` receive the same frame.
- */
 export function startAggregate(
   live: LiveSeries<Schema>,
   broadcast: (frame: string) => void,
   opts: AggregateOptions = {},
-): { stop: () => void; aggregator: HostAggregator } {
+): { stop: () => void } {
   const tickMs = opts.tickMs ?? 200;
-  const aggregator = new HostAggregator();
-  // Strictly monotonic so a clock backstep (NTP jump, manual change)
-  // or two timer fires within one tick boundary can't produce two
-  // frames with the same `ts`. `tickAt(t)` resets `newSinceTick` for
-  // every host, so a duplicate `ts` would also report `cpu_n=0` —
-  // bad signal both ways.
-  let lastTickTs = -1;
+  const seq = Sequence.every(`${tickMs}ms`);
+  const trigger = Trigger.clock(seq);
 
-  const unsubscribe = live.on('batch', (events) => {
-    for (const e of events) {
-      aggregator.record(e.get('host'), e.key().timestampMs(), e.get('cpu'));
+  // Single rolling pipeline producing all three CPU stats from one
+  // 1m buffer per host. cpu_n is the bucket's count (gating signal),
+  // not a per-tick count.
+  const stream: LiveSource<SeriesSchema> = live.partitionBy('host').rolling(
+    '1m',
+    {
+      cpu_avg: { from: 'cpu', using: 'avg' },
+      cpu_sd: { from: 'cpu', using: 'stdev' },
+      cpu_n: { from: 'cpu', using: 'count' },
+    },
+    { trigger },
+  );
+
+  // Per-`ts` row collation. Pond's clock trigger fires every known
+  // partition at the same boundary `ts`, so we accumulate rows in
+  // the current macrotask and emit one wire frame per boundary on
+  // the next microtask. Using `Map<ts, HostTick[]>` so a synchronous
+  // batch that crosses multiple boundaries doesn't collapse into one
+  // frame.
+  const pendingByTs = new Map<number, HostTick[]>();
+
+  // Strict monotonicity guard against duplicate frames if the library
+  // ever fires two emits at the same boundary (it shouldn't, but
+  // mirroring the v1 guard costs ~one branch).
+  let lastEmittedTs = -1;
+
+  let scheduled = false;
+  const scheduleEmit = (): void => {
+    if (scheduled) return;
+    scheduled = true;
+    queueMicrotask(() => {
+      scheduled = false;
+      tryEmit();
+    });
+  };
+
+  const tryEmit = (): void => {
+    const tsList = [...pendingByTs.keys()].sort((a, b) => a - b);
+    for (const ts of tsList) {
+      if (ts <= lastEmittedTs) {
+        pendingByTs.delete(ts);
+        continue;
+      }
+      const rows = pendingByTs.get(ts);
+      if (!rows || rows.length === 0) continue;
+      lastEmittedTs = ts;
+      const msg: AggregateAppendMsg = { type: 'aggregate-append', rows };
+      broadcast(encode(msg));
+      pendingByTs.delete(ts);
     }
+  };
+
+  const off = stream.on('event', (e: EventForSchema<SeriesSchema>) => {
+    const ts = e.key().begin();
+    const host = e.get('host');
+    if (typeof host !== 'string') return;
+    const cpu_avg = e.get('cpu_avg');
+    const cpu_sd = e.get('cpu_sd');
+    const cpu_n = e.get('cpu_n');
+    const row: HostTick = {
+      ts,
+      host,
+      cpu_avg: typeof cpu_avg === 'number' ? cpu_avg : null,
+      cpu_sd: typeof cpu_sd === 'number' ? cpu_sd : null,
+      cpu_n: typeof cpu_n === 'number' ? cpu_n : 0,
+    };
+    let rows = pendingByTs.get(ts);
+    if (!rows) {
+      rows = [];
+      pendingByTs.set(ts, rows);
+    }
+    rows.push(row);
+    scheduleEmit();
   });
 
-  const interval = setInterval(() => {
-    const tickTimeMs = Math.floor(Date.now() / tickMs) * tickMs;
-    if (tickTimeMs <= lastTickTs) return;
-    lastTickTs = tickTimeMs;
-    const rows = aggregator.tick(tickTimeMs);
-    if (rows.length === 0) return;
-    const msg: AggregateAppendMsg = { type: 'aggregate-append', rows };
-    broadcast(encode(msg));
-  }, tickMs);
-  // Don't keep the event loop alive on shutdown; the explicit stop()
-  // is the supported teardown.
-  interval.unref();
-
   return {
-    aggregator,
     stop: () => {
-      clearInterval(interval);
-      unsubscribe();
+      off();
+      pendingByTs.clear();
     },
   };
 }
