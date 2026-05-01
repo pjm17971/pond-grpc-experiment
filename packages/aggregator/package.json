@@ -18,7 +18,7 @@
     "@pond-experiment/dev-utils": "workspace:*",
     "@pond-experiment/shared": "workspace:*",
     "fastify": "^5.0.0",
-    "pond-ts": "^0.13.0",
+    "pond-ts": "^0.14.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
