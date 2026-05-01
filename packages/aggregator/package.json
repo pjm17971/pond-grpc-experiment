@@ -10,14 +10,15 @@
     "start": "tsx src/index.ts",
     "test": "vitest run",
     "bench:dev": "tsx scripts/bench.ts",
-    "bench:full": "tsx scripts/bench.ts --full"
+    "bench:full": "tsx scripts/bench.ts --full",
+    "bench:agg": "tsx scripts/bench-agg.ts"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.12.0",
     "@pond-experiment/dev-utils": "workspace:*",
     "@pond-experiment/shared": "workspace:*",
     "fastify": "^5.0.0",
-    "pond-ts": "^0.11.7",
+    "pond-ts": "^0.12.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {

@@ -1,129 +1,31 @@
 import { describe, it, expect } from 'vitest';
 import { LiveSeries } from 'pond-ts';
-import { schema } from '@pond-experiment/shared';
-import { HostAggregator, startAggregate } from './aggregate.js';
+import {
+  schema,
+  decode,
+  type AggregateAppendMsg,
+} from '@pond-experiment/shared';
+import { startAggregate } from './aggregate.js';
 
-describe('HostAggregator', () => {
-  it('returns no rows before any sample arrives', () => {
-    const agg = new HostAggregator();
-    expect(agg.tick(1_000_000)).toEqual([]);
-  });
+/**
+ * Tests now exercise `startAggregate` end-to-end against a real
+ * `LiveSeries`, not a hand-rolled `HostAggregator`. The math itself
+ * lives in pond's reducers (`avg`, `stdev`, `count`); we assert the
+ * pipeline composition: synchronised tick clock, three-way merge by
+ * (ts, host), no double-emission, monotonic frame ts.
+ *
+ * Numerically-precise reducer behaviour is pond's responsibility and
+ * is covered in its own test suite.
+ */
 
-  it('emits cpu_avg and cpu_sd over the rolling 1m window', () => {
-    const agg = new HostAggregator();
-    const tick = 1_000_000;
-    // Six samples over the 1m window. Mean = 0.55, population SD over
-    // [0.4, 0.5, 0.6, 0.5, 0.7, 0.6] = sqrt(0.0091...) ≈ 0.0957.
-    agg.record('api-1', tick - 50_000, 0.4);
-    agg.record('api-1', tick - 40_000, 0.5);
-    agg.record('api-1', tick - 30_000, 0.6);
-    agg.record('api-1', tick - 20_000, 0.5);
-    agg.record('api-1', tick - 10_000, 0.7);
-    agg.record('api-1', tick - 1_000, 0.6);
+function decodedFrames(frames: string[]): AggregateAppendMsg[] {
+  return frames
+    .map((f) => decode(f))
+    .filter((m): m is AggregateAppendMsg => m.type === 'aggregate-append');
+}
 
-    const rows = agg.tick(tick);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ ts: tick, host: 'api-1', cpu_n: 6 });
-    expect(rows[0].cpu_avg!).toBeCloseTo(0.55, 6);
-    expect(rows[0].cpu_sd!).toBeCloseTo(0.0957, 3);
-  });
-
-  it('cpu_n counts only samples that arrived since the previous tick', () => {
-    const agg = new HostAggregator();
-    agg.record('api-1', 1_000_000, 0.5);
-    agg.record('api-1', 1_000_001, 0.6);
-    const t1 = agg.tick(1_000_010);
-    expect(t1[0].cpu_n).toBe(2);
-    // No new samples between t1 and t2.
-    const t2 = agg.tick(1_000_020);
-    expect(t2[0].cpu_n).toBe(0);
-    // The rolling avg is unchanged — the samples are still in the window.
-    expect(t2[0].cpu_avg).toBe(t1[0].cpu_avg);
-    // One new sample, then tick again.
-    agg.record('api-1', 1_000_025, 0.9);
-    const t3 = agg.tick(1_000_030);
-    expect(t3[0].cpu_n).toBe(1);
-    expect(t3[0].cpu_avg!).toBeCloseTo((0.5 + 0.6 + 0.9) / 3, 6);
-  });
-
-  it('drops samples older than the 1m window from the rolling stats', () => {
-    const agg = new HostAggregator();
-    // Put one stale sample at t=0, one fresh sample at t=70s.
-    agg.record('api-1', 0, 999); // way out of window — should not contribute
-    agg.record('api-1', 70_000, 0.5);
-    const rows = agg.tick(70_000);
-    // Only the fresh sample contributes — mean is its value, sd is 0.
-    expect(rows[0].cpu_avg).toBeCloseTo(0.5, 6);
-    expect(rows[0].cpu_sd).toBeCloseTo(0, 6);
-  });
-
-  it('partitions per-host stats correctly', () => {
-    const agg = new HostAggregator();
-    agg.record('api-1', 1_000_000, 0.4);
-    agg.record('api-1', 1_000_001, 0.6);
-    agg.record('api-2', 1_000_002, 0.9);
-    agg.record('api-2', 1_000_003, 0.9);
-    const rows = agg.tick(1_000_010);
-    const byHost = new Map(rows.map((r) => [r.host, r]));
-    expect(byHost.get('api-1')!.cpu_avg).toBeCloseTo(0.5, 6);
-    expect(byHost.get('api-1')!.cpu_n).toBe(2);
-    expect(byHost.get('api-2')!.cpu_avg).toBeCloseTo(0.9, 6);
-    expect(byHost.get('api-2')!.cpu_sd).toBeCloseTo(0, 6);
-  });
-
-  it('drops a host that has gone fully silent (no samples in the window)', () => {
-    const agg = new HostAggregator();
-    agg.record('api-1', 0, 0.5);
-    agg.record('api-2', 70_000, 0.7);
-    // After tick at t=70s, api-1's only sample (t=0) is outside the
-    // 1m window, so it should be omitted from the row set entirely.
-    const rows = agg.tick(70_000);
-    expect(rows.map((r) => r.host)).toEqual(['api-2']);
-  });
-
-  it('tick(t) called twice with the same t emits cpu_n=0 the second time (no double-counting)', () => {
-    const agg = new HostAggregator();
-    agg.record('api-1', 1_000_000, 0.5);
-    agg.record('api-1', 1_000_001, 0.5);
-    const t1 = agg.tick(1_000_010);
-    expect(t1[0].cpu_n).toBe(2);
-    // The window data is unchanged but cpu_n was reset, so a duplicate
-    // tick at the same boundary reports zero new samples — never the
-    // original 2 again. (`startAggregate` additionally guards against
-    // the duplicate emission entirely.)
-    const t2 = agg.tick(1_000_010);
-    expect(t2[0].cpu_n).toBe(0);
-  });
-
-  it('survives many ticks under steady-state churn (compaction smoke test)', () => {
-    // 30 minutes of samples at 1ms cadence with one tick every 200ms.
-    // A naive shift-on-every-trim implementation would O(n²) here; if
-    // this finishes in well under a second the lazy compactor is
-    // doing its job. We assert only that the math stays coherent.
-    const agg = new HostAggregator();
-    let now = 0;
-    let lastRow = null as ReturnType<HostAggregator['tick']>[number] | null;
-    for (let i = 0; i < 18_000; i++) {
-      agg.record('api-1', now, 0.5);
-      now += 1; // 1 sample per ms
-      if (i % 200 === 199) {
-        const rows = agg.tick(now);
-        if (rows.length > 0) lastRow = rows[0];
-      }
-    }
-    expect(lastRow).not.toBeNull();
-    expect(lastRow!.cpu_avg).toBeCloseTo(0.5, 6);
-    // Window is 1m at 1 sample/ms; live count converges to 60_000.
-    // We don't assert the exact internal length, just that the avg is
-    // numerically stable across the 18k ticks.
-  });
-});
-
-describe('startAggregate tick clock', () => {
-  it('does not emit two append frames for the same tick boundary', async () => {
-    // Tight 5ms cadence: many ticks fire inside the test window. The
-    // monotonic guard in `startAggregate` should ensure every emitted
-    // frame has a strictly increasing `ts` even under timer jitter.
+describe('startAggregate', () => {
+  it('emits one frame per sequence boundary with all hosts in it', async () => {
     const live = new LiveSeries({
       name: 'metrics',
       schema,
@@ -131,22 +33,148 @@ describe('startAggregate tick clock', () => {
     });
     const frames: string[] = [];
     const { stop } = startAggregate(live, (f) => frames.push(f), {
-      tickMs: 5,
+      tickMs: 50,
     });
     try {
-      // Push enough events to trigger ticks; 50ms is 10 tick boundaries.
-      for (let i = 0; i < 20; i++) {
-        live.push([new Date(Date.now() + i), 0.5, 100, 'api-1']);
+      // Push three samples for each of two hosts, each spaced enough
+      // to span sequence boundaries.
+      const t0 = Date.now();
+      for (let i = 0; i < 6; i++) {
+        live.push([new Date(t0 + i * 30), 0.4 + (i % 3) * 0.1, 100, 'api-1']);
+        live.push([new Date(t0 + i * 30), 0.6 + (i % 3) * 0.1, 110, 'api-2']);
       }
+      // Wait long enough for sequence boundaries to fire and the
+      // microtask-deferred emit to drain.
+      await new Promise((res) => setTimeout(res, 200));
+
+      const appends = decodedFrames(frames);
+      expect(appends.length).toBeGreaterThan(0);
+      // Each emitted frame should mention both hosts (synchronised
+      // clock — one row per partition per boundary, even silent ones).
+      for (const f of appends) {
+        const hosts = new Set(f.rows.map((r) => r.host));
+        expect(hosts.has('api-1')).toBe(true);
+        expect(hosts.has('api-2')).toBe(true);
+      }
+      // Values are well-formed numbers (or null), not undefined.
+      for (const f of appends) {
+        for (const r of f.rows) {
+          expect(typeof r.cpu_n).toBe('number');
+          expect(r.cpu_avg === null || typeof r.cpu_avg === 'number').toBe(
+            true,
+          );
+          expect(r.cpu_sd === null || typeof r.cpu_sd === 'number').toBe(true);
+        }
+      }
+    } finally {
+      stop();
+    }
+  });
+
+  it('emits monotonically increasing ts values across frames', async () => {
+    const live = new LiveSeries({
+      name: 'metrics',
+      schema,
+      retention: { maxAge: '6m' },
+    });
+    const frames: string[] = [];
+    const { stop } = startAggregate(live, (f) => frames.push(f), {
+      tickMs: 50,
+    });
+    try {
+      // Keep pushing across many boundaries so multiple frames fire.
+      const t0 = Date.now();
+      for (let i = 0; i < 30; i++) {
+        live.push([new Date(t0 + i * 25), 0.5, 100, 'api-1']);
+      }
+      await new Promise((res) => setTimeout(res, 250));
+
+      const appends = decodedFrames(frames);
+      expect(appends.length).toBeGreaterThanOrEqual(2);
+
+      const tsValues = appends
+        .flatMap((f) => f.rows.map((r) => r.ts))
+        // Within a frame all rows share the same ts; collapse to one
+        // sample per frame.
+        .filter((_, i, arr) => i === 0 || arr[i] !== arr[i - 1]);
+      for (let i = 1; i < tsValues.length; i++) {
+        expect(tsValues[i]).toBeGreaterThan(tsValues[i - 1]);
+      }
+    } finally {
+      stop();
+    }
+  });
+
+  it('coalesces three pipelines into one frame per tick (microtask merge)', async () => {
+    const live = new LiveSeries({
+      name: 'metrics',
+      schema,
+      retention: { maxAge: '6m' },
+    });
+    const frames: string[] = [];
+    const { stop } = startAggregate(live, (f) => frames.push(f), {
+      tickMs: 50,
+    });
+    try {
+      // Drive a single boundary crossing for 3 hosts. We expect a
+      // single frame containing 3 rows (not 9, which would be one
+      // frame per pipeline-event).
+      const t0 = Date.now();
+      live.push([new Date(t0), 0.5, 100, 'api-1']);
+      live.push([new Date(t0), 0.6, 100, 'api-2']);
+      live.push([new Date(t0), 0.7, 100, 'api-3']);
+      // Cross the next boundary deliberately:
       await new Promise((res) => setTimeout(res, 80));
-      const tickTimes = frames
-        .map((f) => JSON.parse(f) as { rows: { ts: number }[] })
-        .map((m) => m.rows[0]?.ts)
-        .filter((t): t is number => t !== undefined);
-      // Strictly monotonic — never equal, never decreasing.
-      for (let i = 1; i < tickTimes.length; i++) {
-        expect(tickTimes[i]).toBeGreaterThan(tickTimes[i - 1]);
+      live.push([new Date(t0 + 60), 0.55, 100, 'api-1']);
+
+      await new Promise((res) => setTimeout(res, 200));
+
+      const appends = decodedFrames(frames);
+      // No pathological per-host duplicates within a single frame.
+      for (const f of appends) {
+        const hosts = f.rows.map((r) => r.host);
+        const uniq = new Set(hosts);
+        expect(uniq.size).toBe(hosts.length);
       }
+    } finally {
+      stop();
+    }
+  });
+
+  it('numerical sanity: cpu_avg sits inside the recent input range', async () => {
+    // Stricter: pond's reducers are responsible for correctness, but
+    // a smoke check that we're wiring the right reducer to the right
+    // output slot guards against future refactors that swap them.
+    const live = new LiveSeries({
+      name: 'metrics',
+      schema,
+      retention: { maxAge: '6m' },
+    });
+    const frames: string[] = [];
+    const { stop } = startAggregate(live, (f) => frames.push(f), {
+      tickMs: 30,
+    });
+    try {
+      const t0 = Date.now();
+      for (let i = 0; i < 10; i++) {
+        live.push([new Date(t0 + i * 10), 0.5, 100, 'api-1']);
+      }
+      await new Promise((res) => setTimeout(res, 200));
+
+      const appends = decodedFrames(frames);
+      const apiOne = appends
+        .flatMap((f) => f.rows)
+        .filter((r) => r.host === 'api-1')
+        .at(-1);
+      expect(apiOne).toBeDefined();
+      expect(apiOne!.cpu_avg).toBeCloseTo(0.5, 5);
+      expect(apiOne!.cpu_sd).toBeCloseTo(0, 5);
+      // `cpu_n` is the count over the per-tick window (`tickMs`
+      // here = 30), so it carries the samples that landed in the
+      // most recent tick — not the rolling-1m total. Lower bound
+      // is "at least one" since this test only confirms the column
+      // is populated.
+      expect(apiOne!.cpu_n).toBeGreaterThanOrEqual(1);
     } finally {
       stop();
     }
