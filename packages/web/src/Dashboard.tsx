@@ -14,14 +14,30 @@ import { useDashboardData } from './useDashboardData';
  * from `VITE_WS_URL` so a single env var configures both endpoints;
  * `VITE_WS_AGG_URL` is the explicit override when the two streams
  * land on different hosts (e.g. M4 fan-out across aggregators).
+ *
+ * URL parsing via the `URL` API rather than string slicing so query
+ * strings (`?token=…`), trailing slashes (`/live/`), and host-only
+ * URLs (`ws://host`) are all handled correctly. Falls back to a
+ * naïve append on parse error.
  */
 const RAW_WS_URL =
   import.meta.env.VITE_WS_URL ?? 'ws://localhost:8080/live';
 const AGG_WS_URL =
-  import.meta.env.VITE_WS_AGG_URL ??
-  (RAW_WS_URL.endsWith('/live')
-    ? `${RAW_WS_URL.slice(0, -'/live'.length)}/live-agg`
-    : `${RAW_WS_URL}-agg`);
+  import.meta.env.VITE_WS_AGG_URL ?? deriveAggregateUrl(RAW_WS_URL);
+
+function deriveAggregateUrl(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    // Trim a trailing slash so `/live/` and `/live` derive the same
+    // aggregate path. Anchor the substitution with `=== '/live'` to
+    // avoid eating part of `/livestream` etc.
+    const path = u.pathname.replace(/\/$/, '');
+    u.pathname = path === '/live' ? '/live-agg' : `${path}/live-agg`;
+    return u.toString();
+  } catch {
+    return `${rawUrl}-agg`;
+  }
+}
 
 /**
  * The dashboard is a layout shell. State lives here as a small set of

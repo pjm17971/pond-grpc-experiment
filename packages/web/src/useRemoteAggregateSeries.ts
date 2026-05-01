@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   backoff,
   decode,
@@ -30,6 +30,35 @@ export function applyAggregateFrame(
   return next;
 }
 
+/**
+ * Sum of `cpu_n` across every row in an aggregate frame — i.e. how
+ * many raw events the aggregator folded into this single frame.
+ * Useful for the dashboard's compression-ratio readout: aggregate
+ * frame count vs raw-event count tells you how much wire traffic the
+ * tick clock is saving vs the per-event firehose.
+ */
+export function sumFrameCpuN(msg: AggregateWireMsg): number {
+  let total = 0;
+  for (const row of msg.rows) total += row.cpu_n;
+  return total;
+}
+
+/**
+ * Running counters for the aggregate stream's compression ratio.
+ * Tracked since the most recent (re)connect; reset to zero on URL
+ * change. WS reconnects continue accumulating across the gap rather
+ * than resetting — the producer's host load is the same load,
+ * regardless of whether the dashboard's socket flapped.
+ */
+export type AggregateCounters = {
+  /** `cpu_n` sum across rows of the most recent aggregate-append. */
+  latestFrameEvents: number;
+  /** Aggregate-append frames received since connect. */
+  totalFrames: number;
+  /** Cumulative `cpu_n` sum across every aggregate-append received. */
+  totalEvents: number;
+};
+
 export type RemoteAggregateState = {
   /** Most recent `HostTick` per host. Empty until the first append. */
   latestPerHost: ReadonlyMap<string, HostTick>;
@@ -40,6 +69,13 @@ export type RemoteAggregateState = {
    */
   thresholds: ReadonlyArray<number>;
   status: ConnectionStatus;
+  counters: AggregateCounters;
+};
+
+const ZERO_COUNTERS: AggregateCounters = {
+  latestFrameEvents: 0,
+  totalFrames: 0,
+  totalEvents: 0,
 };
 
 /**
@@ -62,12 +98,13 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
   >(() => new Map());
   const [thresholds, setThresholds] = useState<ReadonlyArray<number>>([]);
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
-  // Stable ref so the WS handler doesn't capture stale state on
-  // re-renders (latestPerHost changes every tick).
-  const latestRef = useRef<ReadonlyMap<string, HostTick>>(new Map());
-  latestRef.current = latestPerHost;
+  const [counters, setCounters] = useState<AggregateCounters>(ZERO_COUNTERS);
 
   useEffect(() => {
+    // Reset compression-ratio counters when the URL changes (treated
+    // as a fresh subscription). Reconnect to the same URL preserves
+    // the running totals — see `AggregateCounters` doc.
+    setCounters(ZERO_COUNTERS);
     let cancelled = false;
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -91,8 +128,21 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
         if (msg.type === 'aggregate-snapshot') {
           setThresholds(msg.thresholds);
         }
-        const next = applyAggregateFrame(latestRef.current, msg);
-        if (next !== latestRef.current) setLatestPerHost(next);
+        // Functional update — `prev` is always the freshest state in
+        // React's queue. Reading `latestPerHost` from a closure or a
+        // ref would race when two frames land between commits (one
+        // overwriting the other's contribution). `applyAggregateFrame`
+        // returns the same Map reference on empty rows, so React's
+        // shallow-state equality skips the re-render in that case.
+        setLatestPerHost((prev) => applyAggregateFrame(prev, msg));
+        if (msg.type === 'aggregate-append') {
+          const frameEvents = sumFrameCpuN(msg);
+          setCounters((prev) => ({
+            latestFrameEvents: frameEvents,
+            totalFrames: prev.totalFrames + 1,
+            totalEvents: prev.totalEvents + frameEvents,
+          }));
+        }
       };
       ws.onclose = () => {
         if (cancelled) return;
@@ -113,5 +163,5 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
     };
   }, [url]);
 
-  return { latestPerHost, thresholds, status };
+  return { latestPerHost, thresholds, status, counters };
 }

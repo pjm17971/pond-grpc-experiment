@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { HOSTS } from '@pond-experiment/shared';
 import { useRemoteAggregateSeries } from '../useRemoteAggregateSeries';
 
@@ -31,8 +31,18 @@ const STATUS_LABEL: Record<string, string> = {
  * omitted (matches the aggregator's silent-host-omit policy).
  */
 export function AggregateProbe({ url }: Props) {
-  const { latestPerHost, thresholds, status } = useRemoteAggregateSeries(url);
-  const renderedAt = Date.now();
+  const { latestPerHost, thresholds, status, counters } =
+    useRemoteAggregateSeries(url);
+  // Drive the "age" column off a 1Hz wall-clock state bump so the
+  // displayed staleness keeps growing during a disconnect (when no
+  // ticks arrive and React would otherwise not re-render). 1s is fine
+  // for a debug panel; sub-second precision in the staleness column
+  // wouldn't read better.
+  const [renderedAt, setRenderedAt] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setRenderedAt(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
 
   const orderedHosts = useMemo(() => {
     const known: string[] = [];
@@ -54,7 +64,7 @@ export function AggregateProbe({ url }: Props) {
   return (
     <section className="metric-section aggregate-probe">
       <div className="section-header">
-        <h2>Aggregate stream (M3.5 step 1)</h2>
+        <h2>Aggregate stream</h2>
         <div className="section-stats">
           <span
             className={`connection-indicator connection-indicator-${status}`}
@@ -70,6 +80,26 @@ export function AggregateProbe({ url }: Props) {
             σ thresholds: [{thresholds.length > 0 ? thresholds.join(', ') : '—'}]
           </span>
         </div>
+      </div>
+      <div className="aggregate-probe-counts">
+        <span>
+          <strong>{counters.latestFrameEvents}</strong> raw events in latest
+          frame
+        </span>
+        <span>
+          <strong>{counters.totalEvents.toLocaleString()}</strong> raw /{' '}
+          <strong>{counters.totalFrames.toLocaleString()}</strong> frames since
+          connect
+        </span>
+        <span>
+          fan-in:{' '}
+          <strong>
+            {counters.totalFrames === 0
+              ? '—'
+              : (counters.totalEvents / counters.totalFrames).toFixed(1)}
+          </strong>{' '}
+          raw/frame
+        </span>
       </div>
       {orderedHosts.length === 0 ? (
         <p className="section-note">

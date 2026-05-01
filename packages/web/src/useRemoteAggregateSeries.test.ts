@@ -4,7 +4,10 @@ import type {
   AggregateSnapshotMsg,
   HostTick,
 } from '@pond-experiment/shared';
-import { applyAggregateFrame } from './useRemoteAggregateSeries';
+import {
+  applyAggregateFrame,
+  sumFrameCpuN,
+} from './useRemoteAggregateSeries';
 
 const mkTick = (
   host: string,
@@ -73,6 +76,29 @@ describe('applyAggregateFrame', () => {
     expect(next.get('api-2')?.cpu_avg).toBe(0.6);
   });
 
+  it('functional update path: sequential applications never lose state when frames land back-to-back', () => {
+    // The hook uses `setLatestPerHost(prev => applyAggregateFrame(prev, msg))`
+    // so two frames arriving between commits each see the previous's
+    // contribution. Simulate that here by chaining the helper directly.
+    let state: ReadonlyMap<string, HostTick> = new Map();
+    state = applyAggregateFrame(state, {
+      type: 'aggregate-append',
+      rows: [mkTick('api-1', 1_000, 0.5, 2)],
+    });
+    state = applyAggregateFrame(state, {
+      type: 'aggregate-append',
+      rows: [mkTick('api-2', 1_200, 0.6, 3)],
+    });
+    state = applyAggregateFrame(state, {
+      type: 'aggregate-append',
+      rows: [mkTick('api-3', 1_400, 0.7, 1)],
+    });
+    expect(state.size).toBe(3);
+    expect(state.get('api-1')?.cpu_avg).toBe(0.5);
+    expect(state.get('api-2')?.cpu_avg).toBe(0.6);
+    expect(state.get('api-3')?.cpu_avg).toBe(0.7);
+  });
+
   it('preserves entries for hosts not mentioned in the new frame', () => {
     // Sparse-tick regime: at low rates a tick can carry rows for only
     // some hosts. The map should keep the previous value for the
@@ -92,5 +118,40 @@ describe('applyAggregateFrame', () => {
     // api-2 retained, not erased.
     expect(t1.get('api-2')?.ts).toBe(1_000);
     expect(t1.get('api-2')?.cpu_avg).toBe(0.6);
+  });
+});
+
+describe('sumFrameCpuN', () => {
+  it('sums cpu_n across every row in a frame', () => {
+    const msg: AggregateAppendMsg = {
+      type: 'aggregate-append',
+      rows: [
+        mkTick('api-1', 1_000, 0.5, 2),
+        mkTick('api-2', 1_000, 0.6, 3),
+        mkTick('api-3', 1_000, 0.7, 1),
+      ],
+    };
+    expect(sumFrameCpuN(msg)).toBe(6);
+  });
+
+  it('returns zero for an empty frame', () => {
+    expect(sumFrameCpuN({ type: 'aggregate-append', rows: [] })).toBe(0);
+  });
+
+  it('counts frames with cpu_n=0 (stats present but no new samples this tick)', () => {
+    const msg: AggregateAppendMsg = {
+      type: 'aggregate-append',
+      rows: [mkTick('api-1', 1_000, 0.5, 0), mkTick('api-2', 1_000, 0.6, 0)],
+    };
+    expect(sumFrameCpuN(msg)).toBe(0);
+  });
+
+  it('also works on aggregate-snapshot frames (subsequent steps will ship rows there)', () => {
+    const snap: AggregateSnapshotMsg = {
+      type: 'aggregate-snapshot',
+      thresholds: [1, 2],
+      rows: [mkTick('api-1', 900, 0.4, 5)],
+    };
+    expect(sumFrameCpuN(snap)).toBe(5);
   });
 });

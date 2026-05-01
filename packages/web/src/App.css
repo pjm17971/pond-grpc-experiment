@@ -381,6 +381,21 @@ th {
   background: rgba(76, 139, 245, 0.03);
 }
 
+.aggregate-probe-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.25rem;
+  margin: 0.4rem 0 0.2rem;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+
+.aggregate-probe-counts strong {
+  color: rgba(76, 139, 245, 0.95);
+  font-weight: 600;
+}
+
 .aggregate-probe-table {
   width: auto;
   margin-top: 0.5rem;
