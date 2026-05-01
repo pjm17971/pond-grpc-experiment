@@ -99,6 +99,12 @@ export function useRemoteLiveSeries(
         attempt = 0;
       };
       ws.onmessage = (ev) => {
+        // Cleanup may have run between this frame being queued and us
+        // receiving it (URL change → cancel → close, but a buffered
+        // frame fires before `onclose`). Without this guard a stale
+        // frame from the old subscription would briefly write into
+        // the new view.
+        if (cancelled) return;
         const msg = decode(ev.data as string);
         // Narrow to the raw-event firehose; ignore aggregate-stream
         // frames a misconfigured server might send on this socket.

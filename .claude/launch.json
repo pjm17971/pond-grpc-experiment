@@ -9,6 +9,24 @@
         ". ~/.nvm/nvm.sh && nvm use 22 --silent && pnpm dev:web"
       ],
       "port": 5173
+    },
+    {
+      "name": "producer",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        ". ~/.nvm/nvm.sh && nvm use 22 --silent && EVENTS_PER_SEC=10 HOST_COUNT=5 pnpm dev:producer"
+      ],
+      "port": 50051
+    },
+    {
+      "name": "aggregator",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        ". ~/.nvm/nvm.sh && nvm use 22 --silent && pnpm dev:aggregator"
+      ],
+      "port": 8080
     }
   ]
 }
