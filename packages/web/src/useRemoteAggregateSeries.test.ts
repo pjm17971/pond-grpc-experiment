@@ -7,6 +7,7 @@ import type {
 import {
   applyAggregateFrame,
   sumFrameCpuN,
+  tickToRow,
 } from './useRemoteAggregateSeries';
 
 const mkTick = (
@@ -118,6 +119,34 @@ describe('applyAggregateFrame', () => {
     // api-2 retained, not erased.
     expect(t1.get('api-2')?.ts).toBe(1_000);
     expect(t1.get('api-2')?.cpu_avg).toBe(0.6);
+  });
+});
+
+describe('tickToRow', () => {
+  it('converts the wire object form to the schema-typed tuple', () => {
+    const row = tickToRow({
+      ts: 1_700_000_000_000,
+      host: 'api-1',
+      cpu_avg: 0.55,
+      cpu_sd: 0.08,
+      cpu_n: 1000,
+    });
+    expect(row).toEqual([1_700_000_000_000, 'api-1', 0.55, 0.08, 1000]);
+  });
+
+  it('preserves nullable cpu_avg / cpu_sd', () => {
+    // The wire type permits null on `cpu_avg`/`cpu_sd` even though
+    // step-1 doesn't currently emit nulls. Verify the row passes the
+    // null through so a future step can ship the gap-row case
+    // without further conversion changes.
+    const row = tickToRow({
+      ts: 1_700_000_000_000,
+      host: 'api-1',
+      cpu_avg: null,
+      cpu_sd: null,
+      cpu_n: 0,
+    });
+    expect(row).toEqual([1_700_000_000_000, 'api-1', null, null, 0]);
   });
 });
 

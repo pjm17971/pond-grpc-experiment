@@ -27,3 +27,29 @@ export const baselineSchema = [
   { name: 'time', kind: 'time' },
   { name: 'cpu', kind: 'number' },
 ] as const satisfies SeriesSchema;
+
+/**
+ * Client-side schema mirroring the wire's `HostTick`. Lets the
+ * dashboard mount a `LiveSeries<AggregateSchema>` and run pond
+ * pipelines (`partitionBy('host')`, windowing, smoothing, etc.)
+ * over the aggregate stream the same way it runs them over the raw
+ * `/live` stream.
+ *
+ * `cpu_avg` and `cpu_sd` are nullable so a future step that emits
+ * stats-with-no-samples (when a host has new samples this tick but
+ * none in the rolling window) can land without a wire-shape change.
+ * `cpu_n` is always a number — the bucket count, even zero.
+ *
+ * Step 1 of M3.5 only emits hosts with non-empty buckets, so the
+ * `null` branch isn't reachable on the wire today; the type keeps
+ * the contract forward-compatible.
+ */
+export const aggregateSchema = [
+  { name: 'time', kind: 'time' },
+  { name: 'host', kind: 'string' },
+  { name: 'cpu_avg', kind: 'number', required: false },
+  { name: 'cpu_sd', kind: 'number', required: false },
+  { name: 'cpu_n', kind: 'number' },
+] as const satisfies SeriesSchema;
+
+export type AggregateSchema = typeof aggregateSchema;

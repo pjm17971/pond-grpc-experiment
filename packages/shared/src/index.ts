@@ -1,4 +1,10 @@
-export { schema, baselineSchema, type Schema } from './schema.js';
+export {
+  schema,
+  baselineSchema,
+  aggregateSchema,
+  type Schema,
+  type AggregateSchema,
+} from './schema.js';
 export { HOSTS, type HostId } from './hosts.js';
 export {
   type WireRow,
