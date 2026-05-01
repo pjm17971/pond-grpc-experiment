@@ -10,7 +10,8 @@
     "start": "tsx src/index.ts",
     "test": "vitest run",
     "bench:dev": "tsx scripts/bench.ts",
-    "bench:full": "tsx scripts/bench.ts --full"
+    "bench:full": "tsx scripts/bench.ts --full",
+    "bench:agg": "tsx scripts/bench-agg.ts"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.12.0",
