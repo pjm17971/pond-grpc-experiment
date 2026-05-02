@@ -1,11 +1,29 @@
 import { useEffect, useState } from 'react';
+import { useLiveSeries } from '@pond-ts/react';
+import type { LiveSeries } from 'pond-ts';
+import type { JsonRowForSchema } from 'pond-ts/types';
 import {
+  aggregateSchema,
   backoff,
   decode,
+  type AggregateSchema,
   type AggregateWireMsg,
   type HostTick,
 } from '@pond-experiment/shared';
 import type { ConnectionStatus } from './useRemoteLiveSeries';
+
+type AggregateRow = JsonRowForSchema<AggregateSchema>;
+
+/**
+ * Convert a wire-shape `HostTick` (object form, the dashboard agent's
+ * `WIRE.md` contract) into the tuple form `pond-ts.LiveSeries.pushJson`
+ * accepts (`[time, host, cpu_avg, cpu_sd, cpu_n]`). One per-tick row;
+ * stays close to the rest of the experiment's "convert at the boundary"
+ * pattern.
+ */
+export function tickToRow(tick: HostTick): AggregateRow {
+  return [tick.ts, tick.host, tick.cpu_avg, tick.cpu_sd, tick.cpu_n];
+}
 
 /**
  * Apply an aggregate snapshot or append frame to the per-host
@@ -60,12 +78,23 @@ export type AggregateCounters = {
 };
 
 export type RemoteAggregateState = {
+  /**
+   * Mounted `LiveSeries<AggregateSchema>` reflecting the aggregate
+   * wire (one event per `HostTick` row). The dashboard runs pond
+   * pipelines (`partitionBy('host')`, windowing, smoothing, etc.)
+   * over this series the same way `useRemoteLiveSeries` exposes the
+   * raw `LiveSeries` for `/live`. Its lifecycle follows the hook's:
+   * a fresh `LiveSeries` is constructed once per `url`, and the WS
+   * pumps `aggregate-snapshot` + `aggregate-append` rows into it.
+   */
+  liveSeries: LiveSeries<AggregateSchema>;
   /** Most recent `HostTick` per host. Empty until the first append. */
   latestPerHost: ReadonlyMap<string, HostTick>;
   /**
    * σ-threshold list from the most recent snapshot frame. Empty
-   * before the first snapshot arrives. Step-3 anomaly interpolation
-   * will key off this; step 2 only displays it for diagnostics.
+   * before the first snapshot arrives. Step-4 anomaly interpolation
+   * will key off this; step 2's probe and step 3's bands display it
+   * for diagnostics.
    */
   thresholds: ReadonlyArray<number>;
   status: ConnectionStatus;
@@ -81,18 +110,37 @@ const ZERO_COUNTERS: AggregateCounters = {
 /**
  * Sibling of `useRemoteLiveSeries` for the M3.5 aggregate stream.
  *
- * Connects to `url` (typically `ws://host:port/live-agg`), maintains a
- * per-host map of the latest `HostTick`, and exposes the threshold
- * list from the snapshot frame. Reconnect uses the same shared
- * `backoff` schedule as the raw stream so a flaky aggregator doesn't
- * fight one stream against the other.
+ * Connects to `url` (typically `ws://host:port/live-agg`), pumps each
+ * `aggregate-snapshot`/`aggregate-append` frame into a mounted
+ * `LiveSeries<AggregateSchema>`, and also keeps a per-host map of
+ * the latest `HostTick` for the diagnostic probe. Reconnect uses the
+ * same shared `backoff` schedule as the raw stream so a flaky
+ * aggregator doesn't fight one stream against the other.
  *
- * Step 2 deliberately stops at "latest per host" rather than mounting
- * a client `LiveSeries<aggregateSchema>` — the debug probe only needs
- * the current value; step 3 (bands migration) is the right moment to
- * introduce a schema and full windowing on the client side.
+ * Step 3 introduced the mounted `LiveSeries` so the dashboard can
+ * source the CPU bands + smoothed line directly off the wire's
+ * `cpu_avg`/`cpu_sd` columns instead of recomputing baseline from
+ * raw events. The `latestPerHost` map kept its place — it's the
+ * cheapest way to drive the diagnostic probe and (in step 4+) the
+ * "current cell" anomaly readout.
  */
 export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
+  // `useLiveSeries` from `@pond-ts/react` owns the LiveSeries
+  // lifecycle for the component's lifetime — created once on mount,
+  // stable ref afterwards. URL changes don't reconstruct it (the
+  // `useEffect` below opens a new WS but pushes into the same
+  // series); pond's retention policy bounds memory. 6m matches the
+  // raw `live`'s retention so 5m windowing has slack.
+  //
+  // The discarded second slot is a throttled `TimeSeries` snapshot
+  // of the whole series — not what `useDashboardData` wants here
+  // (it does its own `useWindow(aggLive, '5m')` for the chart's
+  // 5-minute back-window).
+  const [liveSeries] = useLiveSeries({
+    name: 'aggregate',
+    schema: aggregateSchema,
+    retention: { maxAge: '6m' },
+  });
   const [latestPerHost, setLatestPerHost] = useState<
     ReadonlyMap<string, HostTick>
   >(() => new Map());
@@ -134,6 +182,14 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
         if (msg.type === 'aggregate-snapshot') {
           setThresholds(msg.thresholds);
         }
+        // Push every row into the mounted LiveSeries so windowed
+        // queries (`useWindow`, `partitionBy`) work over the wire.
+        // Same convert-at-the-boundary pattern the raw `applyFrame`
+        // uses; pond validates each row against `aggregateSchema` and
+        // throws on shape drift.
+        if (msg.rows.length > 0) {
+          liveSeries.pushJson(msg.rows.map(tickToRow));
+        }
         // Functional update — `prev` is always the freshest state in
         // React's queue. Reading `latestPerHost` from a closure or a
         // ref would race when two frames land between commits (one
@@ -169,5 +225,5 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
     };
   }, [url]);
 
-  return { latestPerHost, thresholds, status, counters };
+  return { liveSeries, latestPerHost, thresholds, status, counters };
 }

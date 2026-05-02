@@ -84,13 +84,17 @@ export function CpuSection({ data, chartOpts, onChartOptsChange }: Props) {
             className="sigma-slider"
             aria-label="band width in σ"
           />
-          <label className="toggle">
+          <label
+            className="toggle toggle-disabled"
+            title="Deferred to M3.5 step 7 — repurposed as 'show min/max' once cpu_min/cpu_max ship on /live-agg (per WIRE.md). The bands+smoothed line now source from the aggregate stream, so the per-event raw scatter overlay would create sparse rows in the chart's merged-by-ts data and break the band rendering."
+          >
             <input
               type="checkbox"
               checked={showRaw}
               onChange={(e) => update({ showRaw: e.target.checked })}
+              disabled
             />
-            Show raw samples
+            Show raw samples <span className="toggle-note">(coming back in step 7)</span>
           </label>
         </div>
         <BarChart
