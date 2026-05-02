@@ -35,14 +35,18 @@ export const baselineSchema = [
  * over the aggregate stream the same way it runs them over the raw
  * `/live` stream.
  *
- * `cpu_avg` and `cpu_sd` are nullable so a future step that emits
- * stats-with-no-samples (when a host has new samples this tick but
- * none in the rolling window) can land without a wire-shape change.
- * `cpu_n` is always a number — the bucket count, even zero.
+ * `cpu_avg` and `cpu_sd` are nullable. Pond's clock trigger emits
+ * one row per known partition per boundary — including silent
+ * partitions whose rolling 1m window is empty — and the rolling
+ * reducers return `undefined` over an empty window. The aggregator
+ * translates those to `null` on the wire. So nulls are reachable
+ * today: a host that stops sending events keeps emitting frames
+ * with `cpu_avg: null, cpu_sd: null` for up to 1m of silence
+ * (until the partition rolls fully out of the window).
  *
- * Step 1 of M3.5 only emits hosts with non-empty buckets, so the
- * `null` branch isn't reachable on the wire today; the type keeps
- * the contract forward-compatible.
+ * `cpu_n` is always a number — the bucket count, even zero. The
+ * dashboard's render gate (`cpu_n >= 30`, the equivalent of pond's
+ * raw-side `minSamples: 30` mask) keys off it.
  */
 export const aggregateSchema = [
   { name: 'time', kind: 'time' },

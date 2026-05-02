@@ -56,9 +56,14 @@ const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8080/live';
 
 /**
  * Derive the `/live-agg` URL from `WS_URL` so a single `VITE_WS_URL`
- * env configures both endpoints. Same logic Dashboard.tsx uses for
- * the AggregateProbe — kept locally rather than imported across files
- * because both sites are tiny.
+ * env configures both endpoints. The single hook owner constructs
+ * the URL once; consumers downstream (probe, bands) read state via
+ * `data.aggregate`. `VITE_WS_AGG_URL` is the explicit override when
+ * the two streams land on different hosts (e.g. M4 fan-out across
+ * aggregators). URL parsing via the `URL` API rather than string
+ * slicing — handles query strings (`?token=…`), trailing slashes,
+ * and host-only URLs correctly. Falls back to a naïve append on
+ * parse error.
  */
 const AGG_WS_URL =
   import.meta.env.VITE_WS_AGG_URL ?? deriveAggregateUrl(WS_URL);
@@ -134,7 +139,10 @@ export type DashboardData = {
 
 export function useDashboardData(args: DashboardArgs): DashboardData {
   const { disabledHosts, chartOpts } = args;
-  const { showBands, showRaw, sigma } = chartOpts;
+  // `showRaw` is in `chartOpts` but unused here today — the raw-
+  // scatter overlay path is disabled (deferred to step 7 per WIRE.md).
+  // Re-introduce when step 7's cpu_min/cpu_max repurpose lands.
+  const { showBands, sigma } = chartOpts;
 
   // 1. LiveSeries — the single mutable buffer for ingest. Identical
   //    in shape to the M0 useLiveSeries call; the difference is the
@@ -277,17 +285,34 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       let lastAvg: number | undefined;
 
       // Bands + smoothed line from the aggregate stream.
+      //
+      // `cpu_n >= MIN_SAMPLES` is the gate-on-render mask, equivalent
+      // to the raw side's `baseline(..., { minSamples: 30 })`. Under
+      // bucket-count `cpu_n` semantics (the library agent's correction
+      // during the 0.13 review), `cpu_n` is already the rolling-1m
+      // sample count for that bucket — so the gate is just a per-row
+      // check, no client-side sum across rows needed. Kills the
+      // staircase artefact when the producer pauses and the rolling
+      // window has too few samples to trust mean/sd.
+      const MIN_SAMPLES = 30;
       const aggRows = aggPerHostRows.get(host);
       if (aggRows) {
         for (const r of aggRows) {
-          smoothPoints.push({ ts: r.ts, value: r.cpu_avg });
-          if (r.cpu_avg != null) lastAvg = r.cpu_avg;
-          if (r.cpu_avg != null && r.cpu_sd != null) {
-            upper.push({ ts: r.ts, value: r.cpu_avg + sigma * r.cpu_sd });
-            lower.push({ ts: r.ts, value: r.cpu_avg - sigma * r.cpu_sd });
+          const gated = r.cpu_n >= MIN_SAMPLES;
+          if (gated && r.cpu_avg != null) {
+            smoothPoints.push({ ts: r.ts, value: r.cpu_avg });
+            lastAvg = r.cpu_avg;
+            if (r.cpu_sd != null) {
+              upper.push({ ts: r.ts, value: r.cpu_avg + sigma * r.cpu_sd });
+              lower.push({ ts: r.ts, value: r.cpu_avg - sigma * r.cpu_sd });
+            } else {
+              upper.push({ ts: r.ts, value: undefined });
+              lower.push({ ts: r.ts, value: undefined });
+            }
           } else {
-            // Preserve gaps in the band when stats are absent (the
+            // Below the gate or stats absent — render a gap (the
             // dashboard agent's render-gap convention from WIRE.md).
+            smoothPoints.push({ ts: r.ts, value: undefined });
             upper.push({ ts: r.ts, value: undefined });
             lower.push({ ts: r.ts, value: undefined });
           }
@@ -340,6 +365,11 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     }
 
     return { series, bands, dots, allAnomalies };
+    // `showRaw` is intentionally NOT a dep: the toggle is disabled
+    // in the UI (deferred to step 7's cpu_min/cpu_max repurpose),
+    // and the raw-scatter overlay isn't rendered. Listing it here
+    // would force an unnecessary baseline() recomputation on every
+    // toggle click. Re-add when step 7 brings the overlay back.
   }, [
     timeSeries,
     aggSnapshot,
@@ -347,7 +377,6 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     enabledHosts,
     hostColors,
     showBands,
-    showRaw,
     sigma,
   ]);
 
