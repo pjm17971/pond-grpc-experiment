@@ -35,14 +35,15 @@ export const baselineSchema = [
  * over the aggregate stream the same way it runs them over the raw
  * `/live` stream.
  *
- * `cpu_avg` and `cpu_sd` are nullable. Pond's clock trigger emits
- * one row per known partition per boundary — including silent
- * partitions whose rolling 1m window is empty — and the rolling
- * reducers return `undefined` over an empty window. The aggregator
- * translates those to `null` on the wire. So nulls are reachable
- * today: a host that stops sending events keeps emitting frames
- * with `cpu_avg: null, cpu_sd: null` for up to 1m of silence
- * (until the partition rolls fully out of the window).
+ * `cpu_avg` and `cpu_sd` are nullable so the type is forward-
+ * compatible with future steps that may emit stats-with-no-samples.
+ * The aggregator's emission path (`packages/aggregator/src/aggregate.ts`)
+ * coerces undefined reducer outputs to `null` on the wire defensively;
+ * whether pond's clock-triggered partitioned rolling actually produces
+ * those undefineds at runtime depends on its silent-partition policy
+ * (clock advances on event timestamps, not wall-clock — exact behaviour
+ * for partitions with empty rolling windows at a synchronisation point
+ * is something the library agent's docs / test suite can confirm).
  *
  * `cpu_n` is always a number — the bucket count, even zero. The
  * dashboard's render gate (`cpu_n >= 30`, the equivalent of pond's
