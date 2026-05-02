@@ -28,24 +28,30 @@ export type AppendMsg = { type: 'append'; rows: ReadonlyArray<WireRow> };
 
 /**
  * Per-host, per-tick aggregate row on the `/live-agg` stream. The
- * aggregator computes rolling 1m mean and sd from raw CPU samples it
- * ingested over gRPC, and emits one `HostTick` per host per tick on a
- * synchronized 200ms clock — every host's frame for tick `T` carries
- * the same `ts`. See `WIRE.md` at the repo root for the design.
+ * aggregator joins two synchronised pond rollings — a long baseline
+ * window (1m, for `cpu_avg`/`cpu_sd`/`cpu_n`) and a short leading-
+ * edge window (200ms, for `n_current` and the anomaly arrays) — and
+ * emits one `HostTick` per host per tick on the same `ts`. See
+ * `WIRE.md` at the repo root for the design and the dashboard side's
+ * rendering contract.
  *
- * Step 1 of the M3.5 aggregate-wire work ships only the band-rendering
- * stats (`cpu_avg`/`cpu_sd`/`cpu_n`); the full target shape from
- * `WIRE.md` (anomaly counts, requests stats, min/max) is staged in
- * follow-ups.
+ * Field semantics:
  *
- * `cpu_avg` and `cpu_sd` are over the rolling 1m window; `cpu_n` is
- * the count of raw samples that arrived during this tick. Hosts with
- * no samples in the rolling 1m window are omitted from the row set
- * entirely (per `WIRE.md`'s "either omit or null" allowance) — the
- * client renders a gap until the host re-appears. The fields keep
- * `| null` in the type for forward compatibility: subsequent steps
- * may emit `null` stats when a host has new samples this tick but
- * none in the window (a regime that's not reachable in step 1).
+ * - `cpu_avg`, `cpu_sd` — over the 1m baseline window. Nullable: pond
+ *   may emit undefined stats for an empty rolling window in some
+ *   policies; the wire passes the gap through.
+ * - `cpu_n` — sample count in the 1m baseline window (the bucket
+ *   count, not per-tick). Drives the consumer's render gate ("are
+ *   the stats backed by enough samples?").
+ * - `n_current` — sample count in the most recent 200ms slice. The
+ *   denominator for "what fraction of *now* is anomalous?".
+ * - `anomalies_above[i]` — count of samples in the current slice
+ *   whose value exceeds `cpu_avg + thresholds[i] * cpu_sd`. Length
+ *   equals the snapshot's `thresholds` array; the dashboard
+ *   interpolates linearly between buckets for the user's σ slider
+ *   value. Empty `[]` when `cpu_avg`/`cpu_sd` are null (gating
+ *   condition for anomaly counting).
+ * - `anomalies_below[i]` — same idea, below the band.
  */
 export type HostTick = {
   ts: number;
@@ -53,6 +59,9 @@ export type HostTick = {
   cpu_avg: number | null;
   cpu_sd: number | null;
   cpu_n: number;
+  n_current: number;
+  anomalies_above: ReadonlyArray<number>;
+  anomalies_below: ReadonlyArray<number>;
 };
 
 /**

@@ -17,12 +17,22 @@ type AggregateRow = JsonRowForSchema<AggregateSchema>;
 /**
  * Convert a wire-shape `HostTick` (object form, the dashboard agent's
  * `WIRE.md` contract) into the tuple form `pond-ts.LiveSeries.pushJson`
- * accepts (`[time, host, cpu_avg, cpu_sd, cpu_n]`). One per-tick row;
- * stays close to the rest of the experiment's "convert at the boundary"
- * pattern.
+ * accepts. Tuple order matches `aggregateSchema`'s column order:
+ * `[time, host, cpu_avg, cpu_sd, cpu_n, n_current, anomalies_above,
+ * anomalies_below]`. Stays close to the rest of the experiment's
+ * "convert at the boundary" pattern.
  */
 export function tickToRow(tick: HostTick): AggregateRow {
-  return [tick.ts, tick.host, tick.cpu_avg, tick.cpu_sd, tick.cpu_n];
+  return [
+    tick.ts,
+    tick.host,
+    tick.cpu_avg,
+    tick.cpu_sd,
+    tick.cpu_n,
+    tick.n_current,
+    tick.anomalies_above,
+    tick.anomalies_below,
+  ];
 }
 
 /**
