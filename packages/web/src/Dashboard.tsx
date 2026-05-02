@@ -9,35 +9,10 @@ import { RequestsSection } from './sections/RequestsSection';
 import type { ChartOpts } from './useDashboardData';
 import { useDashboardData } from './useDashboardData';
 
-/**
- * Aggregate-stream URL (`/live-agg`). Defaults to deriving the path
- * from `VITE_WS_URL` so a single env var configures both endpoints;
- * `VITE_WS_AGG_URL` is the explicit override when the two streams
- * land on different hosts (e.g. M4 fan-out across aggregators).
- *
- * URL parsing via the `URL` API rather than string slicing so query
- * strings (`?token=…`), trailing slashes (`/live/`), and host-only
- * URLs (`ws://host`) are all handled correctly. Falls back to a
- * naïve append on parse error.
- */
-const RAW_WS_URL =
-  import.meta.env.VITE_WS_URL ?? 'ws://localhost:8080/live';
-const AGG_WS_URL =
-  import.meta.env.VITE_WS_AGG_URL ?? deriveAggregateUrl(RAW_WS_URL);
-
-function deriveAggregateUrl(rawUrl: string): string {
-  try {
-    const u = new URL(rawUrl);
-    // Trim a trailing slash so `/live/` and `/live` derive the same
-    // aggregate path. Anchor the substitution with `=== '/live'` to
-    // avoid eating part of `/livestream` etc.
-    const path = u.pathname.replace(/\/$/, '');
-    u.pathname = path === '/live' ? '/live-agg' : `${path}/live-agg`;
-    return u.toString();
-  } catch {
-    return `${rawUrl}-agg`;
-  }
-}
+// Aggregate-stream URL derivation moved into `useDashboardData` so
+// the single `useRemoteAggregateSeries` subscription owns both the
+// connection and the connect-string. `Dashboard.tsx` is now a pure
+// layout shell — no env reads, no URL plumbing.
 
 /**
  * The dashboard is a layout shell. State lives here as a small set of
@@ -105,7 +80,7 @@ export function Dashboard() {
       />
       <RequestsSection data={data} />
       <LogsSection data={data} />
-      <AggregateProbe url={AGG_WS_URL} />
+      <AggregateProbe aggregate={data.aggregate} />
     </div>
   );
 }

@@ -1,9 +1,16 @@
 import { useEffect, useMemo, useState } from 'react';
 import { HOSTS } from '@pond-experiment/shared';
-import { useRemoteAggregateSeries } from '../useRemoteAggregateSeries';
+import type { RemoteAggregateState } from '../useRemoteAggregateSeries';
 
 type Props = {
-  url: string;
+  /**
+   * Aggregate stream state, owned by `useDashboardData`. Single
+   * subscription per dashboard tab — earlier drafts of this section
+   * called `useRemoteAggregateSeries` directly, which doubled the
+   * `/live-agg` WS connections (one for the probe, one for the
+   * bands). The hook owner now passes the state in.
+   */
+  aggregate: RemoteAggregateState;
 };
 
 const STATUS_LABEL: Record<string, string> = {
@@ -14,25 +21,18 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 /**
- * Debug panel for the M3.5 aggregate stream. Subscribes to
- * `/live-agg`, displays the most recent `HostTick` per host (one row
- * per host, columns: cpu_avg, cpu_sd, cpu_n, age) plus connection
- * status and the snapshot's threshold list.
- *
- * This is **diagnostic only** in step 2 — the production CPU section
- * still renders bands from the raw `/live` stream's baseline pipeline.
- * Step 3 swaps those bands to source from `cpu_avg`/`cpu_sd` here;
- * step 4+ adds anomalies, requests, and globals as they land on the
- * wire and migrates the corresponding sections.
+ * Debug panel for the M3.5 aggregate stream. Renders the most recent
+ * `HostTick` per host (one row per host, columns: cpu_avg, cpu_sd,
+ * cpu_n, age) plus connection status, σ-threshold list, and the
+ * fan-in counters.
  *
  * Hosts ordered per the canonical `HOSTS` declaration so palette
  * order matches the rest of the dashboard, with any unknown hosts
  * appended in arrival order. Hosts that haven't ticked yet are
  * omitted (matches the aggregator's silent-host-omit policy).
  */
-export function AggregateProbe({ url }: Props) {
-  const { latestPerHost, thresholds, status, counters } =
-    useRemoteAggregateSeries(url);
+export function AggregateProbe({ aggregate }: Props) {
+  const { latestPerHost, thresholds, status, counters } = aggregate;
   // Drive the "age" column off a 1Hz wall-clock state bump so the
   // displayed staleness keeps growing during a disconnect (when no
   // ticks arrive and React would otherwise not re-render). 1s is fine

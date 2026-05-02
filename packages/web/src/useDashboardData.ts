@@ -47,7 +47,10 @@ import {
   useRemoteLiveSeries,
   type ConnectionStatus,
 } from './useRemoteLiveSeries';
-import { useRemoteAggregateSeries } from './useRemoteAggregateSeries';
+import {
+  useRemoteAggregateSeries,
+  type RemoteAggregateState,
+} from './useRemoteAggregateSeries';
 
 const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8080/live';
 
@@ -118,6 +121,11 @@ export type DashboardData = {
 
   // Logs section — raw windowed snapshot.
   timeSeries: TimeSeries<typeof schema> | null;
+
+  // Aggregate stream state — the dashboard owns the single
+  // subscription; `AggregateProbe` and section-7's bands consume it
+  // through this slot.
+  aggregate: RemoteAggregateState;
 
   // Shared time axis for both the CPU and Requests charts.
   tStart: number | undefined;
@@ -502,6 +510,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     reqSeries,
     totalReqPerSec,
     timeSeries,
+    aggregate,
     tStart,
     tEnd,
   };

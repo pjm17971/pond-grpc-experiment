@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { LiveSeries } from 'pond-ts';
+import { useLiveSeries } from '@pond-ts/react';
+import type { LiveSeries } from 'pond-ts';
 import type { JsonRowForSchema } from 'pond-ts/types';
 import {
   aggregateSchema,
@@ -124,18 +125,22 @@ const ZERO_COUNTERS: AggregateCounters = {
  * "current cell" anomaly readout.
  */
 export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
-  // Fresh `LiveSeries` per URL change. The series accumulates rows
-  // as the WS pumps them; pond's retention policy drops rows past
-  // the configured maxAge so this doesn't grow without bound. 6m
-  // matches the raw `live`'s retention so 5m windowing has slack.
-  const [liveSeries] = useState(
-    () =>
-      new LiveSeries({
-        name: 'aggregate',
-        schema: aggregateSchema,
-        retention: { maxAge: '6m' },
-      }),
-  );
+  // `useLiveSeries` from `@pond-ts/react` owns the LiveSeries
+  // lifecycle for the component's lifetime — created once on mount,
+  // stable ref afterwards. URL changes don't reconstruct it (the
+  // `useEffect` below opens a new WS but pushes into the same
+  // series); pond's retention policy bounds memory. 6m matches the
+  // raw `live`'s retention so 5m windowing has slack.
+  //
+  // The discarded second slot is a throttled `TimeSeries` snapshot
+  // of the whole series — not what `useDashboardData` wants here
+  // (it does its own `useWindow(aggLive, '5m')` for the chart's
+  // 5-minute back-window).
+  const [liveSeries] = useLiveSeries({
+    name: 'aggregate',
+    schema: aggregateSchema,
+    retention: { maxAge: '6m' },
+  });
   const [latestPerHost, setLatestPerHost] = useState<
     ReadonlyMap<string, HostTick>
   >(() => new Map());

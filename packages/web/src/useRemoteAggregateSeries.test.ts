@@ -1,8 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import type {
-  AggregateAppendMsg,
-  AggregateSnapshotMsg,
-  HostTick,
+import { LiveSeries } from 'pond-ts';
+import {
+  aggregateSchema,
+  type AggregateAppendMsg,
+  type AggregateSnapshotMsg,
+  type HostTick,
 } from '@pond-experiment/shared';
 import {
   applyAggregateFrame,
@@ -135,10 +137,6 @@ describe('tickToRow', () => {
   });
 
   it('preserves nullable cpu_avg / cpu_sd', () => {
-    // The wire type permits null on `cpu_avg`/`cpu_sd` even though
-    // step-1 doesn't currently emit nulls. Verify the row passes the
-    // null through so a future step can ship the gap-row case
-    // without further conversion changes.
     const row = tickToRow({
       ts: 1_700_000_000_000,
       host: 'api-1',
@@ -147,6 +145,30 @@ describe('tickToRow', () => {
       cpu_n: 0,
     });
     expect(row).toEqual([1_700_000_000_000, 'api-1', null, null, 0]);
+  });
+
+  it('result pushes cleanly into a real LiveSeries<AggregateSchema>', () => {
+    // End-to-end: produce rows from the wire shape, push through
+    // pond's runtime validator, read back. Catches drift between
+    // the schema's `required` flags and `pushJson`'s acceptance of
+    // null cells (the kind of bug that only shows up at runtime).
+    const live = new LiveSeries({
+      name: 'agg-test',
+      schema: aggregateSchema,
+      retention: { maxAge: '6m' },
+    });
+    const ticks: HostTick[] = [
+      { ts: 1_700_000_000_000, host: 'api-1', cpu_avg: 0.5, cpu_sd: 0.08, cpu_n: 50 },
+      { ts: 1_700_000_000_200, host: 'api-1', cpu_avg: null, cpu_sd: null, cpu_n: 0 },
+      { ts: 1_700_000_000_400, host: 'api-1', cpu_avg: 0.6, cpu_sd: 0.09, cpu_n: 60 },
+    ];
+    expect(() => live.pushJson(ticks.map(tickToRow))).not.toThrow();
+    expect(live.length).toBe(3);
+    const events = [live.at(0)!, live.at(1)!, live.at(2)!];
+    expect(events[0].get('cpu_avg')).toBeCloseTo(0.5, 6);
+    expect(events[1].get('cpu_avg')).toBeUndefined();
+    expect(events[1].get('cpu_n')).toBe(0);
+    expect(events[2].get('cpu_avg')).toBeCloseTo(0.6, 6);
   });
 });
 
