@@ -9,18 +9,17 @@ import { startAggregate, assembleTick } from './aggregate.js';
 
 /**
  * Tests exercise `startAggregate` end-to-end against a real
- * `LiveSeries`. With pond 0.13's `AggregateOutputMap` overload on
- * `LivePartitionedSeries.rolling`, all three CPU stats (`cpu_avg`,
- * `cpu_sd`, `cpu_n`) come from one rolling pipeline; we assert the
- * pipeline composition: synchronised tick clock, single-frame-per-ts
- * collation, monotonic frame ts.
+ * `LiveSeries`. V7 wires two clock-synchronised partitioned rollings
+ * — a 1m baseline (avg/stdev/count) and a `tickMs` slice (samples) —
+ * joined per `(ts, host)` and emitted as one wire frame per tick.
+ * We assert the pipeline composition: synchronised tick clock,
+ * single-frame-per-ts collation, monotonic frame ts, and the
+ * anomaly-density fields on every row.
  *
- * `cpu_n` here is the bucket's own sample count (the gating signal),
- * not a per-tick count. The 200ms parallel window earlier drafts had
- * is gone — see PR #14 / friction-notes/M3.5.md.
- *
- * Numerically-precise reducer behaviour is pond's responsibility and
- * is covered in its own test suite.
+ * `cpu_n` is the 1m bucket's own sample count (the gating signal for
+ * "are mean/sd backed by enough samples?"), `n_current` is the
+ * `tickMs` slice's count. Numerically-precise reducer behaviour is
+ * pond's responsibility and is covered in its own test suite.
  */
 
 function decodedFrames(frames: string[]): AggregateAppendMsg[] {
@@ -110,7 +109,7 @@ describe('startAggregate', () => {
     }
   });
 
-  it('coalesces three pipelines into one frame per tick (microtask merge)', async () => {
+  it('coalesces baseline + slice rollings into one frame per tick (microtask merge)', async () => {
     const live = new LiveSeries({
       name: 'metrics',
       schema,

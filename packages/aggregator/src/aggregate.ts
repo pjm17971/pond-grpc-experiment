@@ -15,37 +15,38 @@ import {
 } from '@pond-experiment/shared';
 
 /**
- * Server-side aggregate-stream emitter, M3.5 step 4 shape.
+ * Server-side aggregate-stream emitter, M3.5 step 4 / V7 shape.
  *
  * Builds the per-host tick aggregates the `/live-agg` wire ships
  * (`{ ts, host, cpu_avg, cpu_sd, cpu_n, n_current, anomalies_above[],
- * anomalies_below[] }`) by composing:
+ * anomalies_below[] }`) by composing **two synchronised partitioned
+ * rollings**, both clocked off the same `Trigger.clock(seq)`:
  *
- *   1. **Baseline pipeline** (pond, 1m window):
+ *   1. **Baseline rolling** (1m window):
  *        live.partitionBy('host').rolling('1m', {
  *          cpu_avg: { from: 'cpu', using: 'avg' },
  *          cpu_sd:  { from: 'cpu', using: 'stdev' },
  *          cpu_n:   { from: 'cpu', using: 'count' },
  *        }, { trigger })
  *
- *   2. **Current-slice deque** (manual, `tickMs` window): a per-
- *      host `{ts, value}[]` updated off the source `live.on('batch',
- *      …)` listener. The aggregator iterates the recent slice at
- *      emission time to count threshold-exceeding samples against
- *      the baseline's mean/sd.
+ *   2. **Slice rolling** (`tickMs` window, default 200ms):
+ *        live.partitionBy('host').rolling('200ms', {
+ *          cpu_samples: { from: 'cpu', using: 'samples' },
+ *        }, { trigger })
  *
- * Per the library agent's review during the 0.13 cycle, anomaly
- * density is **by definition two windows** — a long baseline (what's
- * normal) and a short leading edge (what just happened). The shape
- * is right; the implementation is hybrid because pond's live
- * partitioned rolling rejects custom function reducers at runtime
- * ("custom function reducers are not supported on live rolling")
- * and none of the built-ins return the bucket's full value list.
- * `'keep'` is constant-only, `'unique'` dedups, `'top${N}'` is
- * bounded. So the leading-edge sample collection lives in user code
- * for now. See `friction-notes/M3.5.md` for the library-extension
- * asks (custom-reducer-on-live + a `'collect'` built-in) that would
- * collapse this back to all-pond.
+ * Both rollings subscribe to the same `byHost` partition machinery,
+ * share the same clock sequence, and therefore burst at the same
+ * boundary `ts`. Each tick boundary produces two events per known
+ * host (one per rolling); the join below collates them per
+ * `(ts, host)` and emits one wire row per host per tick.
+ *
+ * The `samples` reducer is built-in (v0.14.2) — it returns the bucket's
+ * full sample list as `ReadonlyArray<number>`, which is what anomaly
+ * counting needs at the leading edge against the baseline mean/sd. V6
+ * faked this with a manual per-host deque off `live.on('batch', …)`
+ * because no built-in returned the bucket contents and pond's live
+ * partitioned rolling rejects custom function reducers; the pre-V7
+ * note in `friction-notes/M3.5.md` documents that workaround.
  */
 export type AggregateOptions = {
   /** Tick cadence in milliseconds. Default 200, matches `WIRE.md`. */
@@ -58,16 +59,16 @@ export type AggregateOptions = {
   thresholds?: ReadonlyArray<number>;
 };
 
-type Sample = { ts: number; value: number };
+type BaselineParts = {
+  cpu_avg: number | null;
+  cpu_sd: number | null;
+  cpu_n: number;
+};
 
-/**
- * Tolerance over `tickMs` for sample-deque trimming. A boundary
- * emission at `tickTs` should include samples in `(tickTs - tickMs,
- * tickTs]`; an extra 10 % of `tickMs` covers small wall-clock skew
- * between the producer and the aggregator without inflating the
- * effective slice.
- */
-const TRIM_MAX_AGE_MULTIPLIER = 1.1;
+type Parts = {
+  baseline?: BaselineParts;
+  samples?: ReadonlyArray<number>;
+};
 
 export function startAggregate(
   live: LiveSeries<Schema>,
@@ -79,71 +80,52 @@ export function startAggregate(
   const seq = Sequence.every(`${tickMs}ms`);
   const trigger = Trigger.clock(seq);
 
-  const baselineStream: LiveSource<SeriesSchema> = live
-    .partitionBy('host')
-    .rolling(
-      '1m',
-      {
-        cpu_avg: { from: 'cpu', using: 'avg' },
-        cpu_sd: { from: 'cpu', using: 'stdev' },
-        cpu_n: { from: 'cpu', using: 'count' },
-      },
-      { trigger },
-    );
+  // Both rollings hang off the same partition. `partitionBy` is the
+  // bookkeeping layer that fans events out to per-host LiveSources;
+  // creating two rollings on the same `byHost` reuses that fan-out.
+  const byHost = live.partitionBy('host');
 
-  // Per-host leading-edge deque. Updated on every event arriving
-  // through `live`; trimmed at tick-emission time.
-  const samplesByHost = new Map<string, Sample[]>();
-  const trimAge = tickMs * TRIM_MAX_AGE_MULTIPLIER;
+  const baselineStream: LiveSource<SeriesSchema> = byHost.rolling(
+    '1m',
+    {
+      cpu_avg: { from: 'cpu', using: 'avg' },
+      cpu_sd: { from: 'cpu', using: 'stdev' },
+      cpu_n: { from: 'cpu', using: 'count' },
+    },
+    { trigger },
+  );
 
-  const offSamples = live.on('batch', (events) => {
-    for (const e of events) {
-      const host = e.get('host');
-      const value = e.get('cpu');
-      if (typeof host !== 'string' || typeof value !== 'number') continue;
-      const ts = e.key().begin();
-      let deque = samplesByHost.get(host);
-      if (!deque) {
-        deque = [];
-        samplesByHost.set(host, deque);
-      }
-      deque.push({ ts, value });
-    }
-  });
+  const sliceStream: LiveSource<SeriesSchema> = byHost.rolling(
+    `${tickMs}ms`,
+    {
+      cpu_samples: { from: 'cpu', using: 'samples' },
+    },
+    { trigger },
+  );
 
-  const sliceSamplesAtTick = (host: string, tickTs: number): number[] => {
-    const deque = samplesByHost.get(host);
-    if (!deque || deque.length === 0) return [];
-    const cutoff = tickTs - tickMs;
-    // Drop samples older than cutoff (in-place trim from the front).
-    let drop = 0;
-    while (drop < deque.length && deque[drop].ts <= cutoff) drop += 1;
-    if (drop > 0) deque.splice(0, drop);
-    // Bound staleness: when a host goes silent the deque could keep
-    // a few samples around just past the tick window. The trimAge
-    // bound prevents accumulation.
-    const staleCutoff = tickTs - trimAge;
-    let staleDrop = 0;
-    while (staleDrop < deque.length && deque[staleDrop].ts <= staleCutoff) {
-      staleDrop += 1;
-    }
-    if (staleDrop > 0) deque.splice(0, staleDrop);
-    // Snapshot the values for the consumer (anomaly counting).
-    const out: number[] = [];
-    for (const s of deque) {
-      if (s.ts > cutoff && s.ts <= tickTs) out.push(s.value);
-    }
-    return out;
-  };
-
-  // Per-`ts` row collation. The baseline pipeline emits one row per
-  // partition per tick boundary; on each emission we snapshot the
-  // matching slice from the deque, compute anomaly counts, and
-  // append to the pending row set for that `ts`. The microtask
-  // drain emits one wire frame per `ts` at the end of the macrotask.
-  const pendingByTs = new Map<number, HostTick[]>();
+  // Per-`(ts, host)` parts buffer. Both rollings burst on each clock
+  // boundary; the events fire synchronously inside the same JS task
+  // (pond dispatches subscribers in order). The microtask drain runs
+  // after the task finishes — by then both halves are present for
+  // every host the rollings know about.
+  const pendingByTs = new Map<number, Map<string, Parts>>();
   let lastEmittedTs = -1;
   let scheduled = false;
+
+  const partsFor = (ts: number, host: string): Parts => {
+    let perHost = pendingByTs.get(ts);
+    if (!perHost) {
+      perHost = new Map();
+      pendingByTs.set(ts, perHost);
+    }
+    let parts = perHost.get(host);
+    if (!parts) {
+      parts = {};
+      perHost.set(host, parts);
+    }
+    return parts;
+  };
+
   const scheduleEmit = (): void => {
     if (scheduled) return;
     scheduled = true;
@@ -160,8 +142,32 @@ export function startAggregate(
         pendingByTs.delete(ts);
         continue;
       }
-      const rows = pendingByTs.get(ts);
-      if (!rows || rows.length === 0) continue;
+      const perHost = pendingByTs.get(ts);
+      if (!perHost || perHost.size === 0) continue;
+      const rows: HostTick[] = [];
+      for (const [host, parts] of perHost) {
+        // Only emit hosts that have a baseline. WIRE.md's contract:
+        // "one HostTick per host that had any samples in the rolling
+        // 1m window at tick time; silent hosts are omitted." Slice-
+        // only entries (no baseline event for this tick) shouldn't
+        // happen — slice's 200ms window is a strict subset of
+        // baseline's 1m window — but defending against it costs
+        // nothing.
+        if (!parts.baseline) continue;
+        rows.push(
+          assembleTick(
+            ts,
+            host,
+            parts.baseline,
+            parts.samples ?? [],
+            thresholds,
+          ),
+        );
+      }
+      if (rows.length === 0) {
+        pendingByTs.delete(ts);
+        continue;
+      }
       lastEmittedTs = ts;
       const msg: AggregateAppendMsg = { type: 'aggregate-append', rows };
       broadcast(encode(msg));
@@ -178,24 +184,29 @@ export function startAggregate(
       const cpu_avg = e.get('cpu_avg');
       const cpu_sd = e.get('cpu_sd');
       const cpu_n = e.get('cpu_n');
-      const samples = sliceSamplesAtTick(host, ts);
-      const tick = assembleTick(
-        ts,
-        host,
-        {
-          cpu_avg: typeof cpu_avg === 'number' ? cpu_avg : null,
-          cpu_sd: typeof cpu_sd === 'number' ? cpu_sd : null,
-          cpu_n: typeof cpu_n === 'number' ? cpu_n : 0,
-        },
-        samples,
-        thresholds,
-      );
-      let rows = pendingByTs.get(ts);
-      if (!rows) {
-        rows = [];
-        pendingByTs.set(ts, rows);
-      }
-      rows.push(tick);
+      partsFor(ts, host).baseline = {
+        cpu_avg: typeof cpu_avg === 'number' ? cpu_avg : null,
+        cpu_sd: typeof cpu_sd === 'number' ? cpu_sd : null,
+        cpu_n: typeof cpu_n === 'number' ? cpu_n : 0,
+      };
+      scheduleEmit();
+    },
+  );
+
+  const offSlice = sliceStream.on(
+    'event',
+    (e: EventForSchema<SeriesSchema>) => {
+      const ts = e.key().begin();
+      const host = e.get('host');
+      if (typeof host !== 'string') return;
+      // `samples` reducer returns `ReadonlyArray<number> | undefined`
+      // (undefined when the window is gated or empty). Normalise to
+      // an empty array so downstream consumers see a regular shape.
+      const raw = e.get('cpu_samples');
+      const samples: ReadonlyArray<number> = Array.isArray(raw)
+        ? (raw as ReadonlyArray<number>)
+        : [];
+      partsFor(ts, host).samples = samples;
       scheduleEmit();
     },
   );
@@ -203,18 +214,11 @@ export function startAggregate(
   return {
     stop: () => {
       offBaseline();
-      offSamples();
-      samplesByHost.clear();
+      offSlice();
       pendingByTs.clear();
     },
   };
 }
-
-type BaselineParts = {
-  cpu_avg: number | null;
-  cpu_sd: number | null;
-  cpu_n: number;
-};
 
 /**
  * Compose a `HostTick` from the joined baseline stats + current-slice
