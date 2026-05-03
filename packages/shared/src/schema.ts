@@ -35,19 +35,20 @@ export const baselineSchema = [
  * over the aggregate stream the same way it runs them over the raw
  * `/live` stream.
  *
- * `cpu_avg` and `cpu_sd` are nullable so the type is forward-
- * compatible with future steps that may emit stats-with-no-samples.
- * The aggregator's emission path (`packages/aggregator/src/aggregate.ts`)
- * coerces undefined reducer outputs to `null` on the wire defensively;
- * whether pond's clock-triggered partitioned rolling actually produces
- * those undefineds at runtime depends on its silent-partition policy
- * (clock advances on event timestamps, not wall-clock — exact behaviour
- * for partitions with empty rolling windows at a synchronisation point
- * is something the library agent's docs / test suite can confirm).
+ * `cpu_avg`/`cpu_sd` are nullable: the aggregator coerces undefined
+ * reducer outputs to `null` defensively. Behaviour for empty
+ * rolling windows depends on pond's silent-partition policy.
  *
- * `cpu_n` is always a number — the bucket count, even zero. The
- * dashboard's render gate (`cpu_n >= 30`, the equivalent of pond's
- * raw-side `minSamples: 30` mask) keys off it.
+ * `cpu_n` (baseline bucket count, gates render-readiness) and
+ * `n_current` (count over the most recent 200ms slice) are always
+ * numbers, even zero.
+ *
+ * `anomalies_above` / `anomalies_below` (added in step 4) are
+ * array-kind columns. Each row carries an array indexed by the
+ * snapshot's `thresholds` list — `anomalies_above[i]` = count of
+ * raw samples in the current slice whose value exceeds
+ * `cpu_avg + thresholds[i] * cpu_sd`. The dashboard interpolates
+ * linearly between buckets for arbitrary σ slider values.
  */
 export const aggregateSchema = [
   { name: 'time', kind: 'time' },
@@ -55,6 +56,9 @@ export const aggregateSchema = [
   { name: 'cpu_avg', kind: 'number', required: false },
   { name: 'cpu_sd', kind: 'number', required: false },
   { name: 'cpu_n', kind: 'number' },
+  { name: 'n_current', kind: 'number' },
+  { name: 'anomalies_above', kind: 'array' },
+  { name: 'anomalies_below', kind: 'array' },
 ] as const satisfies SeriesSchema;
 
 export type AggregateSchema = typeof aggregateSchema;

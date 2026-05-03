@@ -37,7 +37,13 @@ import {
   type ChartSeries,
 } from './Chart';
 import { type Bar } from './BarChart';
-import { HOSTS, baselineSchema, schema } from '@pond-experiment/shared';
+import {
+  DEFAULT_AGGREGATE_THRESHOLDS,
+  HOSTS,
+  baselineSchema,
+  schema,
+} from '@pond-experiment/shared';
+import { countAtSigma } from './anomalyInterpolation';
 import {
   HIGH_CPU_THRESHOLD,
   PALETTE,
@@ -169,6 +175,11 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //     events. Probe + counters keep their step-2 home.
   const aggregate = useRemoteAggregateSeries(AGG_WS_URL);
   const aggSnapshot = useWindow(aggregate.liveSeries, '5m', { throttle: 200 });
+  // The σ-threshold list the snapshot frame's `thresholds` field
+  // delivers. Step-4 anomaly-density interpolation keys off this —
+  // see `anomalyInterpolation.ts`. Falls back to the default while
+  // the first snapshot is in flight.
+  const aggregateThresholds = aggregate.thresholds;
 
   // 2. Eviction counter — demonstrates `liveSeries.on('evict', cb)`.
   const [evictedTotal, setEvictedTotal] = useState(0);
@@ -230,50 +241,43 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   const tEnd = timeSeries?.last()?.key().timestampMs();
   const tStart = tEnd != null ? tEnd - WINDOW_MS : undefined;
 
-  // 7. CPU section — per-host bands + smoothed lines now source from
-  //    the aggregate stream (cpu_avg, cpu_sd directly off the wire),
-  //    so the dashboard doesn't recompute baseline from raw events.
-  //    Anomaly dots + raw-points overlay still source from the raw
-  //    `timeSeries.baseline(...)` until step 4 ships per-tick
-  //    anomaly density on the wire and replaces them.
+  // 7. CPU section — fully aggregate-driven now. Bands + smoothed
+  //    line + anomaly dots all source from `/live-agg`'s tick rows;
+  //    the raw `timeSeries.baseline(...)` pipeline this section used
+  //    to run is gone (step 4 retires it).
   //
-  //    The two-pipeline split is intentional for step 3: we want to
-  //    A/B aggregate-driven bands against raw-driven anomaly dots
-  //    without a regression risk. Visually at low rates the bands
-  //    should be indistinguishable from the previous baseline-driven
-  //    output; the bench/profile measure the production headroom.
+  //    Anomaly dots are now per-tick density dots on the band edges
+  //    (per WIRE.md), not per-event red dots on raw values. For each
+  //    enabled host's rows in the aggregate windowed snapshot:
+  //      - render smoothed line + ±σ band from cpu_avg/cpu_sd (gated
+  //        on cpu_n >= 30, equivalent to the previous minSamples)
+  //      - interpolate the σ-bucketed `anomalies_above[]` /
+  //        `anomalies_below[]` arrays at the user's slider value, and
+  //        render a dot at the band edge when the interpolated count
+  //        is ≥ 1.
   const cpu = useMemo(() => {
     const series: ChartSeries[] = [];
     const bands: ChartBand[] = [];
     const dots: ChartDots[] = [];
     const allAnomalies: ChartPoint[] = [];
-    if (!timeSeries && !aggSnapshot) {
+    if (!aggSnapshot) {
       return { series, bands, dots, allAnomalies };
     }
 
-    // Aggregate-driven side: per-host rows of the windowed
-    // `LiveSeries<AggregateSchema>`, one row per 200ms tick boundary.
+    // Per-host rows of the windowed `LiveSeries<AggregateSchema>`,
+    // one row per 200ms tick boundary.
     const aggPerHostRows = aggSnapshot
-      ? aggSnapshot.partitionBy('host').toMap((g) => g.toPoints())
-      : new Map();
+      .partitionBy('host')
+      .toMap((g) => g.toPoints());
 
-    // Raw-driven side: same `baseline` pipeline as before, kept for
-    // anomaly-dot computation (per-event `r.cpu` checked against
-    // baseline's per-event `r.upper`/`r.lower`) and the "show raw
-    // samples" overlay. Step 4 retires the anomaly path; step 7
-    // (cpu_min/cpu_max) retires the raw-samples overlay. Until then,
-    // the raw stream stays the source of truth for these.
-    //
-    // `minSamples` (0.11.2) gates baseline output: rows whose 1-min
-    // window has fewer than 30 source events emit `undefined` for
-    // avg/sd/upper/lower. Same reason as before — kills the
-    // staircase artefact during throttled-tab periods and warmup.
-    const rawPerHostRows = timeSeries
-      ? timeSeries
-          .partitionBy('host')
-          .baseline('cpu', { window: '1m', sigma, minSamples: 30 })
-          .toMap((g) => g.toPoints())
-      : new Map();
+    // Threshold list comes from the snapshot frame's `thresholds`
+    // field. Fall back to the default while the first snapshot is
+    // in flight — the array's contents won't matter then because
+    // anomalies arrays haven't arrived either.
+    const thresholds =
+      aggregateThresholds.length > 0
+        ? aggregateThresholds
+        : DEFAULT_AGGREGATE_THRESHOLDS;
 
     for (const host of hosts) {
       if (!enabledHosts.has(host)) continue;
@@ -282,10 +286,9 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       const upper: ChartPoint[] = [];
       const lower: ChartPoint[] = [];
       const smoothPoints: ChartPoint[] = [];
+      const anomalyDots: ChartPoint[] = [];
       let lastAvg: number | undefined;
 
-      // Bands + smoothed line from the aggregate stream.
-      //
       // `cpu_n >= MIN_SAMPLES` is the gate-on-render mask, equivalent
       // to the raw side's `baseline(..., { minSamples: 30 })`. Under
       // bucket-count `cpu_n` semantics (the library agent's correction
@@ -295,47 +298,43 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       // staircase artefact when the producer pauses and the rolling
       // window has too few samples to trust mean/sd.
       const MIN_SAMPLES = 30;
-      const aggRows = aggPerHostRows.get(host);
-      if (aggRows) {
-        for (const r of aggRows) {
-          const gated = r.cpu_n >= MIN_SAMPLES;
-          if (gated && r.cpu_avg != null) {
-            smoothPoints.push({ ts: r.ts, value: r.cpu_avg });
-            lastAvg = r.cpu_avg;
-            if (r.cpu_sd != null) {
-              upper.push({ ts: r.ts, value: r.cpu_avg + sigma * r.cpu_sd });
-              lower.push({ ts: r.ts, value: r.cpu_avg - sigma * r.cpu_sd });
-            } else {
-              upper.push({ ts: r.ts, value: undefined });
-              lower.push({ ts: r.ts, value: undefined });
+      const aggRows = aggPerHostRows.get(host) ?? [];
+      for (const r of aggRows) {
+        const gated = (r.cpu_n ?? 0) >= MIN_SAMPLES;
+        if (gated && r.cpu_avg != null) {
+          smoothPoints.push({ ts: r.ts, value: r.cpu_avg });
+          lastAvg = r.cpu_avg;
+          if (r.cpu_sd != null) {
+            const upperEdge = r.cpu_avg + sigma * r.cpu_sd;
+            const lowerEdge = r.cpu_avg - sigma * r.cpu_sd;
+            upper.push({ ts: r.ts, value: upperEdge });
+            lower.push({ ts: r.ts, value: lowerEdge });
+            // Per-tick anomaly density at the user's σ — plot a dot
+            // at the band edge when the interpolated count is ≥ 1.
+            // Pond's `kind: 'array'` columns are typed
+            // `ReadonlyArray<ScalarValue>` (number|string|boolean) at
+            // the schema level; the wire contract guarantees number
+            // arrays, so the cast is safe here.
+            const aAbove = (r.anomalies_above as ReadonlyArray<number>) ?? [];
+            const aboveCount = countAtSigma(aAbove, sigma, thresholds);
+            if (aboveCount >= 1) {
+              anomalyDots.push({ ts: r.ts, value: upperEdge });
+            }
+            const aBelow = (r.anomalies_below as ReadonlyArray<number>) ?? [];
+            const belowCount = countAtSigma(aBelow, sigma, thresholds);
+            if (belowCount >= 1) {
+              anomalyDots.push({ ts: r.ts, value: lowerEdge });
             }
           } else {
-            // Below the gate or stats absent — render a gap (the
-            // dashboard agent's render-gap convention from WIRE.md).
-            smoothPoints.push({ ts: r.ts, value: undefined });
             upper.push({ ts: r.ts, value: undefined });
             lower.push({ ts: r.ts, value: undefined });
           }
-        }
-      }
-
-      // Anomaly dots from the raw baseline pipeline (until step 4
-      // lands per-tick anomaly density on the wire). These render as
-      // a Scatter overlay on their own data axis (Chart.tsx), so the
-      // raw timestamps don't pollute the merged-by-ts data the
-      // smoothed line + bands share.
-      const anomalies: ChartPoint[] = [];
-      const rawRows = rawPerHostRows.get(host);
-      if (rawRows) {
-        for (const r of rawRows) {
-          if (
-            r.cpu != null &&
-            r.upper != null &&
-            r.lower != null &&
-            (r.cpu > r.upper || r.cpu < r.lower)
-          ) {
-            anomalies.push({ ts: r.ts, value: r.cpu });
-          }
+        } else {
+          // Below the gate or stats absent — render a gap (the
+          // dashboard agent's render-gap convention from WIRE.md).
+          smoothPoints.push({ ts: r.ts, value: undefined });
+          upper.push({ ts: r.ts, value: undefined });
+          lower.push({ ts: r.ts, value: undefined });
         }
       }
 
@@ -357,22 +356,21 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       });
       if (showBands && upper.length >= 2) {
         bands.push({ name: host, color, upper, lower });
-        if (anomalies.length > 0) {
-          dots.push({ name: host, color: '#e23b3b', points: anomalies });
-          allAnomalies.push(...anomalies);
+        if (anomalyDots.length > 0) {
+          dots.push({ name: host, color: '#e23b3b', points: anomalyDots });
+          allAnomalies.push(...anomalyDots);
         }
       }
     }
 
     return { series, bands, dots, allAnomalies };
-    // `showRaw` is intentionally NOT a dep: the toggle is disabled
-    // in the UI (deferred to step 7's cpu_min/cpu_max repurpose),
-    // and the raw-scatter overlay isn't rendered. Listing it here
-    // would force an unnecessary baseline() recomputation on every
-    // toggle click. Re-add when step 7 brings the overlay back.
+    // `showRaw` and `timeSeries` are intentionally NOT deps: the
+    // CPU section is fully aggregate-driven now (step 4 retired the
+    // raw baseline pipeline). Re-introduce when step 7's
+    // cpu_min/cpu_max repurpose brings the raw overlay back.
   }, [
-    timeSeries,
     aggSnapshot,
+    aggregateThresholds,
     hosts,
     enabledHosts,
     hostColors,

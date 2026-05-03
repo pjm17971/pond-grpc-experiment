@@ -5,7 +5,7 @@ import {
   decode,
   type AggregateAppendMsg,
 } from '@pond-experiment/shared';
-import { startAggregate } from './aggregate.js';
+import { startAggregate, assembleTick } from './aggregate.js';
 
 /**
  * Tests exercise `startAggregate` end-to-end against a real
@@ -182,5 +182,144 @@ describe('startAggregate', () => {
     } finally {
       stop();
     }
+  });
+
+  it('emits anomaly-count and n_current fields on every row', async () => {
+    const live = new LiveSeries({
+      name: 'metrics',
+      schema,
+      retention: { maxAge: '6m' },
+    });
+    const frames: string[] = [];
+    const { stop } = startAggregate(live, (f) => frames.push(f), {
+      tickMs: 50,
+    });
+    try {
+      const t0 = Date.now();
+      for (let i = 0; i < 6; i++) {
+        live.push([new Date(t0 + i * 30), 0.5 + (i % 2) * 0.1, 100, 'api-1']);
+      }
+      await new Promise((res) => setTimeout(res, 200));
+
+      const appends = decodedFrames(frames);
+      expect(appends.length).toBeGreaterThan(0);
+      for (const f of appends) {
+        for (const r of f.rows) {
+          expect(typeof r.n_current).toBe('number');
+          expect(Array.isArray(r.anomalies_above)).toBe(true);
+          expect(Array.isArray(r.anomalies_below)).toBe(true);
+          // Length matches the default thresholds list (5 buckets).
+          expect(r.anomalies_above.length).toBe(5);
+          expect(r.anomalies_below.length).toBe(5);
+          // Counts can never exceed n_current.
+          for (const a of r.anomalies_above) {
+            expect(a).toBeGreaterThanOrEqual(0);
+            expect(a).toBeLessThanOrEqual(r.n_current);
+          }
+          for (const b of r.anomalies_below) {
+            expect(b).toBeGreaterThanOrEqual(0);
+            expect(b).toBeLessThanOrEqual(r.n_current);
+          }
+        }
+      }
+    } finally {
+      stop();
+    }
+  });
+});
+
+describe('assembleTick', () => {
+  // Pure-function unit tests for the threshold-density math. The
+  // join + pipeline composition are tested above against a real
+  // LiveSeries; here we cover the math edges that don't change
+  // shape from one pond version to the next.
+  const thresholds = [1, 1.5, 2, 2.5, 3] as const;
+
+  it('returns zero-filled arrays when baseline stats are null', () => {
+    const tick = assembleTick(
+      1_000,
+      'api-1',
+      { cpu_avg: null, cpu_sd: null, cpu_n: 0 },
+      [0.5, 0.6],
+      thresholds,
+    );
+    expect(tick.anomalies_above).toEqual([0, 0, 0, 0, 0]);
+    expect(tick.anomalies_below).toEqual([0, 0, 0, 0, 0]);
+    expect(tick.n_current).toBe(2);
+  });
+
+  it('returns zero-filled arrays when current slice is empty', () => {
+    const tick = assembleTick(
+      1_000,
+      'api-1',
+      { cpu_avg: 0.5, cpu_sd: 0.1, cpu_n: 100 },
+      [],
+      thresholds,
+    );
+    expect(tick.anomalies_above).toEqual([0, 0, 0, 0, 0]);
+    expect(tick.anomalies_below).toEqual([0, 0, 0, 0, 0]);
+    expect(tick.n_current).toBe(0);
+  });
+
+  it('counts samples that exceed each σ-threshold, above only', () => {
+    // Baseline mean=0.5, sd=0.1. Samples at deviations
+    // [+0.05, +0.12, +0.22, +0.32, +0.42, +0.55] (i.e., 0.5 σ,
+    // 1.2 σ, 2.2 σ, 3.2 σ, 4.2 σ, 5.5 σ above mean).
+    // Thresholds [1, 1.5, 2, 2.5, 3]:
+    //   >1σ: 5 of 6 (all except 0.55 i.e. the 0.5-σ outlier)
+    //   >1.5σ: 4 (1.2σ excluded)
+    //   >2σ: 4 (2.2σ included)
+    //   >2.5σ: 3 (2.2σ excluded)
+    //   >3σ: 3 (3.2σ included)
+    const tick = assembleTick(
+      1_000,
+      'api-1',
+      { cpu_avg: 0.5, cpu_sd: 0.1, cpu_n: 100 },
+      [0.55, 0.62, 0.72, 0.82, 0.92, 1.05],
+      thresholds,
+    );
+    expect(tick.anomalies_above).toEqual([5, 4, 4, 3, 3]);
+    expect(tick.anomalies_below).toEqual([0, 0, 0, 0, 0]);
+    expect(tick.n_current).toBe(6);
+  });
+
+  it('counts above and below symmetrically against the same thresholds', () => {
+    const tick = assembleTick(
+      1_000,
+      'api-1',
+      { cpu_avg: 0.5, cpu_sd: 0.1, cpu_n: 100 },
+      [0.45, 0.38, 0.30, 0.65, 0.72, 0.95],
+      thresholds,
+    );
+    // Below: deviations [-0.05, -0.12, -0.20]
+    //   >1σ: 2 (the -0.05 is 0.5σ, excluded)
+    //   >1.5σ: 1 (the -0.12 is 1.2σ, excluded)
+    //   >2σ: 0 (the -0.20 is exactly 2σ, NOT strictly greater)
+    //   >2.5σ: 0
+    //   >3σ: 0
+    expect(tick.anomalies_below).toEqual([2, 1, 0, 0, 0]);
+    // Above: deviations [+0.15, +0.22, +0.45]
+    //   >1σ: 3
+    //   >1.5σ: 2
+    //   >2σ: 2
+    //   >2.5σ: 1
+    //   >3σ: 1
+    expect(tick.anomalies_above).toEqual([3, 2, 2, 1, 1]);
+  });
+
+  it('zero sd: nothing exceeds any threshold', () => {
+    // sd=0 → cutoff = 0 for every threshold; `diff > 0` only fires
+    // for non-zero deviations. With samples == mean the deviation
+    // is exactly zero, so nothing counts.
+    const tick = assembleTick(
+      1_000,
+      'api-1',
+      { cpu_avg: 0.5, cpu_sd: 0, cpu_n: 100 },
+      [0.5, 0.5, 0.5],
+      thresholds,
+    );
+    expect(tick.anomalies_above).toEqual([0, 0, 0, 0, 0]);
+    expect(tick.anomalies_below).toEqual([0, 0, 0, 0, 0]);
+    expect(tick.n_current).toBe(3);
   });
 });

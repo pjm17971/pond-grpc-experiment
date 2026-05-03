@@ -23,6 +23,9 @@ const mkTick = (
   cpu_avg,
   cpu_sd: 0.05,
   cpu_n,
+  n_current: cpu_n > 0 ? Math.min(cpu_n, 5) : 0,
+  anomalies_above: [0, 0, 0, 0, 0],
+  anomalies_below: [0, 0, 0, 0, 0],
 });
 
 describe('applyAggregateFrame', () => {
@@ -132,8 +135,20 @@ describe('tickToRow', () => {
       cpu_avg: 0.55,
       cpu_sd: 0.08,
       cpu_n: 1000,
+      n_current: 4,
+      anomalies_above: [3, 1, 0, 0, 0],
+      anomalies_below: [2, 0, 0, 0, 0],
     });
-    expect(row).toEqual([1_700_000_000_000, 'api-1', 0.55, 0.08, 1000]);
+    expect(row).toEqual([
+      1_700_000_000_000,
+      'api-1',
+      0.55,
+      0.08,
+      1000,
+      4,
+      [3, 1, 0, 0, 0],
+      [2, 0, 0, 0, 0],
+    ]);
   });
 
   it('preserves nullable cpu_avg / cpu_sd', () => {
@@ -143,8 +158,20 @@ describe('tickToRow', () => {
       cpu_avg: null,
       cpu_sd: null,
       cpu_n: 0,
+      n_current: 0,
+      anomalies_above: [],
+      anomalies_below: [],
     });
-    expect(row).toEqual([1_700_000_000_000, 'api-1', null, null, 0]);
+    expect(row).toEqual([
+      1_700_000_000_000,
+      'api-1',
+      null,
+      null,
+      0,
+      0,
+      [],
+      [],
+    ]);
   });
 
   it('result pushes cleanly into a real LiveSeries<AggregateSchema>', () => {
@@ -158,14 +185,43 @@ describe('tickToRow', () => {
       retention: { maxAge: '6m' },
     });
     const ticks: HostTick[] = [
-      { ts: 1_700_000_000_000, host: 'api-1', cpu_avg: 0.5, cpu_sd: 0.08, cpu_n: 50 },
-      { ts: 1_700_000_000_200, host: 'api-1', cpu_avg: null, cpu_sd: null, cpu_n: 0 },
-      { ts: 1_700_000_000_400, host: 'api-1', cpu_avg: 0.6, cpu_sd: 0.09, cpu_n: 60 },
+      {
+        ts: 1_700_000_000_000,
+        host: 'api-1',
+        cpu_avg: 0.5,
+        cpu_sd: 0.08,
+        cpu_n: 50,
+        n_current: 5,
+        anomalies_above: [4, 1, 0, 0, 0],
+        anomalies_below: [0, 0, 0, 0, 0],
+      },
+      {
+        ts: 1_700_000_000_200,
+        host: 'api-1',
+        cpu_avg: null,
+        cpu_sd: null,
+        cpu_n: 0,
+        n_current: 0,
+        anomalies_above: [0, 0, 0, 0, 0],
+        anomalies_below: [0, 0, 0, 0, 0],
+      },
+      {
+        ts: 1_700_000_000_400,
+        host: 'api-1',
+        cpu_avg: 0.6,
+        cpu_sd: 0.09,
+        cpu_n: 60,
+        n_current: 6,
+        anomalies_above: [3, 0, 0, 0, 0],
+        anomalies_below: [0, 0, 0, 0, 0],
+      },
     ];
     expect(() => live.pushJson(ticks.map(tickToRow))).not.toThrow();
     expect(live.length).toBe(3);
     const events = [live.at(0)!, live.at(1)!, live.at(2)!];
     expect(events[0].get('cpu_avg')).toBeCloseTo(0.5, 6);
+    expect(events[0].get('n_current')).toBe(5);
+    expect(events[0].get('anomalies_above')).toEqual([4, 1, 0, 0, 0]);
     expect(events[1].get('cpu_avg')).toBeUndefined();
     expect(events[1].get('cpu_n')).toBe(0);
     expect(events[2].get('cpu_avg')).toBeCloseTo(0.6, 6);
