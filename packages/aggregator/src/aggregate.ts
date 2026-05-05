@@ -85,15 +85,14 @@ export function startAggregate(
   // every window's columns; events fire on the shared trigger's
   // boundary with all columns populated. See pond-grpc-experiment#20
   // for the RFC.
-  // `partitionBy` defaults its column-name generic to `string`,
-  // which makes the fused-rolling output schema's partition column
-  // widen to `ColumnDef<string, kind-union>` — kind-union includes
-  // `'time'`, which fails the `SeriesSchema` constraint
-  // downstream. Pass the column name explicitly so `K` narrows to
-  // `'host'` and the partition column types as `ColumnDef<'host',
-  // 'string'>` cleanly.
+  //
+  // pond 0.15.1 captures the partition column name into the
+  // `LivePartitionedSeries`'s `ByCol` generic from the `by`
+  // argument, so the fused-rolling output schema's partition
+  // column types as `ColumnDef<'host', 'string'>` without an
+  // explicit type argument. (Pre-0.15.1 needed `partitionBy<'host'>(...)`.)
   const fused: LiveSource<SeriesSchema> = live
-    .partitionBy<'host'>('host')
+    .partitionBy('host')
     .rolling(
       {
         '1m': {
