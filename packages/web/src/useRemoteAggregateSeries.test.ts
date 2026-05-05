@@ -247,12 +247,46 @@ describe('tickToRow', () => {
     expect(() => live.pushJson(ticks.map(tickToRow))).not.toThrow();
     expect(live.length).toBe(3);
     const events = [live.at(0)!, live.at(1)!, live.at(2)!];
+
+    // Spot-checks on the first/middle/last events.
     expect(events[0].get('cpu_avg')).toBeCloseTo(0.5, 6);
     expect(events[0].get('n_current')).toBe(5);
     expect(events[0].get('anomalies_above')).toEqual([4, 1, 0, 0, 0]);
     expect(events[1].get('cpu_avg')).toBeUndefined();
     expect(events[1].get('cpu_n')).toBe(0);
     expect(events[2].get('cpu_avg')).toBeCloseTo(0.6, 6);
+
+    // Every column round-trips with a non-default value. Cheap
+    // insurance against schema/converter drift as columns accumulate
+    // step-by-step — `tickToRow` is positional, so a missing slot or
+    // a misaligned tuple sends wrong data without any type error.
+    // (Spotted in PR #25 review: two 11-column tuples in lockstep,
+    // easy to drift; assert across the whole shape so any future
+    // mismatch fails loudly.)
+    const first = events[0];
+    const last = events[2];
+    expect(first.get('host')).toBe('api-1');
+    expect(first.get('cpu_sd')).toBeCloseTo(0.08, 6);
+    expect(first.get('cpu_n')).toBe(50);
+    expect(first.get('anomalies_below')).toEqual([0, 0, 0, 0, 0]);
+    expect(first.get('requests_avg')).toBe(100);
+    expect(first.get('requests_sum')).toBe(5_000);
+    expect(first.get('requests_n')).toBe(50);
+    expect(last.get('cpu_sd')).toBeCloseTo(0.09, 6);
+    expect(last.get('cpu_n')).toBe(60);
+    expect(last.get('n_current')).toBe(6);
+    expect(last.get('anomalies_above')).toEqual([3, 0, 0, 0, 0]);
+    expect(last.get('requests_avg')).toBe(105);
+    expect(last.get('requests_sum')).toBe(6_300);
+    expect(last.get('requests_n')).toBe(60);
+
+    // The middle-row null cells: confirm undefined (not 0/NaN) for
+    // nullable columns when the wire shipped null, and 0 for
+    // sum-of-empty.
+    expect(events[1].get('cpu_sd')).toBeUndefined();
+    expect(events[1].get('requests_avg')).toBeUndefined();
+    expect(events[1].get('requests_sum')).toBe(0);
+    expect(events[1].get('requests_n')).toBe(0);
   });
 });
 
