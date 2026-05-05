@@ -9,11 +9,11 @@ import { startAggregate, assembleTick } from './aggregate.js';
 
 /**
  * Tests exercise `startAggregate` end-to-end against a real
- * `LiveSeries`. V7 wires two clock-synchronised partitioned rollings
- * — a 1m baseline (avg/stdev/count) and a `tickMs` slice (samples) —
- * joined per `(ts, host)` and emitted as one wire frame per tick.
- * We assert the pipeline composition: synchronised tick clock,
- * single-frame-per-ts collation, monotonic frame ts, and the
+ * `LiveSeries`. V8 (pond 0.15.0) wires a single fused multi-window
+ * partitioned rolling — `'1m'` (avg/stdev/count) and `${tickMs}ms`
+ * (samples) — clocked off one trigger and emitted as one wire frame
+ * per tick. We assert the pipeline composition: synchronised tick
+ * clock, single-frame-per-ts collation, monotonic frame ts, and the
  * anomaly-density fields on every row.
  *
  * `cpu_n` is the 1m bucket's own sample count (the gating signal for
@@ -109,7 +109,7 @@ describe('startAggregate', () => {
     }
   });
 
-  it('coalesces baseline + slice rollings into one frame per tick (microtask merge)', async () => {
+  it('coalesces fused-rolling per-partition events into one frame per tick (microtask merge)', async () => {
     const live = new LiveSeries({
       name: 'metrics',
       schema,
