@@ -15,38 +15,42 @@ import {
 } from '@pond-experiment/shared';
 
 /**
- * Server-side aggregate-stream emitter, M3.5 step 4 / V7 shape.
+ * Server-side aggregate-stream emitter, M3.5 step 4 / V8 shape.
  *
  * Builds the per-host tick aggregates the `/live-agg` wire ships
  * (`{ ts, host, cpu_avg, cpu_sd, cpu_n, n_current, anomalies_above[],
- * anomalies_below[] }`) by composing **two synchronised partitioned
- * rollings**, both clocked off the same `Trigger.clock(seq)`:
+ * anomalies_below[] }`) by composing **one fused multi-window
+ * partitioned rolling** clocked off `Trigger.clock(seq)`:
  *
- *   1. **Baseline rolling** (1m window):
- *        live.partitionBy('host').rolling('1m', {
- *          cpu_avg: { from: 'cpu', using: 'avg' },
- *          cpu_sd:  { from: 'cpu', using: 'stdev' },
- *          cpu_n:   { from: 'cpu', using: 'count' },
- *        }, { trigger })
+ *   live.partitionBy('host').rolling(
+ *     {
+ *       '1m':         { cpu_avg: 'avg', cpu_sd: 'stdev', cpu_n: 'count' },
+ *       `${tickMs}ms`: { cpu_samples: 'samples' },
+ *     },
+ *     { trigger },
+ *   );
  *
- *   2. **Slice rolling** (`tickMs` window, default 200ms):
- *        live.partitionBy('host').rolling('200ms', {
- *          cpu_samples: { from: 'cpu', using: 'samples' },
- *        }, { trigger })
+ * One per-event ingest pass updates both windows' reducer state in
+ * the same partition object; one boundary check fires; one
+ * synchronised burst emits a single merged event per partition per
+ * tick. Every column the consumer cares about is on that one event.
  *
- * Both rollings subscribe to the same `byHost` partition machinery,
- * share the same clock sequence, and therefore burst at the same
- * boundary `ts`. Each tick boundary produces two events per known
- * host (one per rolling); the join below collates them per
- * `(ts, host)` and emits one wire row per host per tick.
+ * History:
+ * - V6 (#16) — manual per-host deque off `live.on('batch', cb)` for
+ *   the leading-edge slice; one pond rolling for baseline.
+ * - V7 (#18) — pond 0.14.2 `samples()` reducer, two parallel
+ *   rollings sharing one trigger. Cleaner shape; ~19% throughput
+ *   regression at ceiling because every event flowed through two
+ *   ingest pipelines (see PR #19's profile diff).
+ * - V8 (this) — pond 0.15.0 fused rolling delivers the API proposed
+ *   in PR #20 (RFC). Two windows, one rolling, one ingest pass.
  *
- * The `samples` reducer is built-in (v0.14.2) — it returns the bucket's
- * full sample list as `ReadonlyArray<number>`, which is what anomaly
- * counting needs at the leading edge against the baseline mean/sd. V6
- * faked this with a manual per-host deque off `live.on('batch', …)`
- * because no built-in returned the bucket contents and pond's live
- * partitioned rolling rejects custom function reducers; the pre-V7
- * note in `friction-notes/M3.5.md` documents that workaround.
+ * The pendingByTs collation below stays — pond emits one event per
+ * partition per tick, and the wire ships one frame per tick across
+ * all partitions. The collation just merges the per-partition
+ * bursts into a single `aggregate-append`. The V7 per-`(ts, host)`
+ * parts buffer (waiting for the second rolling's event to arrive)
+ * is gone — fused emits one event with both halves at once.
  */
 export type AggregateOptions = {
   /** Tick cadence in milliseconds. Default 200, matches `WIRE.md`. */
@@ -65,11 +69,6 @@ type BaselineParts = {
   cpu_n: number;
 };
 
-type Parts = {
-  baseline?: BaselineParts;
-  samples?: ReadonlyArray<number>;
-};
-
 export function startAggregate(
   live: LiveSeries<Schema>,
   broadcast: (frame: string) => void,
@@ -80,51 +79,43 @@ export function startAggregate(
   const seq = Sequence.every(`${tickMs}ms`);
   const trigger = Trigger.clock(seq);
 
-  // Both rollings hang off the same partition. `partitionBy` is the
-  // bookkeeping layer that fans events out to per-host LiveSources;
-  // creating two rollings on the same `byHost` reuses that fan-out.
-  const byHost = live.partitionBy('host');
+  // Single fused rolling — pond 0.15.0. The keyed-form mapping
+  // declares two windows: a 1m baseline (avg/stdev/count) and a
+  // `tickMs`-ms slice (samples). Output schema is the merge of
+  // every window's columns; events fire on the shared trigger's
+  // boundary with all columns populated. See pond-grpc-experiment#20
+  // for the RFC.
+  // `partitionBy` defaults its column-name generic to `string`,
+  // which makes the fused-rolling output schema's partition column
+  // widen to `ColumnDef<string, kind-union>` — kind-union includes
+  // `'time'`, which fails the `SeriesSchema` constraint
+  // downstream. Pass the column name explicitly so `K` narrows to
+  // `'host'` and the partition column types as `ColumnDef<'host',
+  // 'string'>` cleanly.
+  const fused: LiveSource<SeriesSchema> = live
+    .partitionBy<'host'>('host')
+    .rolling(
+      {
+        '1m': {
+          cpu_avg: { from: 'cpu', using: 'avg' },
+          cpu_sd: { from: 'cpu', using: 'stdev' },
+          cpu_n: { from: 'cpu', using: 'count' },
+        },
+        [`${tickMs}ms`]: {
+          cpu_samples: { from: 'cpu', using: 'samples' },
+        },
+      },
+      { trigger },
+    );
 
-  const baselineStream: LiveSource<SeriesSchema> = byHost.rolling(
-    '1m',
-    {
-      cpu_avg: { from: 'cpu', using: 'avg' },
-      cpu_sd: { from: 'cpu', using: 'stdev' },
-      cpu_n: { from: 'cpu', using: 'count' },
-    },
-    { trigger },
-  );
-
-  const sliceStream: LiveSource<SeriesSchema> = byHost.rolling(
-    `${tickMs}ms`,
-    {
-      cpu_samples: { from: 'cpu', using: 'samples' },
-    },
-    { trigger },
-  );
-
-  // Per-`(ts, host)` parts buffer. Both rollings burst on each clock
-  // boundary; the events fire synchronously inside the same JS task
-  // (pond dispatches subscribers in order). The microtask drain runs
-  // after the task finishes — by then both halves are present for
-  // every host the rollings know about.
-  const pendingByTs = new Map<number, Map<string, Parts>>();
+  // Per-`ts` row collation — pond fires one event per partition per
+  // tick boundary; the wire ships one frame per tick across all
+  // partitions. The microtask drain accumulates the per-partition
+  // events for a given `ts` into a single `aggregate-append` frame
+  // and emits it in monotonic order.
+  const pendingByTs = new Map<number, HostTick[]>();
   let lastEmittedTs = -1;
   let scheduled = false;
-
-  const partsFor = (ts: number, host: string): Parts => {
-    let perHost = pendingByTs.get(ts);
-    if (!perHost) {
-      perHost = new Map();
-      pendingByTs.set(ts, perHost);
-    }
-    let parts = perHost.get(host);
-    if (!parts) {
-      parts = {};
-      perHost.set(host, parts);
-    }
-    return parts;
-  };
 
   const scheduleEmit = (): void => {
     if (scheduled) return;
@@ -142,32 +133,8 @@ export function startAggregate(
         pendingByTs.delete(ts);
         continue;
       }
-      const perHost = pendingByTs.get(ts);
-      if (!perHost || perHost.size === 0) continue;
-      const rows: HostTick[] = [];
-      for (const [host, parts] of perHost) {
-        // Only emit hosts that have a baseline. WIRE.md's contract:
-        // "one HostTick per host that had any samples in the rolling
-        // 1m window at tick time; silent hosts are omitted." Slice-
-        // only entries (no baseline event for this tick) shouldn't
-        // happen — slice's 200ms window is a strict subset of
-        // baseline's 1m window — but defending against it costs
-        // nothing.
-        if (!parts.baseline) continue;
-        rows.push(
-          assembleTick(
-            ts,
-            host,
-            parts.baseline,
-            parts.samples ?? [],
-            thresholds,
-          ),
-        );
-      }
-      if (rows.length === 0) {
-        pendingByTs.delete(ts);
-        continue;
-      }
+      const rows = pendingByTs.get(ts);
+      if (!rows || rows.length === 0) continue;
       lastEmittedTs = ts;
       const msg: AggregateAppendMsg = { type: 'aggregate-append', rows };
       broadcast(encode(msg));
@@ -175,46 +142,49 @@ export function startAggregate(
     }
   };
 
-  const offBaseline = baselineStream.on(
+  const offFused = fused.on(
     'event',
     (e: EventForSchema<SeriesSchema>) => {
       const ts = e.key().begin();
       const host = e.get('host');
       if (typeof host !== 'string') return;
+
       const cpu_avg = e.get('cpu_avg');
       const cpu_sd = e.get('cpu_sd');
       const cpu_n = e.get('cpu_n');
-      partsFor(ts, host).baseline = {
-        cpu_avg: typeof cpu_avg === 'number' ? cpu_avg : null,
-        cpu_sd: typeof cpu_sd === 'number' ? cpu_sd : null,
-        cpu_n: typeof cpu_n === 'number' ? cpu_n : 0,
-      };
-      scheduleEmit();
-    },
-  );
-
-  const offSlice = sliceStream.on(
-    'event',
-    (e: EventForSchema<SeriesSchema>) => {
-      const ts = e.key().begin();
-      const host = e.get('host');
-      if (typeof host !== 'string') return;
       // `samples` reducer returns `ReadonlyArray<number> | undefined`
       // (undefined when the window is gated or empty). Normalise to
-      // an empty array so downstream consumers see a regular shape.
-      const raw = e.get('cpu_samples');
-      const samples: ReadonlyArray<number> = Array.isArray(raw)
-        ? (raw as ReadonlyArray<number>)
+      // an empty array so anomaly counting sees a regular shape.
+      const rawSamples = e.get('cpu_samples');
+      const samples: ReadonlyArray<number> = Array.isArray(rawSamples)
+        ? (rawSamples as ReadonlyArray<number>)
         : [];
-      partsFor(ts, host).samples = samples;
+
+      const tick = assembleTick(
+        ts,
+        host,
+        {
+          cpu_avg: typeof cpu_avg === 'number' ? cpu_avg : null,
+          cpu_sd: typeof cpu_sd === 'number' ? cpu_sd : null,
+          cpu_n: typeof cpu_n === 'number' ? cpu_n : 0,
+        },
+        samples,
+        thresholds,
+      );
+
+      let rows = pendingByTs.get(ts);
+      if (!rows) {
+        rows = [];
+        pendingByTs.set(ts, rows);
+      }
+      rows.push(tick);
       scheduleEmit();
     },
   );
 
   return {
     stop: () => {
-      offBaseline();
-      offSlice();
+      offFused();
       pendingByTs.clear();
     },
   };
