@@ -471,44 +471,51 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     );
   }, [showBands, cpu.allAnomalies, highCpuFiltered, tStart, tEnd]);
 
-  // 13. Requests: per-host smoothed lines + 1-min rolling avg as legend stat.
-  //     Same partition pattern as CPU; two `partitionBy.toMap(...)` calls
-  //     produce the per-host smoothed points and the per-host scalar avg.
+  // 13. Requests: per-host smoothed lines + 1-min rolling rate as
+  //     legend stat. Step 5 of M3.5 sources both off `/live-agg`'s
+  //     `requests_sum` / `requests_n` columns rather than smoothing
+  //     raw `requests` events.
+  //
+  //     `requests_sum / 60` is the per-host requests-per-second rate
+  //     averaged over the rolling 1m window — independent of the
+  //     global `eventsPerSec` (which the raw-side path had to use as
+  //     a multiplier to convert per-event averages back into a rate).
+  //     EMA smoothing on the 5 Hz tick stream takes the place of the
+  //     per-event smoothing the raw path did.
   const reqSeries = useMemo<ChartSeries[]>(() => {
-    if (!timeSeries) return [];
-    // eps is the measured event rate (events/sec). Pre-1m, the rolling
-    // count is undefined; fall back to 0 so the chart renders flat
-    // (rather than NaN) during the warm-up.
-    const eps = eventsPerSec ?? 0;
-    const perHostSmooth = timeSeries
+    if (!aggSnapshot) return [];
+    const perHostSmooth = aggSnapshot
       .partitionBy('host')
-      .smooth('requests', 'ema', { alpha: 0.25 })
-      .toMap((g) => g.slice(12).toPoints());
-    const perHostAvg = timeSeries
+      .smooth('requests_sum', 'ema', { alpha: 0.25 })
+      // Drop the first few warmup ticks while the EMA converges
+      // (same intent as the raw path's `slice(12)`, but on a 5 Hz
+      // tick stream so 4 ticks ≈ 800 ms of warmup).
+      .toMap((g) => g.slice(4).toPoints());
+    const perHostLatest = aggSnapshot
       .partitionBy('host')
-      .toMap((g) => g.tail('1m').reduce({ requests: 'avg' }).requests);
+      .toMap((g) => g.last()?.get('requests_sum'));
 
     const out: ChartSeries[] = [];
     for (const host of hosts) {
       if (!enabledHosts.has(host)) continue;
       const rows = perHostSmooth.get(host) ?? [];
-      const rollingAvg = perHostAvg.get(host);
+      const latestSum = perHostLatest.get(host);
       out.push({
         name: host,
         color: hostColors[host],
         stat:
-          rollingAvg != null
-            ? `${(rollingAvg * eps).toFixed(0)}/s`
+          typeof latestSum === 'number'
+            ? `${(latestSum / 60).toFixed(0)}/s`
             : undefined,
         points: rows.flatMap((r) =>
-          r.requests == null
-            ? []
-            : [{ ts: r.ts, value: r.requests * eps }],
+          typeof r.requests_sum === 'number'
+            ? [{ ts: r.ts, value: r.requests_sum / 60 }]
+            : [],
         ),
       });
     }
     return out;
-  }, [timeSeries, hosts, enabledHosts, hostColors, eventsPerSec]);
+  }, [aggSnapshot, hosts, enabledHosts, hostColors]);
 
   // 14. Total req/sec across visible hosts — sum of the latest point per series.
   const totalReqPerSec = reqSeries.reduce((sum, s) => {

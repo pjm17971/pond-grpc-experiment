@@ -26,6 +26,13 @@ const mkTick = (
   n_current: cpu_n > 0 ? Math.min(cpu_n, 5) : 0,
   anomalies_above: [0, 0, 0, 0, 0],
   anomalies_below: [0, 0, 0, 0, 0],
+  // Step 5 — requests stats. Default to derived plausible values
+  // for tests that don't specifically exercise the requests
+  // pass-through (avg=100 matches the producer's constant); tests
+  // can override per-row when they care.
+  requests_avg: cpu_n > 0 ? 100 : null,
+  requests_sum: cpu_n * 100,
+  requests_n: cpu_n,
 });
 
 describe('applyAggregateFrame', () => {
@@ -138,6 +145,9 @@ describe('tickToRow', () => {
       n_current: 4,
       anomalies_above: [3, 1, 0, 0, 0],
       anomalies_below: [2, 0, 0, 0, 0],
+      requests_avg: 102.5,
+      requests_sum: 102_500,
+      requests_n: 1000,
     });
     expect(row).toEqual([
       1_700_000_000_000,
@@ -148,10 +158,13 @@ describe('tickToRow', () => {
       4,
       [3, 1, 0, 0, 0],
       [2, 0, 0, 0, 0],
+      102.5,
+      102_500,
+      1000,
     ]);
   });
 
-  it('preserves nullable cpu_avg / cpu_sd', () => {
+  it('preserves nullable cpu_avg / cpu_sd / requests_avg', () => {
     const row = tickToRow({
       ts: 1_700_000_000_000,
       host: 'api-1',
@@ -161,6 +174,9 @@ describe('tickToRow', () => {
       n_current: 0,
       anomalies_above: [],
       anomalies_below: [],
+      requests_avg: null,
+      requests_sum: 0,
+      requests_n: 0,
     });
     expect(row).toEqual([
       1_700_000_000_000,
@@ -171,6 +187,9 @@ describe('tickToRow', () => {
       0,
       [],
       [],
+      null,
+      0,
+      0,
     ]);
   });
 
@@ -194,6 +213,9 @@ describe('tickToRow', () => {
         n_current: 5,
         anomalies_above: [4, 1, 0, 0, 0],
         anomalies_below: [0, 0, 0, 0, 0],
+        requests_avg: 100,
+        requests_sum: 5_000,
+        requests_n: 50,
       },
       {
         ts: 1_700_000_000_200,
@@ -204,6 +226,9 @@ describe('tickToRow', () => {
         n_current: 0,
         anomalies_above: [0, 0, 0, 0, 0],
         anomalies_below: [0, 0, 0, 0, 0],
+        requests_avg: null,
+        requests_sum: 0,
+        requests_n: 0,
       },
       {
         ts: 1_700_000_000_400,
@@ -214,6 +239,9 @@ describe('tickToRow', () => {
         n_current: 6,
         anomalies_above: [3, 0, 0, 0, 0],
         anomalies_below: [0, 0, 0, 0, 0],
+        requests_avg: 105,
+        requests_sum: 6_300,
+        requests_n: 60,
       },
     ];
     expect(() => live.pushJson(ticks.map(tickToRow))).not.toThrow();
