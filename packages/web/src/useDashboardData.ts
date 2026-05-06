@@ -478,26 +478,20 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   }, [showBands, cpu.allAnomalies, highCpuFiltered, tStart, tEnd]);
 
   // 13. Requests: per-host rolling rate line + 1-min rolling rate as
-  //     legend stat. Step 5 of M3.5 sources both off `/live-agg`'s
-  //     `requests_sum` / `requests_n` columns rather than smoothing
-  //     raw `requests` events.
+  //     legend stat. Sources off `/live-agg`'s `requests_sum` /
+  //     `requests_n` / `window_age_seconds` columns rather than
+  //     smoothing raw `requests` events.
   //
-  //     `requests_sum / 60` is the per-host requests-per-second rate
-  //     averaged over the rolling 1m window — independent of the
-  //     global `eventsPerSec` multiplier the raw-side path needed.
-  //
-  //     **Warmup gate.** During the rolling window's first 60s the
-  //     denominator is wrong: `requests_sum` reflects the current
-  //     elapsed-window-of-data (not a full 60s), so dividing by 60
-  //     under-reports the rate by `(elapsed / 60)`. Gating the line
-  //     on `requests_n >= MIN_SAMPLES` (matching the bands' gate at
-  //     §7) keeps the chart blank until the bucket has accumulated
-  //     a non-trivial sample count, then accepts the residual ramp
-  //     as the window finishes filling. A robust fix is shipping
-  //     `window_seconds` on the wire (deferred to a follow-up; see
-  //     PR #25 review). For a long-running aggregator the window is
-  //     already full at connect time, so the ramp is only visible
-  //     in fresh-aggregator scenarios.
+  //     `requests_sum / window_age_seconds` is the per-host requests-
+  //     per-second rate over the actual rolling-window contents at
+  //     this row's tick. `window_age_seconds` (step 6+) is the
+  //     elapsed wall-clock the rolling 1m window spans, capped at
+  //     60 once warm. Dividing by the actual window age — not a
+  //     hardcoded 60 — kills the warmup-ramp diagonal a fresh
+  //     aggregator would otherwise show on this chart for its first
+  //     60 seconds (the dashboard agent's option-2 fix from PR #25
+  //     review). For long-running aggregators the divisor pins to
+  //     60 and the formula is identical to the previous one.
   //
   //     **No per-tick EMA.** Earlier drafts ran `ema(α=0.25)` on
   //     `requests_sum` to mimic the raw path's per-event smoothing,
@@ -509,7 +503,6 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //     smoothing's added lag.
   const reqSeries = useMemo<ChartSeries[]>(() => {
     if (!aggSnapshot) return [];
-    const MIN_SAMPLES_REQUESTS = 30;
     const perHostRows = aggSnapshot
       .partitionBy('host')
       .toMap((g) => g.toPoints());
@@ -521,10 +514,20 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       const points: ChartPoint[] = [];
       let latestRate: number | undefined;
       for (const r of rows) {
-        const n = r.requests_n ?? 0;
-        if (n < MIN_SAMPLES_REQUESTS) continue;
         if (typeof r.requests_sum !== 'number') continue;
-        const rate = r.requests_sum / 60;
+        // Need at least one event so requests_sum reflects real
+        // data and we don't paint extrapolated rates from an empty
+        // rolling window.
+        if ((r.requests_n ?? 0) < 1) continue;
+        const ageSec =
+          typeof r.window_age_seconds === 'number'
+            ? r.window_age_seconds
+            : 60;
+        // Cap divisor at >0 to avoid division by zero on the very
+        // first frame after aggregator start (window_age_seconds
+        // can be 0 if `firstEventTs == ts` exactly).
+        const denom = Math.max(0.001, ageSec);
+        const rate = r.requests_sum / denom;
         points.push({ ts: r.ts, value: rate });
         latestRate = rate;
       }

@@ -33,6 +33,8 @@ const mkTick = (
   requests_avg: cpu_n > 0 ? 100 : null,
   requests_sum: cpu_n * 100,
   requests_n: cpu_n,
+  // Step 6 — window_age_seconds. Default to 60 (warm aggregator).
+  window_age_seconds: 60,
 });
 
 describe('applyAggregateFrame', () => {
@@ -148,6 +150,7 @@ describe('tickToRow', () => {
       requests_avg: 102.5,
       requests_sum: 102_500,
       requests_n: 1000,
+      window_age_seconds: 60,
     });
     expect(row).toEqual([
       1_700_000_000_000,
@@ -161,6 +164,7 @@ describe('tickToRow', () => {
       102.5,
       102_500,
       1000,
+      60,
     ]);
   });
 
@@ -177,6 +181,7 @@ describe('tickToRow', () => {
       requests_avg: null,
       requests_sum: 0,
       requests_n: 0,
+      window_age_seconds: 0,
     });
     expect(row).toEqual([
       1_700_000_000_000,
@@ -188,6 +193,7 @@ describe('tickToRow', () => {
       [],
       [],
       null,
+      0,
       0,
       0,
     ]);
@@ -216,6 +222,7 @@ describe('tickToRow', () => {
         requests_avg: 100,
         requests_sum: 5_000,
         requests_n: 50,
+        window_age_seconds: 30,
       },
       {
         ts: 1_700_000_000_200,
@@ -229,6 +236,7 @@ describe('tickToRow', () => {
         requests_avg: null,
         requests_sum: 0,
         requests_n: 0,
+        window_age_seconds: 30.2,
       },
       {
         ts: 1_700_000_000_400,
@@ -242,6 +250,7 @@ describe('tickToRow', () => {
         requests_avg: 105,
         requests_sum: 6_300,
         requests_n: 60,
+        window_age_seconds: 30.4,
       },
     ];
     expect(() => live.pushJson(ticks.map(tickToRow))).not.toThrow();
@@ -260,7 +269,7 @@ describe('tickToRow', () => {
     // insurance against schema/converter drift as columns accumulate
     // step-by-step — `tickToRow` is positional, so a missing slot or
     // a misaligned tuple sends wrong data without any type error.
-    // (Spotted in PR #25 review: two 11-column tuples in lockstep,
+    // (Spotted in PR #25 review: two N-column tuples in lockstep,
     // easy to drift; assert across the whole shape so any future
     // mismatch fails loudly.)
     const first = events[0];
@@ -272,6 +281,7 @@ describe('tickToRow', () => {
     expect(first.get('requests_avg')).toBe(100);
     expect(first.get('requests_sum')).toBe(5_000);
     expect(first.get('requests_n')).toBe(50);
+    expect(first.get('window_age_seconds')).toBe(30);
     expect(last.get('cpu_sd')).toBeCloseTo(0.09, 6);
     expect(last.get('cpu_n')).toBe(60);
     expect(last.get('n_current')).toBe(6);
@@ -279,6 +289,7 @@ describe('tickToRow', () => {
     expect(last.get('requests_avg')).toBe(105);
     expect(last.get('requests_sum')).toBe(6_300);
     expect(last.get('requests_n')).toBe(60);
+    expect(last.get('window_age_seconds')).toBeCloseTo(30.4, 6);
 
     // The middle-row null cells: confirm undefined (not 0/NaN) for
     // nullable columns when the wire shipped null, and 0 for
@@ -287,6 +298,7 @@ describe('tickToRow', () => {
     expect(events[1].get('requests_avg')).toBeUndefined();
     expect(events[1].get('requests_sum')).toBe(0);
     expect(events[1].get('requests_n')).toBe(0);
+    expect(events[1].get('window_age_seconds')).toBeCloseTo(30.2, 6);
   });
 });
 

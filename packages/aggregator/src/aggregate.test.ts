@@ -311,10 +311,17 @@ describe('assembleTick', () => {
   // shape from one pond version to the next.
   const thresholds = [1, 1.5, 2, 2.5, 3] as const;
 
-  // Default request stats — most assembleTick tests exercise CPU
-  // anomaly counting and don't care about the requests pass-through;
-  // factor it out so the cpu-focused tests stay readable.
-  const noRequests = { requests_avg: null, requests_sum: 0, requests_n: 0 };
+  // Default request stats + window age — most assembleTick tests
+  // exercise CPU anomaly counting and don't care about the requests
+  // pass-through or the warmup-window value; factor them out so the
+  // cpu-focused tests stay readable. `window_age_seconds: 60`
+  // simulates a warm aggregator (rolling window full).
+  const noRequests = {
+    requests_avg: null,
+    requests_sum: 0,
+    requests_n: 0,
+    window_age_seconds: 60,
+  };
 
   it('returns zero-filled arrays when baseline stats are null', () => {
     const tick = assembleTick(
@@ -404,12 +411,13 @@ describe('assembleTick', () => {
     expect(tick.n_current).toBe(3);
   });
 
-  it('passes requests stats through unchanged (independent of anomaly math)', () => {
-    // assembleTick is purely a pass-through for requests stats —
-    // they're stored on the rolling-output event by pond's reducers
-    // and copied onto the wire row without further computation.
-    // Confirm the three fields land on the output regardless of
-    // baseline-cpu state.
+  it('passes requests stats + window_age through unchanged (independent of anomaly math)', () => {
+    // assembleTick is purely a pass-through for requests stats and
+    // window_age_seconds — they're stored on the rolling-output
+    // event by pond's reducers / computed by the caller and copied
+    // onto the wire row without further computation. Confirm the
+    // four fields land on the output regardless of baseline-cpu
+    // state.
     const tickWithBaseline = assembleTick(
       1_000,
       'api-1',
@@ -420,6 +428,7 @@ describe('assembleTick', () => {
         requests_avg: 102.5,
         requests_sum: 12_300,
         requests_n: 120,
+        window_age_seconds: 60,
       },
       [0.6],
       thresholds,
@@ -427,9 +436,12 @@ describe('assembleTick', () => {
     expect(tickWithBaseline.requests_avg).toBe(102.5);
     expect(tickWithBaseline.requests_sum).toBe(12_300);
     expect(tickWithBaseline.requests_n).toBe(120);
+    expect(tickWithBaseline.window_age_seconds).toBe(60);
 
     // And on a null-baseline tick (no cpu stats yet, but requests
     // can still be present — the two columns gate independently).
+    // Mid-warmup `window_age_seconds: 25` represents 25s of data
+    // accumulated, before the rolling window is full.
     const tickNullBaseline = assembleTick(
       1_000,
       'api-1',
@@ -440,6 +452,7 @@ describe('assembleTick', () => {
         requests_avg: 90,
         requests_sum: 900,
         requests_n: 10,
+        window_age_seconds: 25,
       },
       [],
       thresholds,
@@ -448,5 +461,6 @@ describe('assembleTick', () => {
     expect(tickNullBaseline.requests_avg).toBe(90);
     expect(tickNullBaseline.requests_sum).toBe(900);
     expect(tickNullBaseline.requests_n).toBe(10);
+    expect(tickNullBaseline.window_age_seconds).toBe(25);
   });
 });

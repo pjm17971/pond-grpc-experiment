@@ -63,6 +63,15 @@ export type AppendMsg = { type: 'append'; rows: ReadonlyArray<WireRow> };
  *   `cpu_n` and `requests_n` track each other since both come from
  *   the same source events; kept separate so a future producer that
  *   emits sparse-`requests` events doesn't desync the gating.
+ * - `window_age_seconds` — elapsed wall-clock seconds covered by
+ *   this row's rolling window, capped at the window length (60s for
+ *   the 1m baseline). During the aggregator's first 60s of operation
+ *   this is the actual data-window-so-far; once warm it pins to 60.
+ *   Lets the dashboard divide rolling sums (e.g. `requests_sum`) by
+ *   the *real* elapsed window rather than a hardcoded 60s, so
+ *   request-rate displays don't show a 60s diagonal warmup ramp on
+ *   a freshly-started aggregator. Same value across hosts at a
+ *   given tick — repeated per row for self-describing chart history.
  */
 export type HostTick = {
   ts: number;
@@ -76,6 +85,7 @@ export type HostTick = {
   requests_avg: number | null;
   requests_sum: number;
   requests_n: number;
+  window_age_seconds: number;
 };
 
 /**

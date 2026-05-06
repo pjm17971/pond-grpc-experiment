@@ -79,6 +79,7 @@ type BaselineParts = {
   requests_avg: number | null;
   requests_sum: number;
   requests_n: number;
+  window_age_seconds: number;
 };
 
 export function startAggregate(
@@ -123,40 +124,62 @@ export function startAggregate(
     );
 
   // Step 6 — globals: aggregator-wide stats emitted on the same
-  // tick clock as the per-host fused rolling. All three are
-  // tracked manually off `live.on('batch'/'evict')` callbacks
-  // rather than running a parallel non-partitioned pond rolling.
+  // tick clock as the per-host fused rolling. `events_per_sec`
+  // comes from a **non-partitioned fused rolling** clocked off the
+  // same `Trigger.clock(seq)`; cumulative counters
+  // (`events_ingested_total`, `evicted_total`, `firstEventTs` for
+  // window-age) come from `live.on('batch'/'evict')` callbacks.
   //
-  // **Why not pond rolling for events_per_sec?**
-  //
-  // The natural shape would be `live.rolling({'1s': {events_per_sec:
-  // 'count'}}, {trigger})` — exercising the new non-partitioned
-  // fused-rolling overload (PR #20 / pond 0.15.0). But at 87k+
-  // events/sec, every raw event has to flow through the non-
-  // partitioned rolling's per-event ingest pipeline (fanout → push
-  // → routeEvent → reducer add). The partitioned 1m baseline
-  // splits this work across 100 hosts (~870 events/sec each); the
-  // non-partitioned variant takes the full firehose serially. In
-  // practice this dropped throughput from 88k/s to 21k/s and tick
-  // emission from 5 fps to 1.2 fps at the 87k/s bench point — a
-  // ~4× regression, far worse than the V7→V6 gap PR #19 documented.
-  //
-  // Manual counter + boundary-deltad rate is O(1) per event and
-  // computes an equivalent value (raw events in the trailing tick
-  // window). Friction-note candidate for the library: non-
-  // partitioned rolling is currently the only path that doesn't
-  // shard ingest by partition, and it bottlenecks at firehose
-  // rates. Same `samples()` reducer would exhibit a similar shape.
+  // **Note on the 0.15.0 → 0.15.2 evolution.** The first commit on
+  // this branch tried `live.rolling({'1s': {events_per_sec:
+  // 'count'}}, {trigger})` — the natural API — and saw throughput
+  // collapse from 88k/s to 21k/s at the 87k/s bench point. Cause:
+  // every raw event flowed through the non-partitioned rolling's
+  // per-event ingest pipeline serially, plus an `Array.shift()` on
+  // every eviction at the rolling's deque (O(N) per ingest at
+  // firehose deque sizes). pond-ts 0.15.2 fixed the eviction loop
+  // (head-index + amortised batched compaction; see CHANGELOG)
+  // citing this PR's friction note directly. Re-enabled the
+  // natural shape here.
   let eventsIngested = 0;
   let eventsEvicted = 0;
-  let prevEventsIngested = 0;
-  let prevTickTs: number | null = null;
+  // `firstEventTs` — wall-clock of the first event the aggregator
+  // ever sees. Used to compute `window_age_seconds` per emitted
+  // tick. Once the rolling window has been full for >=60s, age
+  // pins to 60; before then it's the actual elapsed-since-start.
+  let firstEventTs: number | null = null;
   const offBatch = live.on('batch', (events) => {
     eventsIngested += events.length;
+    if (firstEventTs === null && events.length > 0) {
+      firstEventTs = events[0].key().timestampMs();
+    }
   });
   const offEvict = live.on('evict', (events) => {
     eventsEvicted += events.length;
   });
+
+  /** 1m baseline window length in seconds (matches the fused mapping above). */
+  const baselineWindowSec = 60;
+
+  // Non-partitioned fused rolling for `events_per_sec`. Emits one
+  // event per trigger boundary (5 fps at the default tickMs) with
+  // the count of source events in the trailing 1s window. We snap
+  // its output into `latestEventsPerSec` to attach to whatever
+  // tick frame the per-host fused rolling drives next.
+  const globalsStream: LiveSource<SeriesSchema> = live.rolling(
+    {
+      '1s': { events_per_sec: { from: 'cpu', using: 'count' } },
+    },
+    { trigger },
+  );
+  let latestEventsPerSec = 0;
+  const offGlobals = globalsStream.on(
+    'event',
+    (e: EventForSchema<SeriesSchema>) => {
+      const eps = e.get('events_per_sec');
+      if (typeof eps === 'number') latestEventsPerSec = eps;
+    },
+  );
 
   // Per-`ts` row collation — pond fires one event per partition per
   // tick boundary; the wire ships one frame per tick across all
@@ -190,22 +213,17 @@ export function startAggregate(
       if (!rows || rows.length === 0) continue;
       lastEmittedTs = ts;
 
-      // Globals: derived per-tick from the running counters. Rate
-      // is the per-tick delta divided by elapsed wall-clock. First
-      // tick has no `prev` to subtract from — fall back to 0 rather
-      // than dividing-by-zero or shipping an unbounded rate.
-      const dtSec =
-        prevTickTs == null ? 0 : Math.max(0.001, (ts - prevTickTs) / 1000);
-      const eps =
-        dtSec === 0 ? 0 : (eventsIngested - prevEventsIngested) / dtSec;
+      // Globals — events_per_sec comes from the non-partitioned
+      // 1s rolling above; cumulative counters from manual batch /
+      // evict listeners. The rolling fires on every trigger
+      // boundary, so `latestEventsPerSec` is at most one tick
+      // (200ms) stale relative to this `ts`.
       const globals: GlobalsTick = {
         ts,
         events_ingested_total: eventsIngested,
-        events_per_sec: Math.round(eps),
+        events_per_sec: Math.round(latestEventsPerSec),
         evicted_total: eventsEvicted,
       };
-      prevEventsIngested = eventsIngested;
-      prevTickTs = ts;
 
       const msg: AggregateAppendMsg = {
         type: 'aggregate-append',
@@ -238,6 +256,18 @@ export function startAggregate(
         ? (rawSamples as ReadonlyArray<number>)
         : [];
 
+      // Window-age clock for warmup correctness on rolling-rate
+      // displays. `firstEventTs` is the wall-clock of the first
+      // ingested event; the rolling 1m window covers
+      // `min(60, ts - firstEventTs)` seconds at this tick. Same
+      // value across hosts at the same `ts` (cluster-global), but
+      // emitted per row so historical chart pipelines stay self-
+      // describing without a cross-row join.
+      const windowAgeSec =
+        firstEventTs === null
+          ? 0
+          : Math.min(baselineWindowSec, (ts - firstEventTs) / 1000);
+
       const tick = assembleTick(
         ts,
         host,
@@ -253,6 +283,7 @@ export function startAggregate(
           requests_sum:
             typeof requests_sum === 'number' ? requests_sum : 0,
           requests_n: typeof requests_n === 'number' ? requests_n : 0,
+          window_age_seconds: windowAgeSec,
         },
         samples,
         thresholds,
@@ -271,6 +302,7 @@ export function startAggregate(
   return {
     stop: () => {
       offFused();
+      offGlobals();
       offBatch();
       offEvict();
       pendingByTs.clear();
@@ -327,6 +359,7 @@ function assembleTick(
     requests_avg: baseline.requests_avg,
     requests_sum: baseline.requests_sum,
     requests_n: baseline.requests_n,
+    window_age_seconds: baseline.window_age_seconds,
   };
 }
 
