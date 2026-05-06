@@ -21,10 +21,12 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 /**
- * Debug panel for the M3.5 aggregate stream. Renders the most recent
- * `HostTick` per host (one row per host, columns: cpu_avg, cpu_sd,
- * cpu_n, age) plus connection status, σ-threshold list, and the
- * fan-in counters.
+ * Experiment-stats / wire-meta panel — sits at the bottom of the
+ * dashboard so the rest of the page reads as "the gRPC firehose"
+ * with no apparent compression layer. The numbers here are the
+ * "magic trick" reveal: per-tick aggregator pressure, fan-in
+ * compression ratio, and a per-host probe of the most recent
+ * `HostTick` (one row per host: cpu_avg / cpu_sd / cpu_n / age).
  *
  * Hosts ordered per the canonical `HOSTS` declaration so palette
  * order matches the rest of the dashboard, with any unknown hosts
@@ -64,7 +66,7 @@ export function AggregateProbe({ aggregate }: Props) {
   return (
     <section className="metric-section aggregate-probe">
       <div className="section-header">
-        <h2>Aggregate stream</h2>
+        <h2>Experiment stats — /live-agg compression</h2>
         <div className="section-stats">
           <span
             className={`connection-indicator connection-indicator-${status}`}
@@ -81,10 +83,16 @@ export function AggregateProbe({ aggregate }: Props) {
           </span>
         </div>
       </div>
+      <p className="section-note">
+        The dashboard's headline above shows the producer's gRPC
+        firehose. Under the hood the wire ships ~5 frames/sec/host
+        carrying per-host tick aggregates instead of the raw events.
+        Numbers below quantify that down-sampling.
+      </p>
       <div className="aggregate-probe-counts">
         <span>
-          <strong>{counters.latestFrameEvents}</strong> raw events in latest
-          frame
+          <strong>{counters.latestFrameEvents.toLocaleString()}</strong> raw
+          events folded into latest frame
         </span>
         <span>
           <strong>{counters.totalEvents.toLocaleString()}</strong> raw /{' '}
@@ -92,13 +100,16 @@ export function AggregateProbe({ aggregate }: Props) {
           connect
         </span>
         <span>
-          fan-in:{' '}
+          compression:{' '}
           <strong>
             {counters.totalFrames === 0
               ? '—'
-              : (counters.totalEvents / counters.totalFrames).toFixed(1)}
+              : (counters.totalEvents / counters.totalFrames).toLocaleString(
+                  undefined,
+                  { maximumFractionDigits: 1 },
+                )}
           </strong>{' '}
-          raw/frame
+          raw events/frame
         </span>
       </div>
       {orderedHosts.length === 0 ? (

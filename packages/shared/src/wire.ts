@@ -63,6 +63,15 @@ export type AppendMsg = { type: 'append'; rows: ReadonlyArray<WireRow> };
  *   `cpu_n` and `requests_n` track each other since both come from
  *   the same source events; kept separate so a future producer that
  *   emits sparse-`requests` events doesn't desync the gating.
+ * - `window_age_seconds` — elapsed wall-clock seconds covered by
+ *   this row's rolling window, capped at the window length (60s for
+ *   the 1m baseline). During the aggregator's first 60s of operation
+ *   this is the actual data-window-so-far; once warm it pins to 60.
+ *   Lets the dashboard divide rolling sums (e.g. `requests_sum`) by
+ *   the *real* elapsed window rather than a hardcoded 60s, so
+ *   request-rate displays don't show a 60s diagonal warmup ramp on
+ *   a freshly-started aggregator. Same value across hosts at a
+ *   given tick — repeated per row for self-describing chart history.
  */
 export type HostTick = {
   ts: number;
@@ -76,6 +85,41 @@ export type HostTick = {
   requests_avg: number | null;
   requests_sum: number;
   requests_n: number;
+  window_age_seconds: number;
+};
+
+/**
+ * Per-tick **global** stats on the `/live-agg` stream — properties
+ * of the aggregator itself, not of any individual host. Step 6 of
+ * M3.5 surfaces these so the dashboard's headline numbers reflect
+ * the **gRPC firehose** (true ingest rate + cumulative event count
+ * since aggregator start), not the dashboard's down-scaled local
+ * view of `/live-agg`. The dashboard reader should believe they're
+ * looking at the raw stream; the aggregate-frame compression is an
+ * implementation detail surfaced separately as "experiment stats".
+ *
+ * Field semantics:
+ *
+ * - `events_ingested_total` — cumulative number of raw events the
+ *   aggregator has consumed off the producer's gRPC stream since
+ *   aggregator start. Monotonic; survives client reconnect.
+ * - `events_per_sec` — count of raw events seen in the trailing 1s
+ *   window at tick time. Computed by a non-partitioned pond rolling
+ *   sharing the same `Trigger.clock(seq)` as the per-host fused
+ *   rolling, so globals and host frames emit on the same boundaries.
+ * - `evicted_total` — cumulative number of events the LiveSeries
+ *   retention policy has evicted since aggregator start. Useful for
+ *   spotting "we're behind on backpressure" silently.
+ *
+ * One frame per tick (alongside the per-host rows). Optional on
+ * `AggregateAppendMsg` for forward-compat with pre-step-6 servers
+ * during deploys; once step 6 lands fully it's always present.
+ */
+export type GlobalsTick = {
+  ts: number;
+  events_ingested_total: number;
+  events_per_sec: number;
+  evicted_total: number;
 };
 
 /**
@@ -89,22 +133,30 @@ export type HostTick = {
  *   array — a connecting client fills the chart in as ticks arrive,
  *   trading first-paint coverage for protocol simplicity. Snapshot
  *   history lands when M4 measures whether the cost is real.
+ * - `globals` is a tail of the most recent globals ticks (history
+ *   parallel to `rows`). Step 6 ships either an empty array or the
+ *   single most-recent tick; full backfill arrives with snapshot
+ *   history (step 8). Optional for forward-compat.
  */
 export type AggregateSnapshotMsg = {
   type: 'aggregate-snapshot';
   thresholds: ReadonlyArray<number>;
   rows: ReadonlyArray<HostTick>;
+  globals?: ReadonlyArray<GlobalsTick>;
 };
 
 /**
  * Append frame for `/live-agg`. One per 200ms tick. `rows` carries
  * one `HostTick` per host that had any samples in the rolling 1m
  * window at tick time; silent hosts are omitted (client renders the
- * column as a gap until the host re-appears).
+ * column as a gap until the host re-appears). `globals` carries the
+ * tick's aggregator-wide counters (step 6+); a single object since
+ * append is per-tick. Optional during step-6 rollout.
  */
 export type AggregateAppendMsg = {
   type: 'aggregate-append';
   rows: ReadonlyArray<HostTick>;
+  globals?: GlobalsTick;
 };
 
 /**

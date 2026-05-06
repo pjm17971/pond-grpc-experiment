@@ -237,6 +237,71 @@ describe('startAggregate', () => {
       stop();
     }
   });
+
+  it('emits globals (events_ingested_total, events_per_sec, evicted_total) on every append frame', async () => {
+    // Step 6 — the per-tick globals tick rides on the same frame as
+    // the per-host rows. Confirms the manual counters increment as
+    // batches arrive and the per-tick rate computation reflects the
+    // ingest-side delta over the elapsed tick window.
+    const live = new LiveSeries({
+      name: 'metrics',
+      schema,
+      retention: { maxAge: '6m' },
+    });
+    const frames: string[] = [];
+    const { stop } = startAggregate(live, (f) => frames.push(f), {
+      tickMs: 50,
+    });
+    try {
+      const t0 = Date.now();
+      // Push events in stages across multiple tick boundaries so
+      // events_per_sec can compute a meaningful rate (events/sec
+      // requires at least two ticks of delta to be non-zero).
+      for (let stage = 0; stage < 4; stage++) {
+        for (let i = 0; i < 4; i++) {
+          live.push([
+            new Date(t0 + stage * 60 + i * 10),
+            0.5,
+            100,
+            'api-1',
+          ]);
+          live.push([
+            new Date(t0 + stage * 60 + i * 10),
+            0.6,
+            100,
+            'api-2',
+          ]);
+        }
+        await new Promise((res) => setTimeout(res, 60));
+      }
+
+      const appends = decodedFrames(frames);
+      expect(appends.length).toBeGreaterThan(0);
+      // Every emitted append carries globals.
+      for (const f of appends) {
+        expect(f.globals).toBeDefined();
+        expect(typeof f.globals!.events_ingested_total).toBe('number');
+        expect(typeof f.globals!.events_per_sec).toBe('number');
+        expect(typeof f.globals!.evicted_total).toBe('number');
+        expect(f.globals!.evicted_total).toBe(0);
+      }
+      // events_ingested_total is monotonically non-decreasing across
+      // frames (live.on('batch') accumulates; never resets).
+      const counts = appends.map((f) => f.globals!.events_ingested_total);
+      for (let i = 1; i < counts.length; i++) {
+        expect(counts[i]).toBeGreaterThanOrEqual(counts[i - 1]);
+      }
+      // 4 stages × 8 events/stage = 32 events total.
+      expect(counts.at(-1)!).toBeGreaterThanOrEqual(16);
+      // At least one frame should report a non-zero rate — the
+      // boundary that captures one of the staged batches will see
+      // an 8-event delta over a ~50 ms tick window.
+      const rates = appends.map((f) => f.globals!.events_per_sec);
+      expect(rates.some((r) => r > 0)).toBe(true);
+    } finally {
+      stop();
+    }
+  });
 });
 
 describe('assembleTick', () => {
@@ -246,10 +311,17 @@ describe('assembleTick', () => {
   // shape from one pond version to the next.
   const thresholds = [1, 1.5, 2, 2.5, 3] as const;
 
-  // Default request stats — most assembleTick tests exercise CPU
-  // anomaly counting and don't care about the requests pass-through;
-  // factor it out so the cpu-focused tests stay readable.
-  const noRequests = { requests_avg: null, requests_sum: 0, requests_n: 0 };
+  // Default request stats + window age — most assembleTick tests
+  // exercise CPU anomaly counting and don't care about the requests
+  // pass-through or the warmup-window value; factor them out so the
+  // cpu-focused tests stay readable. `window_age_seconds: 60`
+  // simulates a warm aggregator (rolling window full).
+  const noRequests = {
+    requests_avg: null,
+    requests_sum: 0,
+    requests_n: 0,
+    window_age_seconds: 60,
+  };
 
   it('returns zero-filled arrays when baseline stats are null', () => {
     const tick = assembleTick(
@@ -339,12 +411,13 @@ describe('assembleTick', () => {
     expect(tick.n_current).toBe(3);
   });
 
-  it('passes requests stats through unchanged (independent of anomaly math)', () => {
-    // assembleTick is purely a pass-through for requests stats —
-    // they're stored on the rolling-output event by pond's reducers
-    // and copied onto the wire row without further computation.
-    // Confirm the three fields land on the output regardless of
-    // baseline-cpu state.
+  it('passes requests stats + window_age through unchanged (independent of anomaly math)', () => {
+    // assembleTick is purely a pass-through for requests stats and
+    // window_age_seconds — they're stored on the rolling-output
+    // event by pond's reducers / computed by the caller and copied
+    // onto the wire row without further computation. Confirm the
+    // four fields land on the output regardless of baseline-cpu
+    // state.
     const tickWithBaseline = assembleTick(
       1_000,
       'api-1',
@@ -355,6 +428,7 @@ describe('assembleTick', () => {
         requests_avg: 102.5,
         requests_sum: 12_300,
         requests_n: 120,
+        window_age_seconds: 60,
       },
       [0.6],
       thresholds,
@@ -362,9 +436,12 @@ describe('assembleTick', () => {
     expect(tickWithBaseline.requests_avg).toBe(102.5);
     expect(tickWithBaseline.requests_sum).toBe(12_300);
     expect(tickWithBaseline.requests_n).toBe(120);
+    expect(tickWithBaseline.window_age_seconds).toBe(60);
 
     // And on a null-baseline tick (no cpu stats yet, but requests
     // can still be present — the two columns gate independently).
+    // Mid-warmup `window_age_seconds: 25` represents 25s of data
+    // accumulated, before the rolling window is full.
     const tickNullBaseline = assembleTick(
       1_000,
       'api-1',
@@ -375,6 +452,7 @@ describe('assembleTick', () => {
         requests_avg: 90,
         requests_sum: 900,
         requests_n: 10,
+        window_age_seconds: 25,
       },
       [],
       thresholds,
@@ -383,5 +461,6 @@ describe('assembleTick', () => {
     expect(tickNullBaseline.requests_avg).toBe(90);
     expect(tickNullBaseline.requests_sum).toBe(900);
     expect(tickNullBaseline.requests_n).toBe(10);
+    expect(tickNullBaseline.window_age_seconds).toBe(25);
   });
 });

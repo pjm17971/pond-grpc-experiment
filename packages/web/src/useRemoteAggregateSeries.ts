@@ -8,6 +8,7 @@ import {
   decode,
   type AggregateSchema,
   type AggregateWireMsg,
+  type GlobalsTick,
   type HostTick,
 } from '@pond-experiment/shared';
 import type { ConnectionStatus } from './useRemoteLiveSeries';
@@ -19,9 +20,9 @@ type AggregateRow = JsonRowForSchema<AggregateSchema>;
  * `WIRE.md` contract) into the tuple form `pond-ts.LiveSeries.pushJson`
  * accepts. Tuple order matches `aggregateSchema`'s column order:
  * `[time, host, cpu_avg, cpu_sd, cpu_n, n_current, anomalies_above,
- * anomalies_below, requests_avg, requests_sum, requests_n]`. Stays
- * close to the rest of the experiment's "convert at the boundary"
- * pattern.
+ * anomalies_below, requests_avg, requests_sum, requests_n,
+ * window_age_seconds]`. Stays close to the rest of the experiment's
+ * "convert at the boundary" pattern.
  */
 export function tickToRow(tick: HostTick): AggregateRow {
   return [
@@ -36,6 +37,7 @@ export function tickToRow(tick: HostTick): AggregateRow {
     tick.requests_avg,
     tick.requests_sum,
     tick.requests_n,
+    tick.window_age_seconds,
   ];
 }
 
@@ -113,6 +115,18 @@ export type RemoteAggregateState = {
   thresholds: ReadonlyArray<number>;
   status: ConnectionStatus;
   counters: AggregateCounters;
+  /**
+   * Most recent `GlobalsTick` from the wire (step 6+). `null` before
+   * the first frame carrying globals arrives. Drives the dashboard's
+   * headline numbers (Total events, Event rate, Evicted) — sourced
+   * from the aggregator's gRPC-side counters rather than the
+   * dashboard's own `LiveSeries.length`, so they reflect the true
+   * firehose throughput regardless of the wire's tick-frame
+   * compression. Pre-step-6 servers don't ship `globals`; the
+   * dashboard should fall back to a "—" / "—/s" display in that
+   * case rather than misreporting.
+   */
+  latestGlobals: GlobalsTick | null;
 };
 
 const ZERO_COUNTERS: AggregateCounters = {
@@ -161,11 +175,14 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
   const [thresholds, setThresholds] = useState<ReadonlyArray<number>>([]);
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [counters, setCounters] = useState<AggregateCounters>(ZERO_COUNTERS);
+  const [latestGlobals, setLatestGlobals] = useState<GlobalsTick | null>(null);
 
   useEffect(() => {
     // Reset compression-ratio counters when the URL changes (treated
     // as a fresh subscription). Reconnect to the same URL preserves
-    // the running totals — see `AggregateCounters` doc.
+    // the running totals — see `AggregateCounters` doc. Globals
+    // come from the wire on every frame so we don't reset them
+    // explicitly — the next aggregate-append will overwrite.
     setCounters(ZERO_COUNTERS);
     let cancelled = false;
     let ws: WebSocket | null = null;
@@ -195,6 +212,13 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
         }
         if (msg.type === 'aggregate-snapshot') {
           setThresholds(msg.thresholds);
+          // Snapshot may carry a tail of recent globals ticks (step
+          // 8 backfill territory; step 6 ships either an empty
+          // array or just the latest tick). Take the last entry as
+          // the current globals; per-tick appends replace it below.
+          if (msg.globals && msg.globals.length > 0) {
+            setLatestGlobals(msg.globals[msg.globals.length - 1]);
+          }
         }
         // Push every row into the mounted LiveSeries so windowed
         // queries (`useWindow`, `partitionBy`) work over the wire.
@@ -218,6 +242,9 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
             totalFrames: prev.totalFrames + 1,
             totalEvents: prev.totalEvents + frameEvents,
           }));
+          if (msg.globals) {
+            setLatestGlobals(msg.globals);
+          }
         }
       };
       ws.onclose = () => {
@@ -239,5 +266,12 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
     };
   }, [url]);
 
-  return { liveSeries, latestPerHost, thresholds, status, counters };
+  return {
+    liveSeries,
+    latestPerHost,
+    thresholds,
+    status,
+    counters,
+    latestGlobals,
+  };
 }

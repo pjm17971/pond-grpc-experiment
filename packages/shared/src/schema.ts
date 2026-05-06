@@ -56,6 +56,15 @@ export const baselineSchema = [
  * `requests_n`) sourced from the same 1m baseline window as the CPU
  * stats. No band/anomaly arrays for requests — the dashboard
  * renders requests as a smoothed line, not a band.
+ *
+ * Step 6 adds `window_age_seconds` — elapsed wall-clock seconds
+ * the rolling 1m window covers at this row's tick. Lets the
+ * dashboard divide rolling sums by the actual data-window length
+ * rather than a hardcoded 60s, so freshly-started aggregators
+ * don't show a 60s diagonal warmup ramp on rate displays. Caps at
+ * 60 once the window is full. Same value across hosts at a tick;
+ * repeated per row to keep the chart's historical pipeline self-
+ * describing.
  */
 export const aggregateSchema = [
   { name: 'time', kind: 'time' },
@@ -69,6 +78,7 @@ export const aggregateSchema = [
   { name: 'requests_avg', kind: 'number', required: false },
   { name: 'requests_sum', kind: 'number' },
   { name: 'requests_n', kind: 'number' },
+  { name: 'window_age_seconds', kind: 'number' },
 ] as const satisfies SeriesSchema;
 
 export type AggregateSchema = typeof aggregateSchema;

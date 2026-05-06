@@ -9,6 +9,7 @@ import {
 import {
   DEFAULT_AGGREGATE_THRESHOLDS,
   type AggregateAppendMsg,
+  type GlobalsTick,
   type HostTick,
   type Schema,
   encode,
@@ -78,6 +79,7 @@ type BaselineParts = {
   requests_avg: number | null;
   requests_sum: number;
   requests_n: number;
+  window_age_seconds: number;
 };
 
 export function startAggregate(
@@ -121,11 +123,72 @@ export function startAggregate(
       { trigger },
     );
 
+  // Step 6 — globals: aggregator-wide stats emitted on the same
+  // tick clock as the per-host fused rolling. `events_per_sec`
+  // comes from a **non-partitioned fused rolling** clocked off the
+  // same `Trigger.clock(seq)`; cumulative counters
+  // (`events_ingested_total`, `evicted_total`, `firstEventTs` for
+  // window-age) come from `live.on('batch'/'evict')` callbacks.
+  //
+  // **Note on the 0.15.0 → 0.15.2 evolution.** The first commit on
+  // this branch tried `live.rolling({'1s': {events_per_sec:
+  // 'count'}}, {trigger})` — the natural API — and saw throughput
+  // collapse from 88k/s to 21k/s at the 87k/s bench point. Cause:
+  // every raw event flowed through the non-partitioned rolling's
+  // per-event ingest pipeline serially, plus an `Array.shift()` on
+  // every eviction at the rolling's deque (O(N) per ingest at
+  // firehose deque sizes). pond-ts 0.15.2 fixed the eviction loop
+  // (head-index + amortised batched compaction; see CHANGELOG)
+  // citing this PR's friction note directly. Re-enabled the
+  // natural shape here.
+  let eventsIngested = 0;
+  let eventsEvicted = 0;
+  // `firstEventTs` — wall-clock of the first event the aggregator
+  // ever sees. Used to compute `window_age_seconds` per emitted
+  // tick. Once the rolling window has been full for >=60s, age
+  // pins to 60; before then it's the actual elapsed-since-start.
+  let firstEventTs: number | null = null;
+  const offBatch = live.on('batch', (events) => {
+    eventsIngested += events.length;
+    if (firstEventTs === null && events.length > 0) {
+      firstEventTs = events[0].key().timestampMs();
+    }
+  });
+  const offEvict = live.on('evict', (events) => {
+    eventsEvicted += events.length;
+  });
+
+  /** 1m baseline window length in seconds (matches the fused mapping above). */
+  const baselineWindowSec = 60;
+
+  // Non-partitioned fused rolling for `events_per_sec`. Emits one
+  // event per trigger boundary (5 fps at the default tickMs) with
+  // the count of source events in the trailing 1s window. We snap
+  // its output into `latestEventsPerSec` to attach to whatever
+  // tick frame the per-host fused rolling drives next.
+  const globalsStream: LiveSource<SeriesSchema> = live.rolling(
+    {
+      '1s': { events_per_sec: { from: 'cpu', using: 'count' } },
+    },
+    { trigger },
+  );
+  let latestEventsPerSec = 0;
+  const offGlobals = globalsStream.on(
+    'event',
+    (e: EventForSchema<SeriesSchema>) => {
+      const eps = e.get('events_per_sec');
+      if (typeof eps === 'number') latestEventsPerSec = eps;
+    },
+  );
+
   // Per-`ts` row collation — pond fires one event per partition per
   // tick boundary; the wire ships one frame per tick across all
   // partitions. The microtask drain accumulates the per-partition
   // events for a given `ts` into a single `aggregate-append` frame
-  // and emits it in monotonic order.
+  // and emits it in monotonic order. Globals are computed at emit
+  // time from the running counters (no separate buffer; see the
+  // comment block above on why we don't run a parallel pond
+  // pipeline for the rate).
   const pendingByTs = new Map<number, HostTick[]>();
   let lastEmittedTs = -1;
   let scheduled = false;
@@ -149,7 +212,24 @@ export function startAggregate(
       const rows = pendingByTs.get(ts);
       if (!rows || rows.length === 0) continue;
       lastEmittedTs = ts;
-      const msg: AggregateAppendMsg = { type: 'aggregate-append', rows };
+
+      // Globals — events_per_sec comes from the non-partitioned
+      // 1s rolling above; cumulative counters from manual batch /
+      // evict listeners. The rolling fires on every trigger
+      // boundary, so `latestEventsPerSec` is at most one tick
+      // (200ms) stale relative to this `ts`.
+      const globals: GlobalsTick = {
+        ts,
+        events_ingested_total: eventsIngested,
+        events_per_sec: Math.round(latestEventsPerSec),
+        evicted_total: eventsEvicted,
+      };
+
+      const msg: AggregateAppendMsg = {
+        type: 'aggregate-append',
+        rows,
+        globals,
+      };
       broadcast(encode(msg));
       pendingByTs.delete(ts);
     }
@@ -176,6 +256,18 @@ export function startAggregate(
         ? (rawSamples as ReadonlyArray<number>)
         : [];
 
+      // Window-age clock for warmup correctness on rolling-rate
+      // displays. `firstEventTs` is the wall-clock of the first
+      // ingested event; the rolling 1m window covers
+      // `min(60, ts - firstEventTs)` seconds at this tick. Same
+      // value across hosts at the same `ts` (cluster-global), but
+      // emitted per row so historical chart pipelines stay self-
+      // describing without a cross-row join.
+      const windowAgeSec =
+        firstEventTs === null
+          ? 0
+          : Math.min(baselineWindowSec, (ts - firstEventTs) / 1000);
+
       const tick = assembleTick(
         ts,
         host,
@@ -191,6 +283,7 @@ export function startAggregate(
           requests_sum:
             typeof requests_sum === 'number' ? requests_sum : 0,
           requests_n: typeof requests_n === 'number' ? requests_n : 0,
+          window_age_seconds: windowAgeSec,
         },
         samples,
         thresholds,
@@ -209,6 +302,9 @@ export function startAggregate(
   return {
     stop: () => {
       offFused();
+      offGlobals();
+      offBatch();
+      offEvict();
       pendingByTs.clear();
     },
   };
@@ -263,6 +359,7 @@ function assembleTick(
     requests_avg: baseline.requests_avg,
     requests_sum: baseline.requests_sum,
     requests_n: baseline.requests_n,
+    window_age_seconds: baseline.window_age_seconds,
   };
 }
 
