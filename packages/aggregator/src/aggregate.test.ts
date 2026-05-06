@@ -318,6 +318,124 @@ describe('startAggregate', () => {
       stop();
     }
   });
+
+  it('retains snapshot history (rows + globals) within historyMaxAgeMs', async () => {
+    // Step 8 — `getSnapshotHistory()` returns the recent tail of
+    // emitted ticks for the WS-on-connect frame. Drive a few tick
+    // boundaries with both hosts contributing, then assert the
+    // history contains rows for every emitted (ts, host) pair plus
+    // a globals tick per emit.
+    const live = new LiveSeries({
+      name: 'metrics',
+      schema,
+      retention: { maxAge: '6m' },
+    });
+    const frames: string[] = [];
+    const { stop, getSnapshotHistory } = startAggregate(
+      live,
+      (f) => frames.push(f),
+      { tickMs: 50, historyMaxAgeMs: 5_000 },
+    );
+    try {
+      const t0 = Date.now();
+      for (let stage = 0; stage < 4; stage++) {
+        for (let i = 0; i < 4; i++) {
+          live.push([new Date(t0 + stage * 60 + i * 10), 0.5, 100, 'api-1']);
+          live.push([new Date(t0 + stage * 60 + i * 10), 0.6, 100, 'api-2']);
+        }
+        await new Promise((res) => setTimeout(res, 60));
+      }
+
+      const appends = decodedFrames(frames);
+      expect(appends.length).toBeGreaterThan(0);
+
+      const history = getSnapshotHistory();
+      // Globals: one per emitted append frame.
+      expect(history.globals.length).toBe(appends.length);
+      // Rows: sum of `rows.length` across every append. Both hosts
+      // emit on every boundary once warm, so it's roughly
+      // 2 × frames.length.
+      const expectedRowsTotal = appends.reduce(
+        (acc, f) => acc + f.rows.length,
+        0,
+      );
+      expect(history.rows.length).toBe(expectedRowsTotal);
+      // Both arrays sorted by ts (per-emit append preserves the
+      // monotonic emit order; rows within a frame share a `ts`).
+      for (let i = 1; i < history.rows.length; i++) {
+        expect(history.rows[i].ts).toBeGreaterThanOrEqual(
+          history.rows[i - 1].ts,
+        );
+      }
+      for (let i = 1; i < history.globals.length; i++) {
+        expect(history.globals[i].ts).toBeGreaterThan(
+          history.globals[i - 1].ts,
+        );
+      }
+    } finally {
+      stop();
+    }
+  });
+
+  it('evicts history older than historyMaxAgeMs (amortised eviction)', async () => {
+    // 200ms tickMs + 300ms history window → at most ~2 frames'
+    // worth retained. After 1 second of emits, history should hold
+    // only the most recent 1–2 frames.
+    const live = new LiveSeries({
+      name: 'metrics',
+      schema,
+      retention: { maxAge: '6m' },
+    });
+    const { stop, getSnapshotHistory } = startAggregate(live, () => {}, {
+      tickMs: 100,
+      historyMaxAgeMs: 250,
+    });
+    try {
+      const t0 = Date.now();
+      for (let i = 0; i < 20; i++) {
+        live.push([new Date(t0 + i * 50), 0.5, 100, 'api-1']);
+      }
+      await new Promise((res) => setTimeout(res, 1_000));
+
+      const history = getSnapshotHistory();
+      // Only ticks within the last 250ms are retained.
+      const newestTs = history.globals[history.globals.length - 1]?.ts;
+      expect(newestTs).toBeDefined();
+      for (const r of history.rows) {
+        expect(r.ts).toBeGreaterThanOrEqual(newestTs! - 250);
+      }
+      for (const g of history.globals) {
+        expect(g.ts).toBeGreaterThanOrEqual(newestTs! - 250);
+      }
+    } finally {
+      stop();
+    }
+  });
+
+  it('historyMaxAgeMs: 0 disables snapshot history (snapshot ships empty)', async () => {
+    const live = new LiveSeries({
+      name: 'metrics',
+      schema,
+      retention: { maxAge: '6m' },
+    });
+    const { stop, getSnapshotHistory } = startAggregate(live, () => {}, {
+      tickMs: 50,
+      historyMaxAgeMs: 0,
+    });
+    try {
+      const t0 = Date.now();
+      for (let i = 0; i < 6; i++) {
+        live.push([new Date(t0 + i * 30), 0.5, 100, 'api-1']);
+      }
+      await new Promise((res) => setTimeout(res, 200));
+
+      const history = getSnapshotHistory();
+      expect(history.rows).toEqual([]);
+      expect(history.globals).toEqual([]);
+    } finally {
+      stop();
+    }
+  });
 });
 
 describe('assembleTick', () => {
