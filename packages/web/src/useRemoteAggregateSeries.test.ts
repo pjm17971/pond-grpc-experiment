@@ -26,6 +26,13 @@ const mkTick = (
   n_current: cpu_n > 0 ? Math.min(cpu_n, 5) : 0,
   anomalies_above: [0, 0, 0, 0, 0],
   anomalies_below: [0, 0, 0, 0, 0],
+  // Step 5 — requests stats. Default to derived plausible values
+  // for tests that don't specifically exercise the requests
+  // pass-through (avg=100 matches the producer's constant); tests
+  // can override per-row when they care.
+  requests_avg: cpu_n > 0 ? 100 : null,
+  requests_sum: cpu_n * 100,
+  requests_n: cpu_n,
 });
 
 describe('applyAggregateFrame', () => {
@@ -138,6 +145,9 @@ describe('tickToRow', () => {
       n_current: 4,
       anomalies_above: [3, 1, 0, 0, 0],
       anomalies_below: [2, 0, 0, 0, 0],
+      requests_avg: 102.5,
+      requests_sum: 102_500,
+      requests_n: 1000,
     });
     expect(row).toEqual([
       1_700_000_000_000,
@@ -148,10 +158,13 @@ describe('tickToRow', () => {
       4,
       [3, 1, 0, 0, 0],
       [2, 0, 0, 0, 0],
+      102.5,
+      102_500,
+      1000,
     ]);
   });
 
-  it('preserves nullable cpu_avg / cpu_sd', () => {
+  it('preserves nullable cpu_avg / cpu_sd / requests_avg', () => {
     const row = tickToRow({
       ts: 1_700_000_000_000,
       host: 'api-1',
@@ -161,6 +174,9 @@ describe('tickToRow', () => {
       n_current: 0,
       anomalies_above: [],
       anomalies_below: [],
+      requests_avg: null,
+      requests_sum: 0,
+      requests_n: 0,
     });
     expect(row).toEqual([
       1_700_000_000_000,
@@ -171,6 +187,9 @@ describe('tickToRow', () => {
       0,
       [],
       [],
+      null,
+      0,
+      0,
     ]);
   });
 
@@ -194,6 +213,9 @@ describe('tickToRow', () => {
         n_current: 5,
         anomalies_above: [4, 1, 0, 0, 0],
         anomalies_below: [0, 0, 0, 0, 0],
+        requests_avg: 100,
+        requests_sum: 5_000,
+        requests_n: 50,
       },
       {
         ts: 1_700_000_000_200,
@@ -204,6 +226,9 @@ describe('tickToRow', () => {
         n_current: 0,
         anomalies_above: [0, 0, 0, 0, 0],
         anomalies_below: [0, 0, 0, 0, 0],
+        requests_avg: null,
+        requests_sum: 0,
+        requests_n: 0,
       },
       {
         ts: 1_700_000_000_400,
@@ -214,17 +239,54 @@ describe('tickToRow', () => {
         n_current: 6,
         anomalies_above: [3, 0, 0, 0, 0],
         anomalies_below: [0, 0, 0, 0, 0],
+        requests_avg: 105,
+        requests_sum: 6_300,
+        requests_n: 60,
       },
     ];
     expect(() => live.pushJson(ticks.map(tickToRow))).not.toThrow();
     expect(live.length).toBe(3);
     const events = [live.at(0)!, live.at(1)!, live.at(2)!];
+
+    // Spot-checks on the first/middle/last events.
     expect(events[0].get('cpu_avg')).toBeCloseTo(0.5, 6);
     expect(events[0].get('n_current')).toBe(5);
     expect(events[0].get('anomalies_above')).toEqual([4, 1, 0, 0, 0]);
     expect(events[1].get('cpu_avg')).toBeUndefined();
     expect(events[1].get('cpu_n')).toBe(0);
     expect(events[2].get('cpu_avg')).toBeCloseTo(0.6, 6);
+
+    // Every column round-trips with a non-default value. Cheap
+    // insurance against schema/converter drift as columns accumulate
+    // step-by-step — `tickToRow` is positional, so a missing slot or
+    // a misaligned tuple sends wrong data without any type error.
+    // (Spotted in PR #25 review: two 11-column tuples in lockstep,
+    // easy to drift; assert across the whole shape so any future
+    // mismatch fails loudly.)
+    const first = events[0];
+    const last = events[2];
+    expect(first.get('host')).toBe('api-1');
+    expect(first.get('cpu_sd')).toBeCloseTo(0.08, 6);
+    expect(first.get('cpu_n')).toBe(50);
+    expect(first.get('anomalies_below')).toEqual([0, 0, 0, 0, 0]);
+    expect(first.get('requests_avg')).toBe(100);
+    expect(first.get('requests_sum')).toBe(5_000);
+    expect(first.get('requests_n')).toBe(50);
+    expect(last.get('cpu_sd')).toBeCloseTo(0.09, 6);
+    expect(last.get('cpu_n')).toBe(60);
+    expect(last.get('n_current')).toBe(6);
+    expect(last.get('anomalies_above')).toEqual([3, 0, 0, 0, 0]);
+    expect(last.get('requests_avg')).toBe(105);
+    expect(last.get('requests_sum')).toBe(6_300);
+    expect(last.get('requests_n')).toBe(60);
+
+    // The middle-row null cells: confirm undefined (not 0/NaN) for
+    // nullable columns when the wire shipped null, and 0 for
+    // sum-of-empty.
+    expect(events[1].get('cpu_sd')).toBeUndefined();
+    expect(events[1].get('requests_avg')).toBeUndefined();
+    expect(events[1].get('requests_sum')).toBe(0);
+    expect(events[1].get('requests_n')).toBe(0);
   });
 });
 

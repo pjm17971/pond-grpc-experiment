@@ -35,13 +35,15 @@ export const baselineSchema = [
  * over the aggregate stream the same way it runs them over the raw
  * `/live` stream.
  *
- * `cpu_avg`/`cpu_sd` are nullable: the aggregator coerces undefined
- * reducer outputs to `null` defensively. Behaviour for empty
- * rolling windows depends on pond's silent-partition policy.
+ * `cpu_avg`/`cpu_sd`/`requests_avg` are nullable: the aggregator
+ * coerces undefined reducer outputs to `null` defensively.
+ * Behaviour for empty rolling windows depends on pond's silent-
+ * partition policy.
  *
- * `cpu_n` (baseline bucket count, gates render-readiness) and
- * `n_current` (count over the most recent 200ms slice) are always
- * numbers, even zero.
+ * `cpu_n` / `requests_n` (baseline bucket counts, gate render-
+ * readiness) and `n_current` (count over the most recent 200ms
+ * slice) are always numbers, even zero. `requests_sum` likewise —
+ * sum over the 1m baseline; defaults to 0 for an empty bucket.
  *
  * `anomalies_above` / `anomalies_below` (added in step 4) are
  * array-kind columns. Each row carries an array indexed by the
@@ -49,6 +51,11 @@ export const baselineSchema = [
  * raw samples in the current slice whose value exceeds
  * `cpu_avg + thresholds[i] * cpu_sd`. The dashboard interpolates
  * linearly between buckets for arbitrary σ slider values.
+ *
+ * Step 5 adds the requests stats (`requests_avg`, `requests_sum`,
+ * `requests_n`) sourced from the same 1m baseline window as the CPU
+ * stats. No band/anomaly arrays for requests — the dashboard
+ * renders requests as a smoothed line, not a band.
  */
 export const aggregateSchema = [
   { name: 'time', kind: 'time' },
@@ -59,6 +66,9 @@ export const aggregateSchema = [
   { name: 'n_current', kind: 'number' },
   { name: 'anomalies_above', kind: 'array' },
   { name: 'anomalies_below', kind: 'array' },
+  { name: 'requests_avg', kind: 'number', required: false },
+  { name: 'requests_sum', kind: 'number' },
+  { name: 'requests_n', kind: 'number' },
 ] as const satisfies SeriesSchema;
 
 export type AggregateSchema = typeof aggregateSchema;

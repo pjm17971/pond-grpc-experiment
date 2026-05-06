@@ -15,42 +15,50 @@ import {
 } from '@pond-experiment/shared';
 
 /**
- * Server-side aggregate-stream emitter, M3.5 step 4 / V8 shape.
+ * Server-side aggregate-stream emitter.
  *
  * Builds the per-host tick aggregates the `/live-agg` wire ships
- * (`{ ts, host, cpu_avg, cpu_sd, cpu_n, n_current, anomalies_above[],
- * anomalies_below[] }`) by composing **one fused multi-window
- * partitioned rolling** clocked off `Trigger.clock(seq)`:
+ * (`HostTick`: `cpu_avg`/`cpu_sd`/`cpu_n`, `n_current`, anomaly
+ * arrays, `requests_avg`/`requests_sum`/`requests_n`) by composing
+ * **one fused multi-window partitioned rolling** (pond 0.15.0+)
+ * clocked off `Trigger.clock(seq)`:
  *
  *   live.partitionBy('host').rolling(
  *     {
- *       '1m':         { cpu_avg: 'avg', cpu_sd: 'stdev', cpu_n: 'count' },
+ *       '1m': {
+ *         cpu_avg: 'avg', cpu_sd: 'stdev', cpu_n: 'count',
+ *         requests_avg: 'avg', requests_sum: 'sum', requests_n: 'count',
+ *       },
  *       `${tickMs}ms`: { cpu_samples: 'samples' },
  *     },
  *     { trigger },
  *   );
  *
- * One per-event ingest pass updates both windows' reducer state in
- * the same partition object; one boundary check fires; one
- * synchronised burst emits a single merged event per partition per
- * tick. Every column the consumer cares about is on that one event.
+ * One per-event ingest pass updates every reducer's state in the
+ * same partition object; one boundary check fires; one synchronised
+ * burst emits a single merged event per partition per tick. Every
+ * column the consumer cares about is on that one event.
  *
  * History:
  * - V6 (#16) — manual per-host deque off `live.on('batch', cb)` for
  *   the leading-edge slice; one pond rolling for baseline.
  * - V7 (#18) — pond 0.14.2 `samples()` reducer, two parallel
- *   rollings sharing one trigger. Cleaner shape; ~19% throughput
- *   regression at ceiling because every event flowed through two
- *   ingest pipelines (see PR #19's profile diff).
- * - V8 (this) — pond 0.15.0 fused rolling delivers the API proposed
- *   in PR #20 (RFC). Two windows, one rolling, one ingest pass.
+ *   rollings sharing one trigger. ~19% throughput regression at
+ *   ceiling because every event flowed through two ingest pipelines
+ *   (see PR #19's profile diff).
+ * - V8 (#22) — pond 0.15.0 fused rolling. Two windows, one rolling,
+ *   one ingest pass; recovers V6's per-event cost.
+ * - Step 5 (this) — extends the 1m baseline with the requests stats;
+ *   no shape change, just three more reducers in the same window.
+ *   The fused-rolling primitive composes for additional source
+ *   columns at near-zero per-event cost (the per-event ingest pass
+ *   visits the same partition once and updates each reducer's
+ *   running state in a tight loop).
  *
  * The pendingByTs collation below stays — pond emits one event per
  * partition per tick, and the wire ships one frame per tick across
- * all partitions. The collation just merges the per-partition
- * bursts into a single `aggregate-append`. The V7 per-`(ts, host)`
- * parts buffer (waiting for the second rolling's event to arrive)
- * is gone — fused emits one event with both halves at once.
+ * all partitions. The collation merges the per-partition bursts
+ * into a single `aggregate-append`.
  */
 export type AggregateOptions = {
   /** Tick cadence in milliseconds. Default 200, matches `WIRE.md`. */
@@ -67,6 +75,9 @@ type BaselineParts = {
   cpu_avg: number | null;
   cpu_sd: number | null;
   cpu_n: number;
+  requests_avg: number | null;
+  requests_sum: number;
+  requests_n: number;
 };
 
 export function startAggregate(
@@ -99,6 +110,9 @@ export function startAggregate(
           cpu_avg: { from: 'cpu', using: 'avg' },
           cpu_sd: { from: 'cpu', using: 'stdev' },
           cpu_n: { from: 'cpu', using: 'count' },
+          requests_avg: { from: 'requests', using: 'avg' },
+          requests_sum: { from: 'requests', using: 'sum' },
+          requests_n: { from: 'requests', using: 'count' },
         },
         [`${tickMs}ms`]: {
           cpu_samples: { from: 'cpu', using: 'samples' },
@@ -151,6 +165,9 @@ export function startAggregate(
       const cpu_avg = e.get('cpu_avg');
       const cpu_sd = e.get('cpu_sd');
       const cpu_n = e.get('cpu_n');
+      const requests_avg = e.get('requests_avg');
+      const requests_sum = e.get('requests_sum');
+      const requests_n = e.get('requests_n');
       // `samples` reducer returns `ReadonlyArray<number> | undefined`
       // (undefined when the window is gated or empty). Normalise to
       // an empty array so anomaly counting sees a regular shape.
@@ -166,6 +183,14 @@ export function startAggregate(
           cpu_avg: typeof cpu_avg === 'number' ? cpu_avg : null,
           cpu_sd: typeof cpu_sd === 'number' ? cpu_sd : null,
           cpu_n: typeof cpu_n === 'number' ? cpu_n : 0,
+          requests_avg:
+            typeof requests_avg === 'number' ? requests_avg : null,
+          // `sum` of an empty bucket is 0, not undefined — defensive
+          // coerce keeps the wire shape regular if pond ever changes
+          // its empty-bucket policy.
+          requests_sum:
+            typeof requests_sum === 'number' ? requests_sum : 0,
+          requests_n: typeof requests_n === 'number' ? requests_n : 0,
         },
         samples,
         thresholds,
@@ -235,6 +260,9 @@ function assembleTick(
     n_current,
     anomalies_above: above,
     anomalies_below: below,
+    requests_avg: baseline.requests_avg,
+    requests_sum: baseline.requests_sum,
+    requests_n: baseline.requests_n,
   };
 }
 

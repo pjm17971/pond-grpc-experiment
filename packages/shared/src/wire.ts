@@ -28,12 +28,13 @@ export type AppendMsg = { type: 'append'; rows: ReadonlyArray<WireRow> };
 
 /**
  * Per-host, per-tick aggregate row on the `/live-agg` stream. The
- * aggregator joins two synchronised pond rollings — a long baseline
- * window (1m, for `cpu_avg`/`cpu_sd`/`cpu_n`) and a short leading-
- * edge window (200ms, for `n_current` and the anomaly arrays) — and
- * emits one `HostTick` per host per tick on the same `ts`. See
- * `WIRE.md` at the repo root for the design and the dashboard side's
- * rendering contract.
+ * aggregator runs one fused multi-window partitioned rolling (pond
+ * 0.15.0+) — a 1m baseline window producing `cpu_avg`/`cpu_sd`/
+ * `cpu_n` and `requests_avg`/`requests_sum`/`requests_n`, and a
+ * 200ms leading-edge slice producing `n_current` and the anomaly
+ * arrays — and emits one `HostTick` per host per tick on the same
+ * `ts`. See `WIRE.md` at the repo root for the design and the
+ * dashboard side's rendering contract.
  *
  * Field semantics:
  *
@@ -52,6 +53,16 @@ export type AppendMsg = { type: 'append'; rows: ReadonlyArray<WireRow> };
  *   value. Empty `[]` when `cpu_avg`/`cpu_sd` are null (gating
  *   condition for anomaly counting).
  * - `anomalies_below[i]` — same idea, below the band.
+ * - `requests_avg` — over the 1m baseline window. Nullable for the
+ *   same reason as `cpu_avg`.
+ * - `requests_sum` — sum of `requests` over the 1m baseline window.
+ *   Total request volume the host fielded in the rolling minute.
+ *   Defaults to 0 for an empty bucket (not null — sum-of-empty is 0).
+ * - `requests_n` — sample count in the 1m baseline window. Same
+ *   semantics as `cpu_n` but for the `requests` column. In practice
+ *   `cpu_n` and `requests_n` track each other since both come from
+ *   the same source events; kept separate so a future producer that
+ *   emits sparse-`requests` events doesn't desync the gating.
  */
 export type HostTick = {
   ts: number;
@@ -62,6 +73,9 @@ export type HostTick = {
   n_current: number;
   anomalies_above: ReadonlyArray<number>;
   anomalies_below: ReadonlyArray<number>;
+  requests_avg: number | null;
+  requests_sum: number;
+  requests_n: number;
 };
 
 /**

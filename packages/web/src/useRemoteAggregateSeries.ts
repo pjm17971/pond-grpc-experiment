@@ -19,8 +19,9 @@ type AggregateRow = JsonRowForSchema<AggregateSchema>;
  * `WIRE.md` contract) into the tuple form `pond-ts.LiveSeries.pushJson`
  * accepts. Tuple order matches `aggregateSchema`'s column order:
  * `[time, host, cpu_avg, cpu_sd, cpu_n, n_current, anomalies_above,
- * anomalies_below]`. Stays close to the rest of the experiment's
- * "convert at the boundary" pattern.
+ * anomalies_below, requests_avg, requests_sum, requests_n]`. Stays
+ * close to the rest of the experiment's "convert at the boundary"
+ * pattern.
  */
 export function tickToRow(tick: HostTick): AggregateRow {
   return [
@@ -32,6 +33,9 @@ export function tickToRow(tick: HostTick): AggregateRow {
     tick.n_current,
     tick.anomalies_above,
     tick.anomalies_below,
+    tick.requests_avg,
+    tick.requests_sum,
+    tick.requests_n,
   ];
 }
 

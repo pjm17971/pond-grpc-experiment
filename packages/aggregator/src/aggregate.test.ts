@@ -68,6 +68,12 @@ describe('startAggregate', () => {
             true,
           );
           expect(r.cpu_sd === null || typeof r.cpu_sd === 'number').toBe(true);
+          // Step 5 — requests stats present on every row.
+          expect(typeof r.requests_n).toBe('number');
+          expect(typeof r.requests_sum).toBe('number');
+          expect(
+            r.requests_avg === null || typeof r.requests_avg === 'number',
+          ).toBe(true);
         }
       }
     } finally {
@@ -178,6 +184,12 @@ describe('startAggregate', () => {
       // enough samples?" The trigger only controls *when* the
       // bucket reports, not what's in it.
       expect(apiOne!.cpu_n).toBeGreaterThanOrEqual(5);
+      // Step 5 — requests stats are sourced from the same 1m
+      // baseline window, so all 10 events land in the bucket.
+      // requests=100 constant → avg 100, sum 1000, n same as cpu_n.
+      expect(apiOne!.requests_avg).toBeCloseTo(100, 5);
+      expect(apiOne!.requests_sum).toBe(apiOne!.cpu_n * 100);
+      expect(apiOne!.requests_n).toBe(apiOne!.cpu_n);
     } finally {
       stop();
     }
@@ -234,11 +246,16 @@ describe('assembleTick', () => {
   // shape from one pond version to the next.
   const thresholds = [1, 1.5, 2, 2.5, 3] as const;
 
+  // Default request stats — most assembleTick tests exercise CPU
+  // anomaly counting and don't care about the requests pass-through;
+  // factor it out so the cpu-focused tests stay readable.
+  const noRequests = { requests_avg: null, requests_sum: 0, requests_n: 0 };
+
   it('returns zero-filled arrays when baseline stats are null', () => {
     const tick = assembleTick(
       1_000,
       'api-1',
-      { cpu_avg: null, cpu_sd: null, cpu_n: 0 },
+      { cpu_avg: null, cpu_sd: null, cpu_n: 0, ...noRequests },
       [0.5, 0.6],
       thresholds,
     );
@@ -251,7 +268,7 @@ describe('assembleTick', () => {
     const tick = assembleTick(
       1_000,
       'api-1',
-      { cpu_avg: 0.5, cpu_sd: 0.1, cpu_n: 100 },
+      { cpu_avg: 0.5, cpu_sd: 0.1, cpu_n: 100, ...noRequests },
       [],
       thresholds,
     );
@@ -273,7 +290,7 @@ describe('assembleTick', () => {
     const tick = assembleTick(
       1_000,
       'api-1',
-      { cpu_avg: 0.5, cpu_sd: 0.1, cpu_n: 100 },
+      { cpu_avg: 0.5, cpu_sd: 0.1, cpu_n: 100, ...noRequests },
       [0.55, 0.62, 0.72, 0.82, 0.92, 1.05],
       thresholds,
     );
@@ -286,7 +303,7 @@ describe('assembleTick', () => {
     const tick = assembleTick(
       1_000,
       'api-1',
-      { cpu_avg: 0.5, cpu_sd: 0.1, cpu_n: 100 },
+      { cpu_avg: 0.5, cpu_sd: 0.1, cpu_n: 100, ...noRequests },
       [0.45, 0.38, 0.30, 0.65, 0.72, 0.95],
       thresholds,
     );
@@ -313,12 +330,58 @@ describe('assembleTick', () => {
     const tick = assembleTick(
       1_000,
       'api-1',
-      { cpu_avg: 0.5, cpu_sd: 0, cpu_n: 100 },
+      { cpu_avg: 0.5, cpu_sd: 0, cpu_n: 100, ...noRequests },
       [0.5, 0.5, 0.5],
       thresholds,
     );
     expect(tick.anomalies_above).toEqual([0, 0, 0, 0, 0]);
     expect(tick.anomalies_below).toEqual([0, 0, 0, 0, 0]);
     expect(tick.n_current).toBe(3);
+  });
+
+  it('passes requests stats through unchanged (independent of anomaly math)', () => {
+    // assembleTick is purely a pass-through for requests stats —
+    // they're stored on the rolling-output event by pond's reducers
+    // and copied onto the wire row without further computation.
+    // Confirm the three fields land on the output regardless of
+    // baseline-cpu state.
+    const tickWithBaseline = assembleTick(
+      1_000,
+      'api-1',
+      {
+        cpu_avg: 0.5,
+        cpu_sd: 0.1,
+        cpu_n: 100,
+        requests_avg: 102.5,
+        requests_sum: 12_300,
+        requests_n: 120,
+      },
+      [0.6],
+      thresholds,
+    );
+    expect(tickWithBaseline.requests_avg).toBe(102.5);
+    expect(tickWithBaseline.requests_sum).toBe(12_300);
+    expect(tickWithBaseline.requests_n).toBe(120);
+
+    // And on a null-baseline tick (no cpu stats yet, but requests
+    // can still be present — the two columns gate independently).
+    const tickNullBaseline = assembleTick(
+      1_000,
+      'api-1',
+      {
+        cpu_avg: null,
+        cpu_sd: null,
+        cpu_n: 0,
+        requests_avg: 90,
+        requests_sum: 900,
+        requests_n: 10,
+      },
+      [],
+      thresholds,
+    );
+    expect(tickNullBaseline.cpu_avg).toBeNull();
+    expect(tickNullBaseline.requests_avg).toBe(90);
+    expect(tickNullBaseline.requests_sum).toBe(900);
+    expect(tickNullBaseline.requests_n).toBe(10);
   });
 });
