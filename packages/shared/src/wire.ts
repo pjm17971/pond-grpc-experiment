@@ -79,6 +79,40 @@ export type HostTick = {
 };
 
 /**
+ * Per-tick **global** stats on the `/live-agg` stream — properties
+ * of the aggregator itself, not of any individual host. Step 6 of
+ * M3.5 surfaces these so the dashboard's headline numbers reflect
+ * the **gRPC firehose** (true ingest rate + cumulative event count
+ * since aggregator start), not the dashboard's down-scaled local
+ * view of `/live-agg`. The dashboard reader should believe they're
+ * looking at the raw stream; the aggregate-frame compression is an
+ * implementation detail surfaced separately as "experiment stats".
+ *
+ * Field semantics:
+ *
+ * - `events_ingested_total` — cumulative number of raw events the
+ *   aggregator has consumed off the producer's gRPC stream since
+ *   aggregator start. Monotonic; survives client reconnect.
+ * - `events_per_sec` — count of raw events seen in the trailing 1s
+ *   window at tick time. Computed by a non-partitioned pond rolling
+ *   sharing the same `Trigger.clock(seq)` as the per-host fused
+ *   rolling, so globals and host frames emit on the same boundaries.
+ * - `evicted_total` — cumulative number of events the LiveSeries
+ *   retention policy has evicted since aggregator start. Useful for
+ *   spotting "we're behind on backpressure" silently.
+ *
+ * One frame per tick (alongside the per-host rows). Optional on
+ * `AggregateAppendMsg` for forward-compat with pre-step-6 servers
+ * during deploys; once step 6 lands fully it's always present.
+ */
+export type GlobalsTick = {
+  ts: number;
+  events_ingested_total: number;
+  events_per_sec: number;
+  evicted_total: number;
+};
+
+/**
  * Snapshot frame for `/live-agg`. Sent once on connect.
  *
  * - `thresholds` is the σ-threshold list anomaly density will use
@@ -89,22 +123,30 @@ export type HostTick = {
  *   array — a connecting client fills the chart in as ticks arrive,
  *   trading first-paint coverage for protocol simplicity. Snapshot
  *   history lands when M4 measures whether the cost is real.
+ * - `globals` is a tail of the most recent globals ticks (history
+ *   parallel to `rows`). Step 6 ships either an empty array or the
+ *   single most-recent tick; full backfill arrives with snapshot
+ *   history (step 8). Optional for forward-compat.
  */
 export type AggregateSnapshotMsg = {
   type: 'aggregate-snapshot';
   thresholds: ReadonlyArray<number>;
   rows: ReadonlyArray<HostTick>;
+  globals?: ReadonlyArray<GlobalsTick>;
 };
 
 /**
  * Append frame for `/live-agg`. One per 200ms tick. `rows` carries
  * one `HostTick` per host that had any samples in the rolling 1m
  * window at tick time; silent hosts are omitted (client renders the
- * column as a gap until the host re-appears).
+ * column as a gap until the host re-appears). `globals` carries the
+ * tick's aggregator-wide counters (step 6+); a single object since
+ * append is per-tick. Optional during step-6 rollout.
  */
 export type AggregateAppendMsg = {
   type: 'aggregate-append';
   rows: ReadonlyArray<HostTick>;
+  globals?: GlobalsTick;
 };
 
 /**

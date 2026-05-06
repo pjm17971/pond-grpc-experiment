@@ -12,6 +12,7 @@ export {
   type AppendMsg,
   type RawWireMsg,
   type HostTick,
+  type GlobalsTick,
   type AggregateSnapshotMsg,
   type AggregateAppendMsg,
   type AggregateWireMsg,

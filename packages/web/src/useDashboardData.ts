@@ -17,13 +17,8 @@
  *  10. Requests section          (partitionBy → smooth → toMap)
  *  11. roll-up scalars
  */
-import { useEffect, useMemo, useState } from 'react';
-import {
-  useCurrent,
-  useEventRate,
-  useTimeSeries,
-  useWindow,
-} from '@pond-ts/react';
+import { useMemo } from 'react';
+import { useCurrent, useTimeSeries, useWindow } from '@pond-ts/react';
 import {
   Sequence,
   TimeSeries,
@@ -158,7 +153,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //    same rows at the same moment. The third tuple slot is the
   //    WS lifecycle status — surfaces in the page summary as a
   //    connection indicator.
-  const [liveSeries, snapshot, connectionStatus] = useRemoteLiveSeries(
+  const [liveSeries, , connectionStatus] = useRemoteLiveSeries(
     WS_URL,
     {
       name: 'metrics',
@@ -181,13 +176,22 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   // the first snapshot is in flight.
   const aggregateThresholds = aggregate.thresholds;
 
-  // 2. Eviction counter — demonstrates `liveSeries.on('evict', cb)`.
-  const [evictedTotal, setEvictedTotal] = useState(0);
-  useEffect(() => {
-    return liveSeries.on('evict', (events) => {
-      setEvictedTotal((n) => n + events.length);
-    });
-  }, [liveSeries]);
+  // 2. Eviction counter, event rate, total events — all sourced
+  //    from the wire's globals tick (step 6). The previous version
+  //    tracked them client-side (`live.on('evict', cb)` counter,
+  //    `useEventRate(live, '1m')`, `snapshot.length`), which made
+  //    the dashboard's headline numbers reflect the dashboard's
+  //    locally-buffered view of the raw stream. With globals on the
+  //    wire those headline numbers now reflect the **producer's
+  //    actual gRPC throughput** at the aggregator's ingest hop —
+  //    monotonic across reconnects, unaffected by retention, and
+  //    independent of the down-sampling the wire does to ship one
+  //    frame per tick. The "the dashboard sees the gRPC firehose"
+  //    illusion the WIRE.md doc describes.
+  const globals = aggregate.latestGlobals;
+  const totalEventsGlobal = globals?.events_ingested_total ?? 0;
+  const eventsPerSec = globals?.events_per_sec;
+  const evictedTotal = globals?.evicted_total ?? 0;
 
   // 3. Throttled 5-min windowed snapshot. `useWindow` owns the live
   //    view subscription; what we get back is an immutable TimeSeries
@@ -223,14 +227,16 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
 
   // 5. Whole-source rollups (computed live, not from the window).
   //    `useCurrent` is sugar for `useSnapshot(src).tail(t).reduce(map)`.
-  //    Event rate uses 0.11.7's `useEventRate` — closes the M1
-  //    `useCurrent({ cpu: 'count' }).cpu / 60` boilerplate.
+  //    Event rate moved to globals (step 6) — see §2 above. The
+  //    remaining client-side rollups are the ones the wire doesn't
+  //    yet ship: a cumulative `requests` total (waiting on a
+  //    requests global; could be added to `GlobalsTick` if useful)
+  //    and the rolling 1m CPU avg displayed in the section header.
   const { requests: totalRequests } = useCurrent(
     liveSeries,
     { requests: 'sum' },
     { throttle: 500 },
   );
-  const eventsPerSec = useEventRate(liveSeries, '1m');
   const { cpu: rollingCpu } = useCurrent(
     liveSeries,
     { cpu: 'avg' },
@@ -541,7 +547,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
 
   return {
     liveSeries,
-    totalEvents: snapshot?.length ?? 0,
+    totalEvents: totalEventsGlobal,
     totalRequests,
     eventsPerSec,
     evictedTotal,

@@ -237,6 +237,71 @@ describe('startAggregate', () => {
       stop();
     }
   });
+
+  it('emits globals (events_ingested_total, events_per_sec, evicted_total) on every append frame', async () => {
+    // Step 6 — the per-tick globals tick rides on the same frame as
+    // the per-host rows. Confirms the manual counters increment as
+    // batches arrive and the per-tick rate computation reflects the
+    // ingest-side delta over the elapsed tick window.
+    const live = new LiveSeries({
+      name: 'metrics',
+      schema,
+      retention: { maxAge: '6m' },
+    });
+    const frames: string[] = [];
+    const { stop } = startAggregate(live, (f) => frames.push(f), {
+      tickMs: 50,
+    });
+    try {
+      const t0 = Date.now();
+      // Push events in stages across multiple tick boundaries so
+      // events_per_sec can compute a meaningful rate (events/sec
+      // requires at least two ticks of delta to be non-zero).
+      for (let stage = 0; stage < 4; stage++) {
+        for (let i = 0; i < 4; i++) {
+          live.push([
+            new Date(t0 + stage * 60 + i * 10),
+            0.5,
+            100,
+            'api-1',
+          ]);
+          live.push([
+            new Date(t0 + stage * 60 + i * 10),
+            0.6,
+            100,
+            'api-2',
+          ]);
+        }
+        await new Promise((res) => setTimeout(res, 60));
+      }
+
+      const appends = decodedFrames(frames);
+      expect(appends.length).toBeGreaterThan(0);
+      // Every emitted append carries globals.
+      for (const f of appends) {
+        expect(f.globals).toBeDefined();
+        expect(typeof f.globals!.events_ingested_total).toBe('number');
+        expect(typeof f.globals!.events_per_sec).toBe('number');
+        expect(typeof f.globals!.evicted_total).toBe('number');
+        expect(f.globals!.evicted_total).toBe(0);
+      }
+      // events_ingested_total is monotonically non-decreasing across
+      // frames (live.on('batch') accumulates; never resets).
+      const counts = appends.map((f) => f.globals!.events_ingested_total);
+      for (let i = 1; i < counts.length; i++) {
+        expect(counts[i]).toBeGreaterThanOrEqual(counts[i - 1]);
+      }
+      // 4 stages × 8 events/stage = 32 events total.
+      expect(counts.at(-1)!).toBeGreaterThanOrEqual(16);
+      // At least one frame should report a non-zero rate — the
+      // boundary that captures one of the staged batches will see
+      // an 8-event delta over a ~50 ms tick window.
+      const rates = appends.map((f) => f.globals!.events_per_sec);
+      expect(rates.some((r) => r > 0)).toBe(true);
+    } finally {
+      stop();
+    }
+  });
 });
 
 describe('assembleTick', () => {
