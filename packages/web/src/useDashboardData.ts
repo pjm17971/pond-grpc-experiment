@@ -25,6 +25,16 @@ import {
   type LiveSeries,
   type SeriesSchema,
 } from 'pond-ts';
+
+/**
+ * Target points per chart series. The CPU/Requests charts are ~420px
+ * wide; rendering more than ~1 point per pixel is wasted SVG-node
+ * churn that React+Recharts has to diff every frame. With a 5-min
+ * window of 5 fps/host ticks (1500 raw rows), TARGET_CHART_POINTS=500
+ * gives ~3× downsample with no visible loss. See M3.5 friction note
+ * "Recharts as the dashboard's render bottleneck".
+ */
+const TARGET_CHART_POINTS = 500;
 import {
   type ChartBand,
   type ChartDots,
@@ -289,19 +299,92 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //        render a dot at the band edge when the interpolated count
   //        is ≥ 1.
   const cpu = useMemo(() => {
+    // Lightweight per-render diagnostic. `?perf=1` query param turns
+    // it on; off in normal use because `console` lookups churn dev
+    // logs at 5 fps. Splits the cost across pond's filter+partition,
+    // pond's downsample (aggregate), the full-res anomaly scan, and
+    // the chart-points assembly so we can localise regressions.
+    const perf =
+      typeof window !== 'undefined' &&
+      new URLSearchParams(window.location.search).get('perf') === '1';
+    const t0 = perf ? performance.now() : 0;
+
     const series: ChartSeries[] = [];
     const bands: ChartBand[] = [];
     const dots: ChartDots[] = [];
     const allAnomalies: ChartPoint[] = [];
-    if (!aggSnapshot) {
+    // Bail before touching pond if the snapshot has no events. `aggregate(seq)`
+    // on an empty source falls back to `series.timeRange()` for its bucket
+    // range, and that's undefined when length is 0 — pond throws inside the
+    // sequence walk. The dashboard's first render hits this every time
+    // (initial WS connect → snapshot is empty until the first frame lands),
+    // so the guard isn't an edge case, it's the boot path.
+    if (!aggSnapshot || aggSnapshot.length === 0) {
       return { series, bands, dots, allAnomalies };
     }
 
-    // Per-host rows of the windowed `LiveSeries<AggregateSchema>`,
-    // one row per 200ms tick boundary.
-    const aggPerHostRows = aggSnapshot
-      .partitionBy('host')
+    // **Filter to enabled hosts before partitioning** — at 80-host
+    // firehose loads the full partition would allocate ~120k row
+    // objects per render to use ~1.5k of them. Filtering first scopes
+    // the allocation to the hosts we'll actually iterate. The
+    // partitioned series is then reused for both the full-res
+    // anomaly scan (sparse signals, must see every tick) and the
+    // downsampled line/band data — `partitionBy` returns a structural
+    // wrapper, so the second consumer is cheap.
+    const filtered = aggSnapshot.filter((e) => {
+      const h = e.get('host');
+      return typeof h === 'string' && enabledHosts.has(h);
+    });
+    if (filtered.length === 0) {
+      return { series, bands, dots, allAnomalies };
+    }
+    const partitioned = filtered.partitionBy('host');
+    const tPart = perf ? performance.now() : 0;
+
+    // Downsample for line/band rendering. Per-bucket reducers picked
+    // to match each signal's semantic:
+    //   - cpu_avg/cpu_sd → 'avg'  (smooth-of-smooth; the bucket's
+    //     averaged statistic is the natural plot value)
+    //   - cpu_n/n_current → 'last' (these are gates; the bucket's
+    //     terminal sample-count is what the user sees as "current")
+    //   - cpu_min → 'min', cpu_max → 'max' (spike preservation —
+    //     pond's built-in min/max reducers do exactly the right
+    //     thing here)
+    // Bucket size derived from the visible window so the per-render
+    // SVG node count tracks chart pixel width, not wire fan-out.
+    // Anomalies array columns aren't reduced — pond's reducers are
+    // scalar-only — so per-tick anomaly extraction runs separately
+    // below over the full-res partitioned series.
+    const aggBucketMs = Math.max(
+      200,
+      Math.ceil(WINDOW_MS / TARGET_CHART_POINTS),
+    );
+    const downsampledPerHost = partitioned
+      .aggregate(Sequence.every(`${aggBucketMs}ms`), {
+        // `host: 'first'` carries the partition column through the
+        // aggregate so `PartitionedTimeSeries.aggregate(...)` can
+        // rewrap into a partitioned result. Without this pond throws
+        // `column "host" not in schema` on the rewrap — the partition
+        // column has to survive the reducer map even though every row
+        // in a partition has the same value. See M3.5 friction note
+        // "Per-partition aggregate must re-declare the partition col".
+        host: 'first',
+        cpu_avg: 'avg',
+        cpu_sd: 'avg',
+        cpu_n: 'last',
+        n_current: 'last',
+        cpu_min: 'min',
+        cpu_max: 'max',
+      })
       .toMap((g) => g.toPoints());
+    const tDownsample = perf ? performance.now() : 0;
+
+    // Full-res rows per host — only used for the per-tick anomaly
+    // scan below. Could fold into the aggregate above with a custom
+    // reducer if pond ever grows array-column folds; today this is
+    // the cleanest split.
+    const fullResPerHost = partitioned.toMap((g) => g.toPoints());
+    const tFullRes = perf ? performance.now() : 0;
 
     // Threshold list comes from the snapshot frame's `thresholds`
     // field. Fall back to the default while the first snapshot is
@@ -316,14 +399,37 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       if (!enabledHosts.has(host)) continue;
       const color = hostColors[host];
 
+      // ── Pass 1: per-tick anomaly dots (full resolution). Anomalies
+      //    are sparse single-tick signals; plotting them at downsampled
+      //    bucket boundaries would smear them and risk dropping them
+      //    inside an all-zero bucket. Iterate every tick and emit a
+      //    dot whenever the σ-bucketed count crosses 1.
+      const anomalyDots: ChartPoint[] = [];
+      const fullRows = fullResPerHost.get(host) ?? [];
+      for (const r of fullRows) {
+        if (r.cpu_avg == null || r.cpu_sd == null) continue;
+        const upperEdge = r.cpu_avg + sigma * r.cpu_sd;
+        const lowerEdge = r.cpu_avg - sigma * r.cpu_sd;
+        // `kind: 'array'` columns are typed `ReadonlyArray<ScalarValue>`
+        // (number|string|boolean) at the schema level; the wire contract
+        // guarantees number arrays, so the cast is safe.
+        const aAbove = (r.anomalies_above as ReadonlyArray<number>) ?? [];
+        if (countAtSigma(aAbove, sigma, thresholds) >= 1) {
+          anomalyDots.push({ ts: r.ts, value: upperEdge });
+        }
+        const aBelow = (r.anomalies_below as ReadonlyArray<number>) ?? [];
+        if (countAtSigma(aBelow, sigma, thresholds) >= 1) {
+          anomalyDots.push({ ts: r.ts, value: lowerEdge });
+        }
+      }
+
+      // ── Pass 2: line/band points from the downsampled bucket rows.
       const upper: ChartPoint[] = [];
       const lower: ChartPoint[] = [];
       const smoothPoints: ChartPoint[] = [];
-      const anomalyDots: ChartPoint[] = [];
-      // Step 7 — per-tick CPU min/max envelope. Populated only when
-      // `showRaw` is on (the toggle's repurposed semantic). Each row's
-      // `cpu_min`/`cpu_max` cell is the extremum of the cpu column over
-      // the row's 200ms slice, or null when the slice is empty.
+      // Step 7 — per-tick CPU min/max envelope (the toggle's
+      // semantic). Pond's `min`/`max` reducers preserve the bucket's
+      // extremum so a single-tick spike survives the downsample.
       const minPoints: ChartPoint[] = [];
       const maxPoints: ChartPoint[] = [];
       let lastAvg: number | undefined;
@@ -337,33 +443,15 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       // staircase artefact when the producer pauses and the rolling
       // window has too few samples to trust mean/sd.
       const MIN_SAMPLES = 30;
-      const aggRows = aggPerHostRows.get(host) ?? [];
+      const aggRows = downsampledPerHost.get(host) ?? [];
       for (const r of aggRows) {
         const gated = (r.cpu_n ?? 0) >= MIN_SAMPLES;
         if (gated && r.cpu_avg != null) {
           smoothPoints.push({ ts: r.ts, value: r.cpu_avg });
           lastAvg = r.cpu_avg;
           if (r.cpu_sd != null) {
-            const upperEdge = r.cpu_avg + sigma * r.cpu_sd;
-            const lowerEdge = r.cpu_avg - sigma * r.cpu_sd;
-            upper.push({ ts: r.ts, value: upperEdge });
-            lower.push({ ts: r.ts, value: lowerEdge });
-            // Per-tick anomaly density at the user's σ — plot a dot
-            // at the band edge when the interpolated count is ≥ 1.
-            // Pond's `kind: 'array'` columns are typed
-            // `ReadonlyArray<ScalarValue>` (number|string|boolean) at
-            // the schema level; the wire contract guarantees number
-            // arrays, so the cast is safe here.
-            const aAbove = (r.anomalies_above as ReadonlyArray<number>) ?? [];
-            const aboveCount = countAtSigma(aAbove, sigma, thresholds);
-            if (aboveCount >= 1) {
-              anomalyDots.push({ ts: r.ts, value: upperEdge });
-            }
-            const aBelow = (r.anomalies_below as ReadonlyArray<number>) ?? [];
-            const belowCount = countAtSigma(aBelow, sigma, thresholds);
-            if (belowCount >= 1) {
-              anomalyDots.push({ ts: r.ts, value: lowerEdge });
-            }
+            upper.push({ ts: r.ts, value: r.cpu_avg + sigma * r.cpu_sd });
+            lower.push({ ts: r.ts, value: r.cpu_avg - sigma * r.cpu_sd });
           } else {
             upper.push({ ts: r.ts, value: undefined });
             lower.push({ ts: r.ts, value: undefined });
@@ -376,13 +464,12 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
           lower.push({ ts: r.ts, value: undefined });
         }
         // Min/max envelope tracks cpu_min/cpu_max on every row,
-        // independent of the cpu_n MIN_SAMPLES gate. The envelope is a
-        // direct readout of the per-tick 200ms slice — it's fine even
-        // when the 1m baseline gate is closed (early connect), and
-        // omitting the gap there means the line breaks with the
-        // smoothed line on a quiet host. We DO gate on the slice
-        // having content (n_current >= 1), since min/max of an empty
-        // slice is null on the wire.
+        // independent of the cpu_n MIN_SAMPLES gate. The envelope is
+        // a direct readout of the bucket's spike extrema (pond's
+        // `min`/`max` reducers — see the aggregate call above). Gate
+        // only on slice content (`n_current >= 1`); empty slices
+        // produce null on the wire and the `'min'`/`'max'` reducer
+        // falls back to undefined, which renders as a gap.
         if (showRaw) {
           const sliceFilled = (r.n_current ?? 0) >= 1;
           minPoints.push({
@@ -441,6 +528,28 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
           hideFromLegend: true,
         });
       }
+    }
+
+    if (perf) {
+      const tEnd = performance.now();
+      let dsRows = 0;
+      let frRows = 0;
+      for (const rs of downsampledPerHost.values()) dsRows += rs.length;
+      for (const rs of fullResPerHost.values()) frRows += rs.length;
+      // eslint-disable-next-line no-console
+      console.log(
+        '[cpu memo]',
+        `part ${(tPart - t0).toFixed(1)}ms`,
+        `down ${(tDownsample - tPart).toFixed(1)}ms`,
+        `full ${(tFullRes - tDownsample).toFixed(1)}ms`,
+        `assemble ${(tEnd - tFullRes).toFixed(1)}ms`,
+        `total ${(tEnd - t0).toFixed(1)}ms`,
+        `hosts:${downsampledPerHost.size}`,
+        `down/host:${dsRows / Math.max(1, downsampledPerHost.size)}`,
+        `full/host:${frRows / Math.max(1, fullResPerHost.size)}`,
+        `series:${series.length}`,
+        `dots:${dots.reduce((acc, d) => acc + d.points.length, 0)}`,
+      );
     }
 
     return { series, bands, dots, allAnomalies };
@@ -607,9 +716,30 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //     samples). Plotting raw ticks reads cleanly without compound
   //     smoothing's added lag.
   const reqSeries = useMemo<ChartSeries[]>(() => {
-    if (!aggSnapshot) return [];
-    const perHostRows = aggSnapshot
+    if (!aggSnapshot || aggSnapshot.length === 0) return [];
+    // Same filter-before-partition + downsample pattern as the CPU
+    // section. `requests_sum` is already a 1-min rolling sum, so
+    // averaging it across the bucket gives the natural plot value;
+    // `requests_n` and `window_age_seconds` are gates / divisors,
+    // sample at the bucket's terminal tick. No spike-preserving
+    // signal here so all reducers are smooth-friendly.
+    const aggBucketMs = Math.max(
+      200,
+      Math.ceil(WINDOW_MS / TARGET_CHART_POINTS),
+    );
+    const filtered = aggSnapshot.filter((e) => {
+      const h = e.get('host');
+      return typeof h === 'string' && enabledHosts.has(h);
+    });
+    if (filtered.length === 0) return [];
+    const perHostRows = filtered
       .partitionBy('host')
+      .aggregate(Sequence.every(`${aggBucketMs}ms`), {
+        host: 'first',
+        requests_sum: 'avg',
+        requests_n: 'last',
+        window_age_seconds: 'last',
+      })
       .toMap((g) => g.toPoints());
 
     const out: ChartSeries[] = [];
