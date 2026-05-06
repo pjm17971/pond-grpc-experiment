@@ -361,14 +361,6 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     );
     const downsampledPerHost = partitioned
       .aggregate(Sequence.every(`${aggBucketMs}ms`), {
-        // `host: 'first'` carries the partition column through the
-        // aggregate so `PartitionedTimeSeries.aggregate(...)` can
-        // rewrap into a partitioned result. Without this pond throws
-        // `column "host" not in schema` on the rewrap — the partition
-        // column has to survive the reducer map even though every row
-        // in a partition has the same value. See M3.5 friction note
-        // "Per-partition aggregate must re-declare the partition col".
-        host: 'first',
         cpu_avg: 'avg',
         cpu_sd: 'avg',
         cpu_n: 'last',
@@ -735,7 +727,6 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     const perHostRows = filtered
       .partitionBy('host')
       .aggregate(Sequence.every(`${aggBucketMs}ms`), {
-        host: 'first',
         requests_sum: 'avg',
         requests_n: 'last',
         window_age_seconds: 'last',
