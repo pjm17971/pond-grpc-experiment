@@ -140,10 +140,12 @@ export type DashboardData = {
 
 export function useDashboardData(args: DashboardArgs): DashboardData {
   const { disabledHosts, chartOpts } = args;
-  // `showRaw` is in `chartOpts` but unused here today — the raw-
-  // scatter overlay path is disabled (deferred to step 7 per WIRE.md).
-  // Re-introduce when step 7's cpu_min/cpu_max repurpose lands.
-  const { showBands, sigma } = chartOpts;
+  // `showRaw` controls the per-tick min/max envelope overlay on the
+  // CPU chart (step 7's repurpose of the legacy raw-samples toggle —
+  // WIRE.md "show min/max" pattern, sourced from `cpu_min`/`cpu_max`
+  // on the aggregate stream). When on, each enabled host's chart gets
+  // two extra thin lines tracing the per-tick CPU extrema.
+  const { showBands, showRaw, sigma } = chartOpts;
 
   // 1. LiveSeries — the single mutable buffer for ingest. Identical
   //    in shape to the M0 useLiveSeries call; the difference is the
@@ -293,6 +295,12 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       const lower: ChartPoint[] = [];
       const smoothPoints: ChartPoint[] = [];
       const anomalyDots: ChartPoint[] = [];
+      // Step 7 — per-tick CPU min/max envelope. Populated only when
+      // `showRaw` is on (the toggle's repurposed semantic). Each row's
+      // `cpu_min`/`cpu_max` cell is the extremum of the cpu column over
+      // the row's 200ms slice, or null when the slice is empty.
+      const minPoints: ChartPoint[] = [];
+      const maxPoints: ChartPoint[] = [];
       let lastAvg: number | undefined;
 
       // `cpu_n >= MIN_SAMPLES` is the gate-on-render mask, equivalent
@@ -342,16 +350,32 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
           upper.push({ ts: r.ts, value: undefined });
           lower.push({ ts: r.ts, value: undefined });
         }
+        // Min/max envelope tracks cpu_min/cpu_max on every row,
+        // independent of the cpu_n MIN_SAMPLES gate. The envelope is a
+        // direct readout of the per-tick 200ms slice — it's fine even
+        // when the 1m baseline gate is closed (early connect), and
+        // omitting the gap there means the line breaks with the
+        // smoothed line on a quiet host. We DO gate on the slice
+        // having content (n_current >= 1), since min/max of an empty
+        // slice is null on the wire.
+        if (showRaw) {
+          const sliceFilled = (r.n_current ?? 0) >= 1;
+          minPoints.push({
+            ts: r.ts,
+            value:
+              sliceFilled && typeof r.cpu_min === 'number'
+                ? r.cpu_min
+                : undefined,
+          });
+          maxPoints.push({
+            ts: r.ts,
+            value:
+              sliceFilled && typeof r.cpu_max === 'number'
+                ? r.cpu_max
+                : undefined,
+          });
+        }
       }
-
-      // The raw-samples scatter overlay (`showRaw`) is deferred — see
-      // WIRE.md: with aggregate-driven bands/smoothed-line on a 200ms
-      // tick clock, mixing in raw events at ~10ms cadence would
-      // introduce sparse rows in the chart's merged-by-ts data and
-      // break `connectNulls={false}` on the smoothed line + bands.
-      // The dashboard agent's repurpose-as-show-min/max plan lands in
-      // step 7 once `cpu_min`/`cpu_max` are on the wire. The toggle
-      // stays in UI but is a no-op until then.
 
       series.push({
         name: host,
@@ -367,13 +391,34 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
           allAnomalies.push(...anomalyDots);
         }
       }
+      if (showRaw && (minPoints.length >= 2 || maxPoints.length >= 2)) {
+        // Two thin host-coloured lines tracing the 200ms-slice
+        // extrema. Hidden from the legend (the host's smoothed line
+        // already represents it; this is overlay context). Slightly
+        // transparent + dashed so the smoothed line stays the
+        // primary visual.
+        series.push({
+          name: `${host} max`,
+          color,
+          points: maxPoints,
+          dashed: true,
+          width: 1,
+          opacity: 0.55,
+          hideFromLegend: true,
+        });
+        series.push({
+          name: `${host} min`,
+          color,
+          points: minPoints,
+          dashed: true,
+          width: 1,
+          opacity: 0.55,
+          hideFromLegend: true,
+        });
+      }
     }
 
     return { series, bands, dots, allAnomalies };
-    // `showRaw` and `timeSeries` are intentionally NOT deps: the
-    // CPU section is fully aggregate-driven now (step 4 retired the
-    // raw baseline pipeline). Re-introduce when step 7's
-    // cpu_min/cpu_max repurpose brings the raw overlay back.
   }, [
     aggSnapshot,
     aggregateThresholds,
@@ -381,6 +426,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     enabledHosts,
     hostColors,
     showBands,
+    showRaw,
     sigma,
   ]);
 

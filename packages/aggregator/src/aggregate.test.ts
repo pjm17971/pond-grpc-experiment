@@ -74,6 +74,22 @@ describe('startAggregate', () => {
           expect(
             r.requests_avg === null || typeof r.requests_avg === 'number',
           ).toBe(true);
+          // Step 7 — cpu_min/cpu_max present on every row, with the
+          // min ≤ max ordering invariant when both are non-null. The
+          // extrema are over the 200ms slice while cpu_avg is over
+          // the 1m baseline — different windows, so cpu_min can be
+          // above cpu_avg (or vice versa) when the recent slice's
+          // values cluster outside the long-window mean. Only the
+          // intra-slice min ≤ max relation is guaranteed.
+          expect(r.cpu_min === null || typeof r.cpu_min === 'number').toBe(
+            true,
+          );
+          expect(r.cpu_max === null || typeof r.cpu_max === 'number').toBe(
+            true,
+          );
+          if (typeof r.cpu_min === 'number' && typeof r.cpu_max === 'number') {
+            expect(r.cpu_min).toBeLessThanOrEqual(r.cpu_max);
+          }
         }
       }
     } finally {
@@ -311,16 +327,20 @@ describe('assembleTick', () => {
   // shape from one pond version to the next.
   const thresholds = [1, 1.5, 2, 2.5, 3] as const;
 
-  // Default request stats + window age — most assembleTick tests
-  // exercise CPU anomaly counting and don't care about the requests
-  // pass-through or the warmup-window value; factor them out so the
+  // Default per-tick context — most assembleTick tests exercise CPU
+  // anomaly counting and don't care about the requests pass-through,
+  // window age, or step-7 min/max envelope; factor them out so the
   // cpu-focused tests stay readable. `window_age_seconds: 60`
-  // simulates a warm aggregator (rolling window full).
+  // simulates a warm aggregator (rolling window full);
+  // `cpu_min`/`cpu_max: null` simulates an empty 200ms slice (the
+  // assembleTick tests pass `samples` to the function separately).
   const noRequests = {
     requests_avg: null,
     requests_sum: 0,
     requests_n: 0,
     window_age_seconds: 60,
+    cpu_min: null,
+    cpu_max: null,
   };
 
   it('returns zero-filled arrays when baseline stats are null', () => {
@@ -411,13 +431,13 @@ describe('assembleTick', () => {
     expect(tick.n_current).toBe(3);
   });
 
-  it('passes requests stats + window_age through unchanged (independent of anomaly math)', () => {
-    // assembleTick is purely a pass-through for requests stats and
-    // window_age_seconds — they're stored on the rolling-output
-    // event by pond's reducers / computed by the caller and copied
-    // onto the wire row without further computation. Confirm the
-    // four fields land on the output regardless of baseline-cpu
-    // state.
+  it('passes requests stats + window_age + cpu_min/max through unchanged (independent of anomaly math)', () => {
+    // assembleTick is purely a pass-through for requests stats,
+    // window_age_seconds, and the per-tick min/max envelope — they're
+    // stored on the rolling-output event by pond's reducers /
+    // computed by the caller and copied onto the wire row without
+    // further computation. Confirm all six fields land on the output
+    // regardless of baseline-cpu state.
     const tickWithBaseline = assembleTick(
       1_000,
       'api-1',
@@ -429,6 +449,8 @@ describe('assembleTick', () => {
         requests_sum: 12_300,
         requests_n: 120,
         window_age_seconds: 60,
+        cpu_min: 0.42,
+        cpu_max: 0.58,
       },
       [0.6],
       thresholds,
@@ -437,11 +459,15 @@ describe('assembleTick', () => {
     expect(tickWithBaseline.requests_sum).toBe(12_300);
     expect(tickWithBaseline.requests_n).toBe(120);
     expect(tickWithBaseline.window_age_seconds).toBe(60);
+    expect(tickWithBaseline.cpu_min).toBe(0.42);
+    expect(tickWithBaseline.cpu_max).toBe(0.58);
 
     // And on a null-baseline tick (no cpu stats yet, but requests
     // can still be present — the two columns gate independently).
     // Mid-warmup `window_age_seconds: 25` represents 25s of data
-    // accumulated, before the rolling window is full.
+    // accumulated, before the rolling window is full. With no
+    // events in the 200ms slice the min/max are also null (an
+    // empty-slice marker for the dashboard's envelope toggle).
     const tickNullBaseline = assembleTick(
       1_000,
       'api-1',
@@ -453,6 +479,8 @@ describe('assembleTick', () => {
         requests_sum: 900,
         requests_n: 10,
         window_age_seconds: 25,
+        cpu_min: null,
+        cpu_max: null,
       },
       [],
       thresholds,
@@ -461,6 +489,8 @@ describe('assembleTick', () => {
     expect(tickNullBaseline.requests_avg).toBe(90);
     expect(tickNullBaseline.requests_sum).toBe(900);
     expect(tickNullBaseline.requests_n).toBe(10);
+    expect(tickNullBaseline.cpu_min).toBeNull();
+    expect(tickNullBaseline.cpu_max).toBeNull();
     expect(tickNullBaseline.window_age_seconds).toBe(25);
   });
 });
