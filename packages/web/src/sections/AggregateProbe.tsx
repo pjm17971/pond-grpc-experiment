@@ -102,7 +102,7 @@ export function AggregateProbe({ aggregate }: Props) {
         <span>
           compression:{' '}
           <strong>
-            {counters.totalFrames === 0
+            {counters.totalFrames === 0 || counters.totalEvents === 0
               ? '—'
               : (counters.totalEvents / counters.totalFrames).toLocaleString(
                   undefined,
