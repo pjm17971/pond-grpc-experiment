@@ -66,6 +66,19 @@ import {
 const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8080/live';
 
 /**
+ * `/live` stream toggle. Step 9 (the M3.5 finish line) re-wires the
+ * remaining raw-stream consumers — rolling 1m CPU avg, EMA trend,
+ * total requests cumulative, threshold-mode high-CPU alerts, and the
+ * last-20 events log — onto the aggregate stream's globals plus the
+ * per-host rolling output. Until then this branch keeps `/live`
+ * disabled (the firehose-side fix) and section renderers gate the
+ * affected surfaces on this flag so they're hidden rather than shown
+ * as misleading "—" or empty tables. Single source of truth — both
+ * the WS subscription and the UI gating read from here.
+ */
+const LIVE_STREAM_ENABLED = false;
+
+/**
  * Derive the `/live-agg` URL from `WS_URL` so a single `VITE_WS_URL`
  * env configures both endpoints. The single hook owner constructs
  * the URL once; consumers downstream (probe, bands) read state via
@@ -106,6 +119,15 @@ export type DashboardArgs = {
 
 export type DashboardData = {
   liveSeries: LiveSeries<typeof schema>;
+
+  /**
+   * False while `/live` is retired (this branch). Section renderers
+   * use this flag to hide UI surfaces that would otherwise show stale
+   * "—" or empty content because their data sources are unreachable.
+   * Step 9 re-derives every gated surface from the aggregate stream
+   * and flips this back to `true`.
+   */
+  liveStreamEnabled: boolean;
 
   // basic counters
   totalEvents: number;
@@ -187,7 +209,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       schema,
       retention: { maxAge: '90s' },
     },
-    { throttle: 200, enabled: false },
+    { throttle: 200, enabled: LIVE_STREAM_ENABLED },
   );
   // The aggregate stream's connection status drives the page-summary
   // indicator. Mapping is direct — `/live-agg`'s `ConnectionStatus`
@@ -776,6 +798,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
 
   return {
     liveSeries,
+    liveStreamEnabled: LIVE_STREAM_ENABLED,
     totalEvents: totalEventsGlobal,
     totalRequests,
     eventsPerSec,

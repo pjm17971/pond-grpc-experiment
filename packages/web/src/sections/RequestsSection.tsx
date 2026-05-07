@@ -12,6 +12,10 @@ type Props = {
  * raw integer counts (no percentage formatting).
  */
 export function RequestsSection({ data }: Props) {
+  // `Total requests` is the cumulative `requests`-column sum off the
+  // raw `/live` stream — unavailable while /live is retired. Step 9
+  // reroutes it through a `requests_total` global on the aggregate
+  // wire. Until then the stat is hidden rather than shown as "—".
   return (
     <section className="metric-section">
       <header className="section-header">
@@ -23,14 +27,16 @@ export function RequestsSection({ data }: Props) {
               data.totalReqPerSec > 0 ? data.totalReqPerSec.toFixed(0) : '—'
             }
           />
-          <Stat
-            label="Total requests"
-            value={
-              data.totalRequests != null
-                ? data.totalRequests.toLocaleString()
-                : '—'
-            }
-          />
+          {data.liveStreamEnabled && (
+            <Stat
+              label="Total requests"
+              value={
+                data.totalRequests != null
+                  ? data.totalRequests.toLocaleString()
+                  : '—'
+              }
+            />
+          )}
         </div>
       </header>
       <div className="section-charts">

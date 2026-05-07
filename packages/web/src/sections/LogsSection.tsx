@@ -9,8 +9,15 @@ type Props = {
  * snapshot, newest first. Demonstrates direct event iteration —
  * `timeSeries.toArray()` gives a typed `EventForSchema<S>[]` and
  * `e.get('cpu')` etc. narrow on the schema with no casts.
+ *
+ * Hidden entirely while `/live` is retired: the section iterates raw
+ * events, which the aggregate stream doesn't carry. Step 9 either
+ * reintroduces a small per-host log tail on the aggregate wire or
+ * removes the section permanently — either way, hiding here avoids
+ * the empty-table state Codex flagged on PR #29.
  */
 export function LogsSection({ data }: Props) {
+  if (!data.liveStreamEnabled) return null;
   const { timeSeries, hostColors } = data;
   return (
     <section className="logs-section">
