@@ -67,6 +67,38 @@ export function applyAggregateFrame(
 }
 
 /**
+ * Drop rows whose `ts` is at or before the LiveSeries' current tail.
+ * Idempotency guard for snapshot frames received on reconnect: pond's
+ * `LiveSeries` defaults to strict ordering, so `pushJson([row_older
+ * _than_tail, ...])` throws on the first out-of-order row. The step-8
+ * snapshot ships a 5m backfill on every connect — including reconnects
+ * after the buffer already has data — so this filter is the difference
+ * between a clean reconnect and the dashboard freezing on its next
+ * websocket flap.
+ *
+ * Filter rule: keep `row.ts > latestTs`. Rows at the boundary `ts ===
+ * latestTs` are dropped because the existing buffer already represents
+ * the same tick and pond's same-key insertion would double-count
+ * across hosts. On first connect the buffer is empty and `latestTs`
+ * is `undefined` — every row passes through.
+ *
+ * Used for both the LiveSeries push and the per-host latest map so
+ * stale snapshot rows can't stomp fresher data accumulated before the
+ * reconnect either.
+ */
+export function selectNewerRows(
+  rows: ReadonlyArray<HostTick>,
+  latestTs: number | undefined,
+): ReadonlyArray<HostTick> {
+  if (latestTs === undefined) return rows;
+  const out: HostTick[] = [];
+  for (const row of rows) {
+    if (row.ts > latestTs) out.push(row);
+  }
+  return out;
+}
+
+/**
  * Sum of `cpu_n` across every row in an aggregate frame — i.e. the
  * total bucket density represented in this frame. **Not the same as
  * "raw events ingested for this tick"**: each raw event contributes
@@ -257,8 +289,22 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
         // Same convert-at-the-boundary pattern the raw `applyFrame`
         // uses; pond validates each row against `aggregateSchema` and
         // throws on shape drift.
-        if (msg.rows.length > 0) {
-          liveSeries.pushJson(msg.rows.map(tickToRow));
+        //
+        // Filter against the LiveSeries tail before pushing. Step 8's
+        // snapshot frame ships a 5m backfill — on reconnect after the
+        // buffer already has data, the snapshot starts older than the
+        // tail and pond's strict-ordering `pushJson` would throw on
+        // the first row. `selectNewerRows` drops the overlapping
+        // prefix so the push is idempotent across reconnects. Same
+        // filter feeds the per-host latest map so a stale snapshot
+        // row can't stomp a fresher tick we already received.
+        // `last()?.key().timestampMs()` is the codebase's established
+        // tail-peek (mirrors `useDashboardData`'s `tEnd` derivation)
+        // and works on every pond-ts version this branch targets.
+        const latestTs = liveSeries.last()?.key().timestampMs();
+        const newerRows = selectNewerRows(msg.rows, latestTs);
+        if (newerRows.length > 0) {
+          liveSeries.pushJson(newerRows.map(tickToRow));
         }
         // Functional update — `prev` is always the freshest state in
         // React's queue. Reading `latestPerHost` from a closure or a
@@ -266,7 +312,8 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
         // overwriting the other's contribution). `applyAggregateFrame`
         // returns the same Map reference on empty rows, so React's
         // shallow-state equality skips the re-render in that case.
-        setLatestPerHost((prev) => applyAggregateFrame(prev, msg));
+        const filteredMsg = { ...msg, rows: newerRows } as AggregateWireMsg;
+        setLatestPerHost((prev) => applyAggregateFrame(prev, filteredMsg));
         if (msg.type === 'aggregate-append') {
           // True per-frame raw-event delta from globals. Falls back
           // to 0 for pre-step-6 servers that don't ship `globals`
