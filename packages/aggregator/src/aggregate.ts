@@ -70,6 +70,35 @@ export type AggregateOptions = {
    * `anomalies_above`/`anomalies_below` arrays the wire ships.
    */
   thresholds?: ReadonlyArray<number>;
+  /**
+   * How much per-host tick history (in ms) to retain for the
+   * snapshot-on-connect frame. Defaults to 5 minutes — matches the
+   * dashboard's chart back-window so a connecting client sees the
+   * chart already filled, not a blank canvas filling in over time.
+   * Set to 0 to disable history (snapshot ships empty `rows` /
+   * `globals`, the pre-step-8 behaviour).
+   */
+  historyMaxAgeMs?: number;
+};
+
+const DEFAULT_HISTORY_MAX_AGE_MS = 5 * 60 * 1000;
+
+/**
+ * Bounded ring of recent `HostTick`s + `GlobalsTick`s, populated as
+ * the aggregator emits frames and consumed when a new client
+ * connects to `/live-agg`. The ring is kept independent of the raw
+ * `LiveSeries`'s retention because the two have different shapes
+ * and lifetimes: the raw `live` only needs ~1m for the fused
+ * rolling's longest window, but the dashboard wants ~5m of tick
+ * history to draw a full back-window chart on connect.
+ *
+ * Eviction uses an amortised head-index pattern (à la pond 0.15.2's
+ * `LiveFusedRolling.#compactFront`) so per-emit cost is O(1)
+ * regardless of ring length.
+ */
+export type SnapshotHistory = {
+  rows: ReadonlyArray<HostTick>;
+  globals: ReadonlyArray<GlobalsTick>;
 };
 
 type BaselineParts = {
@@ -88,9 +117,20 @@ export function startAggregate(
   live: LiveSeries<Schema>,
   broadcast: (frame: string) => void,
   opts: AggregateOptions = {},
-): { stop: () => void } {
+): {
+  stop: () => void;
+  /**
+   * Snapshot history for the WS-on-connect frame. Returns the
+   * currently-retained `HostTick`s and `GlobalsTick`s. Both arrays
+   * are sorted by `ts`. Server.ts calls this when a `/live-agg`
+   * client connects so the dashboard sees the chart's back-window
+   * already filled instead of waiting ~5 minutes for it to fill in.
+   */
+  getSnapshotHistory: () => SnapshotHistory;
+} {
   const tickMs = opts.tickMs ?? 200;
   const thresholds = opts.thresholds ?? DEFAULT_AGGREGATE_THRESHOLDS;
+  const historyMaxAgeMs = opts.historyMaxAgeMs ?? DEFAULT_HISTORY_MAX_AGE_MS;
   const seq = Sequence.every(`${tickMs}ms`);
   const trigger = Trigger.clock(seq);
 
@@ -201,6 +241,41 @@ export function startAggregate(
   let lastEmittedTs = -1;
   let scheduled = false;
 
+  // Snapshot-history rings. Per-emit, every row + the globals tick
+  // get appended; eviction advances a head index (no `Array.shift`
+  // hot path — same amortised-O(1) pattern pond 0.15.2 adopted on
+  // its own deques). Periodic compaction reclaims the dead prefix
+  // when it grows past half the array; consumers only see the live
+  // tail via `getSnapshotHistory()`.
+  const historyRows: HostTick[] = [];
+  const historyGlobals: GlobalsTick[] = [];
+  let historyRowsHead = 0;
+  let historyGlobalsHead = 0;
+  const historyDisabled = historyMaxAgeMs <= 0;
+  const evictHistory = (cutoffTs: number): void => {
+    if (historyDisabled) return;
+    while (
+      historyRowsHead < historyRows.length &&
+      historyRows[historyRowsHead].ts < cutoffTs
+    ) {
+      historyRowsHead += 1;
+    }
+    if (historyRowsHead > historyRows.length / 2) {
+      historyRows.splice(0, historyRowsHead);
+      historyRowsHead = 0;
+    }
+    while (
+      historyGlobalsHead < historyGlobals.length &&
+      historyGlobals[historyGlobalsHead].ts < cutoffTs
+    ) {
+      historyGlobalsHead += 1;
+    }
+    if (historyGlobalsHead > historyGlobals.length / 2) {
+      historyGlobals.splice(0, historyGlobalsHead);
+      historyGlobalsHead = 0;
+    }
+  };
+
   const scheduleEmit = (): void => {
     if (scheduled) return;
     scheduled = true;
@@ -240,6 +315,17 @@ export function startAggregate(
       };
       broadcast(encode(msg));
       pendingByTs.delete(ts);
+
+      // Mirror into the snapshot-history ring. Append-then-evict
+      // (not evict-then-append) so a tick that's at the very edge
+      // of the retention window still gets one emit slot before
+      // sliding off — matches the WIRE.md "snapshot is the most
+      // recent N ticks" semantic.
+      if (!historyDisabled) {
+        for (const row of rows) historyRows.push(row);
+        historyGlobals.push(globals);
+        evictHistory(ts - historyMaxAgeMs);
+      }
     }
   };
 
@@ -318,7 +404,15 @@ export function startAggregate(
       offBatch();
       offEvict();
       pendingByTs.clear();
+      historyRows.length = 0;
+      historyGlobals.length = 0;
+      historyRowsHead = 0;
+      historyGlobalsHead = 0;
     },
+    getSnapshotHistory: (): SnapshotHistory => ({
+      rows: historyRows.slice(historyRowsHead),
+      globals: historyGlobals.slice(historyGlobalsHead),
+    }),
   };
 }
 

@@ -259,8 +259,7 @@ export function Chart({
                     cy={props.cy}
                     r={d.radius ?? 2.5}
                     fill={d.color}
-                    stroke="white"
-                    strokeWidth={0.8}
+                    fillOpacity={0.85}
                   />
                 )
               }

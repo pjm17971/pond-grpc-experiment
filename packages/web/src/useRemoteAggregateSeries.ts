@@ -67,11 +67,49 @@ export function applyAggregateFrame(
 }
 
 /**
- * Sum of `cpu_n` across every row in an aggregate frame — i.e. how
- * many raw events the aggregator folded into this single frame.
- * Useful for the dashboard's compression-ratio readout: aggregate
- * frame count vs raw-event count tells you how much wire traffic the
- * tick clock is saving vs the per-event firehose.
+ * Drop rows whose `ts` is at or before the LiveSeries' current tail.
+ * Idempotency guard for snapshot frames received on reconnect: pond's
+ * `LiveSeries` defaults to strict ordering, so `pushJson([row_older
+ * _than_tail, ...])` throws on the first out-of-order row. The step-8
+ * snapshot ships a 5m backfill on every connect — including reconnects
+ * after the buffer already has data — so this filter is the difference
+ * between a clean reconnect and the dashboard freezing on its next
+ * websocket flap.
+ *
+ * Filter rule: keep `row.ts > latestTs`. Rows at the boundary `ts ===
+ * latestTs` are dropped because the existing buffer already represents
+ * the same tick and pond's same-key insertion would double-count
+ * across hosts. On first connect the buffer is empty and `latestTs`
+ * is `undefined` — every row passes through.
+ *
+ * Used for both the LiveSeries push and the per-host latest map so
+ * stale snapshot rows can't stomp fresher data accumulated before the
+ * reconnect either.
+ */
+export function selectNewerRows(
+  rows: ReadonlyArray<HostTick>,
+  latestTs: number | undefined,
+): ReadonlyArray<HostTick> {
+  if (latestTs === undefined) return rows;
+  const out: HostTick[] = [];
+  for (const row of rows) {
+    if (row.ts > latestTs) out.push(row);
+  }
+  return out;
+}
+
+/**
+ * Sum of `cpu_n` across every row in an aggregate frame — i.e. the
+ * total bucket density represented in this frame. **Not the same as
+ * "raw events ingested for this tick"**: each raw event contributes
+ * to `cpu_n` for ~300 frames (1m baseline window × 5 fps), so this
+ * sum runs ~300× higher than the per-tick raw-event delta. Earlier
+ * versions of the dashboard's compression readout misread the two
+ * as equivalent and reported inflated numbers; the dashboard now
+ * sources the true per-frame raw-event count from
+ * `globals.events_ingested_total` deltas instead. This helper
+ * stays for diagnostic / test use — bucket density is a real
+ * signal, just not "raw events per frame".
  */
 export function sumFrameCpuN(msg: AggregateWireMsg): number {
   let total = 0;
@@ -80,18 +118,37 @@ export function sumFrameCpuN(msg: AggregateWireMsg): number {
 }
 
 /**
- * Running counters for the aggregate stream's compression ratio.
- * Tracked since the most recent (re)connect; reset to zero on URL
- * change. WS reconnects continue accumulating across the gap rather
- * than resetting — the producer's host load is the same load,
- * regardless of whether the dashboard's socket flapped.
+ * Running counters for the aggregate stream's true compression ratio.
+ * Tracked since this dashboard's first frame; reset to zero on URL
+ * change. WS reconnects continue accumulating across the gap (the
+ * aggregator's `events_ingested_total` is monotonic across the
+ * dashboard's reconnects); a true aggregator restart is detected
+ * via the counter going backwards and re-anchors.
+ *
+ * **Earlier versions used `cpu_n` sums** (the bucket count over the
+ * 1m baseline window) and reported headline numbers like "418k raw
+ * events folded into latest frame" — which were ~300× over the
+ * actual per-tick raw-event count, because every event contributes
+ * to ~300 frames worth of `cpu_n` (1m window × 5 fps). Those
+ * numbers told a real story (sum-of-bucket-density per frame) but
+ * read as the wire's compression ratio, which they weren't. The
+ * counters now anchor to `globals.events_ingested_total` deltas so
+ * "raw events per frame" reads as actual ingest density.
  */
 export type AggregateCounters = {
-  /** `cpu_n` sum across rows of the most recent aggregate-append. */
+  /**
+   * Raw events ingested between this frame and the previous one
+   * (`globals.events_ingested_total` delta). At a steady gRPC ingest
+   * of 7000/sec with 5 fps tick frames, this reads ~1400.
+   */
   latestFrameEvents: number;
   /** Aggregate-append frames received since connect. */
   totalFrames: number;
-  /** Cumulative `cpu_n` sum across every aggregate-append received. */
+  /**
+   * Raw events ingested since this dashboard's first frame (so
+   * `totalEvents / totalFrames` is the average raw events per
+   * frame, the true wire compression ratio).
+   */
   totalEvents: number;
 };
 
@@ -186,6 +243,11 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
     // come from the wire on every frame so we don't reset them
     // explicitly — the next aggregate-append will overwrite.
     setCounters(ZERO_COUNTERS);
+    // Per-effect-run anchors for the true-compression counter.
+    // Reset alongside `setCounters(ZERO_COUNTERS)` because they
+    // share the URL's lifecycle.
+    let initialEventsIngested: number | null = null;
+    let prevEventsIngested: number | null = null;
     let cancelled = false;
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -227,8 +289,22 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
         // Same convert-at-the-boundary pattern the raw `applyFrame`
         // uses; pond validates each row against `aggregateSchema` and
         // throws on shape drift.
-        if (msg.rows.length > 0) {
-          liveSeries.pushJson(msg.rows.map(tickToRow));
+        //
+        // Filter against the LiveSeries tail before pushing. Step 8's
+        // snapshot frame ships a 5m backfill — on reconnect after the
+        // buffer already has data, the snapshot starts older than the
+        // tail and pond's strict-ordering `pushJson` would throw on
+        // the first row. `selectNewerRows` drops the overlapping
+        // prefix so the push is idempotent across reconnects. Same
+        // filter feeds the per-host latest map so a stale snapshot
+        // row can't stomp a fresher tick we already received.
+        // `last()?.key().timestampMs()` is the codebase's established
+        // tail-peek (mirrors `useDashboardData`'s `tEnd` derivation)
+        // and works on every pond-ts version this branch targets.
+        const latestTs = liveSeries.last()?.key().timestampMs();
+        const newerRows = selectNewerRows(msg.rows, latestTs);
+        if (newerRows.length > 0) {
+          liveSeries.pushJson(newerRows.map(tickToRow));
         }
         // Functional update — `prev` is always the freshest state in
         // React's queue. Reading `latestPerHost` from a closure or a
@@ -236,14 +312,49 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
         // overwriting the other's contribution). `applyAggregateFrame`
         // returns the same Map reference on empty rows, so React's
         // shallow-state equality skips the re-render in that case.
-        setLatestPerHost((prev) => applyAggregateFrame(prev, msg));
+        const filteredMsg = { ...msg, rows: newerRows } as AggregateWireMsg;
+        setLatestPerHost((prev) => applyAggregateFrame(prev, filteredMsg));
         if (msg.type === 'aggregate-append') {
-          const frameEvents = sumFrameCpuN(msg);
-          setCounters((prev) => ({
-            latestFrameEvents: frameEvents,
-            totalFrames: prev.totalFrames + 1,
-            totalEvents: prev.totalEvents + frameEvents,
-          }));
+          // True per-frame raw-event delta from globals. Falls back
+          // to 0 for pre-step-6 servers that don't ship `globals`
+          // (the counters then just report "0 raw events per
+          // frame", which is honest if uninformative — the right
+          // long-term answer is requiring globals on every frame).
+          const ingested = msg.globals?.events_ingested_total;
+          if (typeof ingested === 'number') {
+            // Aggregator restart detection: if the cumulative count
+            // goes backward, the aggregator was reset. Re-anchor.
+            if (
+              prevEventsIngested !== null &&
+              ingested < prevEventsIngested
+            ) {
+              initialEventsIngested = ingested;
+              prevEventsIngested = ingested;
+            }
+            if (initialEventsIngested === null) {
+              initialEventsIngested = ingested;
+            }
+            const frameEvents =
+              prevEventsIngested === null
+                ? 0
+                : ingested - prevEventsIngested;
+            prevEventsIngested = ingested;
+            const eventsThisSession = ingested - initialEventsIngested;
+            setCounters((prev) => ({
+              latestFrameEvents: frameEvents,
+              totalFrames: prev.totalFrames + 1,
+              totalEvents: eventsThisSession,
+            }));
+          } else {
+            // No globals on the wire — count frames only, leave
+            // event counts at zero so the displayed compression
+            // reads as "—" rather than a fabricated number.
+            setCounters((prev) => ({
+              latestFrameEvents: 0,
+              totalFrames: prev.totalFrames + 1,
+              totalEvents: prev.totalEvents,
+            }));
+          }
           if (msg.globals) {
             setLatestGlobals(msg.globals);
           }

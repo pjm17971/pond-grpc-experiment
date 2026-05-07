@@ -8,6 +8,7 @@ import {
 } from '@pond-experiment/shared';
 import {
   applyAggregateFrame,
+  selectNewerRows,
   sumFrameCpuN,
   tickToRow,
 } from './useRemoteAggregateSeries';
@@ -324,6 +325,107 @@ describe('tickToRow', () => {
     expect(events[1].get('window_age_seconds')).toBeCloseTo(30.2, 6);
     expect(events[1].get('cpu_min')).toBeUndefined();
     expect(events[1].get('cpu_max')).toBeUndefined();
+  });
+});
+
+describe('selectNewerRows', () => {
+  it('returns the input unchanged when latestTs is undefined (first connect)', () => {
+    const rows = [
+      mkTick('api-1', 1_000, 0.5, 2),
+      mkTick('api-2', 1_000, 0.6, 3),
+    ];
+    const out = selectNewerRows(rows, undefined);
+    expect(out).toBe(rows);
+  });
+
+  it('drops rows at or before the tail (boundary inclusive)', () => {
+    const rows = [
+      mkTick('api-1', 1_000, 0.5, 2),
+      mkTick('api-2', 1_000, 0.6, 3),
+      mkTick('api-1', 1_200, 0.55, 2),
+      mkTick('api-2', 1_200, 0.65, 3),
+    ];
+    const out = selectNewerRows(rows, 1_000);
+    expect(out.length).toBe(2);
+    expect(out.every((r) => r.ts === 1_200)).toBe(true);
+  });
+
+  it('returns empty when every row is at or before the tail', () => {
+    const rows = [
+      mkTick('api-1', 800, 0.5, 2),
+      mkTick('api-2', 1_000, 0.6, 3),
+    ];
+    const out = selectNewerRows(rows, 1_000);
+    expect(out).toEqual([]);
+  });
+
+  it('snapshot-after-data: full snapshot replays the buffer; helper drops the overlap', () => {
+    // Reproduces the Codex adversarial-review scenario directly: a
+    // LiveSeries with prior data receives a snapshot whose backfill
+    // starts *before* the buffer's tail. Without the filter,
+    // `liveSeries.pushJson(snapshot.rows.map(tickToRow))` throws on
+    // the first out-of-order row. With the filter, the push is a
+    // no-op (or a tiny tail extension) and the buffer is unchanged.
+    const live = new LiveSeries({
+      name: 'agg-test',
+      schema: aggregateSchema,
+      retention: { maxAge: '6m' },
+    });
+    const tail: HostTick[] = [];
+    for (let ts = 1_000; ts <= 2_000; ts += 200) {
+      tail.push(mkTick('api-1', ts, 0.5, 10));
+      tail.push(mkTick('api-2', ts, 0.6, 10));
+    }
+    live.pushJson(tail.map(tickToRow));
+    const tailTs = live.last()?.key().timestampMs();
+    expect(tailTs).toBe(2_000);
+
+    // Reconnect snapshot: 5m of backfill ending at 1_800. Some rows
+    // are older than the buffer's tail (1_800 < 2_000), so a raw
+    // pushJson would throw `out of order`. The filter drops them.
+    const snapshotRows: HostTick[] = [];
+    for (let ts = 600; ts <= 1_800; ts += 200) {
+      snapshotRows.push(mkTick('api-1', ts, 0.5, 10));
+      snapshotRows.push(mkTick('api-2', ts, 0.6, 10));
+    }
+    const filtered = selectNewerRows(snapshotRows, tailTs);
+    expect(filtered).toEqual([]);
+    expect(() => live.pushJson(filtered.map(tickToRow))).not.toThrow();
+    expect(live.last()?.key().timestampMs()).toBe(2_000);
+  });
+
+  it('snapshot-after-data: tail extension survives when the snapshot reaches further than the buffer', () => {
+    // Same shape, but the snapshot's tail is past the buffer's tail
+    // (clock progressed during the WS gap). Filter keeps only the
+    // strictly-newer rows; pushJson succeeds and extends the buffer.
+    const live = new LiveSeries({
+      name: 'agg-test',
+      schema: aggregateSchema,
+      retention: { maxAge: '6m' },
+    });
+    live.pushJson(
+      [
+        mkTick('api-1', 1_000, 0.5, 10),
+        mkTick('api-1', 1_200, 0.5, 10),
+      ].map(tickToRow),
+    );
+    expect(live.last()?.key().timestampMs()).toBe(1_200);
+
+    const snapshotRows = [
+      mkTick('api-1', 800, 0.5, 10), // overlap, drop
+      mkTick('api-1', 1_000, 0.5, 10), // boundary, drop
+      mkTick('api-1', 1_200, 0.5, 10), // boundary, drop
+      mkTick('api-1', 1_400, 0.55, 10), // newer, keep
+      mkTick('api-1', 1_600, 0.6, 10), // newer, keep
+    ];
+    const filtered = selectNewerRows(
+      snapshotRows,
+      live.last()?.key().timestampMs(),
+    );
+    expect(filtered.length).toBe(2);
+    expect(() => live.pushJson(filtered.map(tickToRow))).not.toThrow();
+    expect(live.last()?.key().timestampMs()).toBe(1_600);
+    expect(live.length).toBe(4);
   });
 });
 

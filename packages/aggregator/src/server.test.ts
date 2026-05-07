@@ -193,7 +193,12 @@ describe('/live-agg WS (M3.5 aggregate stream)', () => {
     const snap = received[0] as AggregateSnapshotMsg;
     expect(snap.type).toBe('aggregate-snapshot');
     expect(snap.thresholds).toEqual(DEFAULT_AGGREGATE_THRESHOLDS);
-    expect(snap.rows).toEqual([]);
+    // Step 8: snapshot may carry history. Connecting immediately
+    // after server start means the history ring is usually empty,
+    // but a tick boundary that fires between server start and the
+    // WS handshake can populate it. Either is correct — assert the
+    // shape, not the length.
+    expect(Array.isArray(snap.rows)).toBe(true);
 
     const append = received.find(
       (m) => m.type === 'aggregate-append',

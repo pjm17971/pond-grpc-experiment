@@ -75,28 +75,12 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const clients = new Set<WebSocket>();
   const aggClients = new Set<WebSocket>();
 
-  wss.on('connection', (socket, req) => {
-    // Tolerate `?foo=1` in case a client appends query params later
-    // for cache busting / debug. Path is the dispatch key.
-    if (pathnameOf(req.url) === '/live-agg') {
-      aggClients.add(socket);
-      const snap: AggregateSnapshotMsg = {
-        type: 'aggregate-snapshot',
-        thresholds: DEFAULT_AGGREGATE_THRESHOLDS,
-        rows: [],
-      };
-      socket.send(encode(snap));
-      socket.on('close', () => aggClients.delete(socket));
-      socket.on('error', () => aggClients.delete(socket));
-      return;
-    }
-    // Default `/live` — verifyClient already rejected anything else.
-    clients.add(socket);
-    socket.send(encode(buildSnapshot(opts.live)));
-    socket.on('close', () => clients.delete(socket));
-    socket.on('error', () => clients.delete(socket));
-  });
-
+  // Start the aggregator first — its `getSnapshotHistory` getter
+  // closes over the running history ring and we want the WS
+  // connection handler to use it. Order doesn't strictly matter
+  // (fastify doesn't accept connections until `listen` runs below),
+  // but keeping it explicit avoids any "accept before bind"
+  // confusion if this code grows.
   const stopFanout = startFanout(opts.live, (frame) => {
     let openCount = 0;
     for (const c of clients) {
@@ -110,7 +94,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     if (openCount > 0) recordBytesSent(frame.length * openCount);
   });
 
-  const { stop: stopAggregate } = startAggregate(
+  const { stop: stopAggregate, getSnapshotHistory } = startAggregate(
     opts.live,
     (frame) => {
       let openCount = 0;
@@ -124,6 +108,36 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     },
     { tickMs: opts.aggregateTickMs },
   );
+
+  wss.on('connection', (socket, req) => {
+    // Tolerate `?foo=1` in case a client appends query params later
+    // for cache busting / debug. Path is the dispatch key.
+    if (pathnameOf(req.url) === '/live-agg') {
+      aggClients.add(socket);
+      // Step 8 — snapshot history. The aggregator maintains a ~5m
+      // ring of recent `HostTick`s + `GlobalsTick`s; on connect we
+      // ship that tail so the dashboard renders the full back-window
+      // immediately rather than filling in over time. Empty arrays
+      // for the very first client (aggregator just started, no
+      // history yet); steady-state ships ~12k rows + ~1.5k globals.
+      const history = getSnapshotHistory();
+      const snap: AggregateSnapshotMsg = {
+        type: 'aggregate-snapshot',
+        thresholds: DEFAULT_AGGREGATE_THRESHOLDS,
+        rows: history.rows,
+        globals: history.globals,
+      };
+      socket.send(encode(snap));
+      socket.on('close', () => aggClients.delete(socket));
+      socket.on('error', () => aggClients.delete(socket));
+      return;
+    }
+    // Default `/live` — verifyClient already rejected anything else.
+    clients.add(socket);
+    socket.send(encode(buildSnapshot(opts.live)));
+    socket.on('close', () => clients.delete(socket));
+    socket.on('error', () => clients.delete(socket));
+  });
 
   return {
     stop: async () => {
