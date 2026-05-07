@@ -22,6 +22,13 @@ type Props = {
  */
 export function CpuSection({ data, chartOpts, onChartOptsChange }: Props) {
   const { showBands, showRaw, sigma } = chartOpts;
+  // Threshold-mode alerts and the rolling/EMA stats are sourced from
+  // the raw `/live` stream. While that's retired (this branch),
+  // anomaly mode is the only working mode and the rolling/EMA stats
+  // are hidden to avoid showing misleading "—" placeholders. Step 9
+  // re-derives those surfaces from the aggregate stream's globals
+  // and per-host rolling output and flips `liveStreamEnabled` back.
+  const { liveStreamEnabled } = data;
   const update = (patch: Partial<ChartOpts>) =>
     onChartOptsChange({ ...chartOpts, ...patch });
 
@@ -30,22 +37,26 @@ export function CpuSection({ data, chartOpts, onChartOptsChange }: Props) {
       <header className="section-header">
         <h2>CPU</h2>
         <div className="section-stats">
-          <Stat
-            label="Rolling 1m avg"
-            value={
-              data.rollingCpu != null
-                ? `${(data.rollingCpu * 100).toFixed(1)}%`
-                : '—'
-            }
-          />
-          <Stat
-            label="EMA trend"
-            value={
-              data.trendCpu != null
-                ? `${(data.trendCpu * 100).toFixed(1)}%`
-                : '—'
-            }
-          />
+          {liveStreamEnabled && (
+            <>
+              <Stat
+                label="Rolling 1m avg"
+                value={
+                  data.rollingCpu != null
+                    ? `${(data.rollingCpu * 100).toFixed(1)}%`
+                    : '—'
+                }
+              />
+              <Stat
+                label="EMA trend"
+                value={
+                  data.trendCpu != null
+                    ? `${(data.trendCpu * 100).toFixed(1)}%`
+                    : '—'
+                }
+              />
+            </>
+          )}
           <Stat
             label={showBands ? 'Anomalies' : 'Alerts'}
             value={showBands ? data.cpuAnomalyCount : data.cpuAlertCount}
@@ -65,14 +76,21 @@ export function CpuSection({ data, chartOpts, onChartOptsChange }: Props) {
           yMax={0.9}
         />
         <div className="chart-toggles">
-          <label className="toggle">
-            <input
-              type="checkbox"
-              checked={showBands}
-              onChange={(e) => update({ showBands: e.target.checked })}
-            />
-            Show ±{sigma.toFixed(1)}σ bands
-          </label>
+          {liveStreamEnabled ? (
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={showBands}
+                onChange={(e) => update({ showBands: e.target.checked })}
+              />
+              Show ±{sigma.toFixed(1)}σ bands
+            </label>
+          ) : (
+            // Threshold mode would render alerts/bars off the empty
+            // /live filter — hide the toggle so users can't switch
+            // into a broken mode. The σ slider stays.
+            <span className="toggle-static">±{sigma.toFixed(1)}σ bands</span>
+          )}
           <input
             type="range"
             min={0.5}
@@ -96,19 +114,17 @@ export function CpuSection({ data, chartOpts, onChartOptsChange }: Props) {
             Show min/max envelope
           </label>
         </div>
-        <BarChart
-          title={
-            showBands
-              ? 'Anomalies — 15s buckets'
-              : 'High CPU alerts — 15s buckets'
-          }
-          emptyLabel={showBands ? 'no anomalies yet' : 'no alerts yet'}
-          bars={data.bars}
-          tStart={data.tStart}
-          tEnd={data.tEnd}
-          width={720}
-          height={100}
-        />
+        {showBands && (
+          <BarChart
+            title="Anomalies — 15s buckets"
+            emptyLabel="no anomalies yet"
+            bars={data.bars}
+            tStart={data.tStart}
+            tEnd={data.tEnd}
+            width={720}
+            height={100}
+          />
+        )}
       </div>
     </section>
   );

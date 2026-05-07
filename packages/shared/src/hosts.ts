@@ -13,6 +13,8 @@ export const HOSTS = [
   'api-6',
   'api-7',
   'api-8',
+  'api-9',
+  'api-10',
 ] as const;
 
 export type HostId = (typeof HOSTS)[number];

@@ -20,11 +20,29 @@
       "port": 50051
     },
     {
+      "name": "producer-firehose",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        ". ~/.nvm/nvm.sh && nvm use 22 --silent && EVENTS_PER_SEC=10000 HOST_COUNT=80 pnpm dev:producer"
+      ],
+      "port": 50051
+    },
+    {
       "name": "aggregator",
       "runtimeExecutable": "bash",
       "runtimeArgs": [
         "-c",
         ". ~/.nvm/nvm.sh && nvm use 22 --silent && pnpm dev:aggregator"
+      ],
+      "port": 8080
+    },
+    {
+      "name": "aggregator-firehose",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        ". ~/.nvm/nvm.sh && nvm use 22 --silent && NODE_OPTIONS='--max-old-space-size=8192' pnpm dev:aggregator"
       ],
       "port": 8080
     }

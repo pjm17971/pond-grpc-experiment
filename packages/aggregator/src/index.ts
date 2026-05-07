@@ -12,19 +12,23 @@ const PRODUCER_URL = process.env.PRODUCER_URL ?? '127.0.0.1:50051';
 
 const stopGc = startGcObserver();
 
-// Retention sized to the fused rolling's longest window (1m baseline)
-// plus headroom for boundary alignment + microtask drain. Earlier
-// drafts used 6m, which over-provisioned by 4× and at firehose rates
-// (5k+ events/sec) drove the aggregator's heap into V8's 2GB limit
-// after ~25 minutes of uptime. Nothing downstream needs >1m of raw
-// retention — the per-host fused rolling is the only consumer of
-// `live`'s contents and its longest window is 1m. The aggregate-
-// stream's snapshot history (M3.5 step 8) will live in a separate
-// bounded ring keyed off `HostTick`s, not raw events.
+// Retention sized as a small ingest buffer, NOT the rolling's
+// window store. Pond's `LivePartitionedFusedRolling` maintains its
+// own per-partition deque (with the head-index amortised eviction
+// added in 0.15.2), so the rolling's 1m baseline keeps emitting
+// correctly even after `live` evicts the underlying events.
+//
+// History: 6m → 90s (step 7 follow-up, fixed an OOM at moderate
+// rates) → 30s (this commit, fixes an OOM at firehose). At ~70k
+// events/sec a 90s retention puts ~6.3M events × ~600 bytes =
+// ~3.8GB into the live deque alone, which pushed V8 past its 4GB
+// heap ceiling. 30s caps live retention at ~2.1M × ~600 = ~1.3GB,
+// leaving headroom for the rolling state, snapshot history, and
+// transient allocations.
 const live = new LiveSeries({
   name: 'metrics',
   schema,
-  retention: { maxAge: '90s' },
+  retention: { maxAge: '30s' },
 });
 
 const stopIngest = startIngest(live, { producerUrl: PRODUCER_URL });
