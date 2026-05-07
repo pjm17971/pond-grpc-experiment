@@ -80,6 +80,8 @@ type BaselineParts = {
   requests_sum: number;
   requests_n: number;
   window_age_seconds: number;
+  cpu_min: number | null;
+  cpu_max: number | null;
 };
 
 export function startAggregate(
@@ -118,6 +120,12 @@ export function startAggregate(
         },
         [`${tickMs}ms`]: {
           cpu_samples: { from: 'cpu', using: 'samples' },
+          // Step 7 — per-tick CPU extrema for the dashboard's "show
+          // min/max envelope" overlay. Same window as `cpu_samples`,
+          // built-in min/max reducers; both emit undefined for an
+          // empty slice (defensively coerced to null in `assembleTick`).
+          cpu_min: { from: 'cpu', using: 'min' },
+          cpu_max: { from: 'cpu', using: 'max' },
         },
       },
       { trigger },
@@ -245,6 +253,8 @@ export function startAggregate(
       const cpu_avg = e.get('cpu_avg');
       const cpu_sd = e.get('cpu_sd');
       const cpu_n = e.get('cpu_n');
+      const cpu_min = e.get('cpu_min');
+      const cpu_max = e.get('cpu_max');
       const requests_avg = e.get('requests_avg');
       const requests_sum = e.get('requests_sum');
       const requests_n = e.get('requests_n');
@@ -284,6 +294,8 @@ export function startAggregate(
             typeof requests_sum === 'number' ? requests_sum : 0,
           requests_n: typeof requests_n === 'number' ? requests_n : 0,
           window_age_seconds: windowAgeSec,
+          cpu_min: typeof cpu_min === 'number' ? cpu_min : null,
+          cpu_max: typeof cpu_max === 'number' ? cpu_max : null,
         },
         samples,
         thresholds,
@@ -360,6 +372,8 @@ function assembleTick(
     requests_sum: baseline.requests_sum,
     requests_n: baseline.requests_n,
     window_age_seconds: baseline.window_age_seconds,
+    cpu_min: baseline.cpu_min,
+    cpu_max: baseline.cpu_max,
   };
 }
 

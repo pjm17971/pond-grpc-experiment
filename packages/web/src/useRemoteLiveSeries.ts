@@ -76,12 +76,33 @@ export function applyFrame(live: LiveSeries<Schema>, msg: RawWireMsg): void {
 export function useRemoteLiveSeries(
   url: string,
   options: LiveSeriesOptions<Schema>,
-  hookOptions?: UseSnapshotOptions,
+  hookOptions?: UseSnapshotOptions & {
+    /**
+     * When `false`, skips the WebSocket connection entirely. The
+     * `LiveSeries` is still constructed (so consumers don't have to
+     * special-case a missing reference) but stays empty. Used by the
+     * dashboard during M3.5 step 9's `/live` retirement: chart paths
+     * have already migrated to `/live-agg`, and the raw stream's only
+     * remaining consumers (logs section, host-discovery, total-
+     * requests rollup) accept the resulting `undefined` / empty
+     * fallbacks gracefully. Default `true` (subscribe).
+     */
+    enabled?: boolean;
+  },
 ): [LiveSeries<Schema>, TimeSeries<Schema> | null, ConnectionStatus] {
+  const enabled = hookOptions?.enabled ?? true;
   const [live] = useState(() => new LiveSeries(options));
-  const [status, setStatus] = useState<ConnectionStatus>('connecting');
+  const [status, setStatus] = useState<ConnectionStatus>(
+    enabled ? 'connecting' : 'closed',
+  );
 
   useEffect(() => {
+    if (!enabled) {
+      // No WS, no fanout, no retention pressure. The `LiveSeries`
+      // mounted above stays empty for the component's lifetime.
+      setStatus('closed');
+      return;
+    }
     let cancelled = false;
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -135,7 +156,7 @@ export function useRemoteLiveSeries(
       if (reconnectTimer) clearTimeout(reconnectTimer);
       ws?.close();
     };
-  }, [url, live]);
+  }, [url, live, enabled]);
 
   const snapshot = useSnapshot(live, hookOptions);
   return [live, snapshot, status];

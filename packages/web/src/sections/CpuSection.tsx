@@ -85,16 +85,15 @@ export function CpuSection({ data, chartOpts, onChartOptsChange }: Props) {
             aria-label="band width in σ"
           />
           <label
-            className="toggle toggle-disabled"
-            title="Deferred to M3.5 step 7 — repurposed as 'show min/max' once cpu_min/cpu_max ship on /live-agg (per WIRE.md). The bands+smoothed line now source from the aggregate stream, so the per-event raw scatter overlay would create sparse rows in the chart's merged-by-ts data and break the band rendering."
+            className="toggle"
+            title="Per-tick CPU min/max envelope from the /live-agg wire's cpu_min and cpu_max columns. Adds two thin dashed lines per host tracing the 200ms-slice extrema — visible texture when the 1m smoothed line is flat (high event rates) and a finer-resolution view of within-tick variation."
           >
             <input
               type="checkbox"
               checked={showRaw}
               onChange={(e) => update({ showRaw: e.target.checked })}
-              disabled
             />
-            Show raw samples <span className="toggle-note">(coming back in step 7)</span>
+            Show min/max envelope
           </label>
         </div>
         <BarChart

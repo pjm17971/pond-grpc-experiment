@@ -65,6 +65,13 @@ export const baselineSchema = [
  * 60 once the window is full. Same value across hosts at a tick;
  * repeated per row to keep the chart's historical pipeline self-
  * describing.
+ *
+ * Step 7 adds `cpu_min` / `cpu_max` — per-tick (200ms) min/max of
+ * the `cpu` column. Drives the dashboard's "show min/max envelope"
+ * toggle (the WIRE.md repurpose of the legacy raw-samples scatter
+ * overlay) — gives the chart visible per-tick texture even when
+ * the 1m smoothed line is flat. Both `null` when the 200ms slice
+ * is empty (`n_current === 0`).
  */
 export const aggregateSchema = [
   { name: 'time', kind: 'time' },
@@ -79,6 +86,8 @@ export const aggregateSchema = [
   { name: 'requests_sum', kind: 'number' },
   { name: 'requests_n', kind: 'number' },
   { name: 'window_age_seconds', kind: 'number' },
+  { name: 'cpu_min', kind: 'number', required: false },
+  { name: 'cpu_max', kind: 'number', required: false },
 ] as const satisfies SeriesSchema;
 
 export type AggregateSchema = typeof aggregateSchema;

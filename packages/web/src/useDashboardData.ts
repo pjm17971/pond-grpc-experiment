@@ -140,10 +140,12 @@ export type DashboardData = {
 
 export function useDashboardData(args: DashboardArgs): DashboardData {
   const { disabledHosts, chartOpts } = args;
-  // `showRaw` is in `chartOpts` but unused here today — the raw-
-  // scatter overlay path is disabled (deferred to step 7 per WIRE.md).
-  // Re-introduce when step 7's cpu_min/cpu_max repurpose lands.
-  const { showBands, sigma } = chartOpts;
+  // `showRaw` controls the per-tick min/max envelope overlay on the
+  // CPU chart (step 7's repurpose of the legacy raw-samples toggle —
+  // WIRE.md "show min/max" pattern, sourced from `cpu_min`/`cpu_max`
+  // on the aggregate stream). When on, each enabled host's chart gets
+  // two extra thin lines tracing the per-tick CPU extrema.
+  const { showBands, showRaw, sigma } = chartOpts;
 
   // 1. LiveSeries — the single mutable buffer for ingest. Identical
   //    in shape to the M0 useLiveSeries call; the difference is the
@@ -153,15 +155,33 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //    same rows at the same moment. The third tuple slot is the
   //    WS lifecycle status — surfaces in the page summary as a
   //    connection indicator.
-  const [liveSeries, , connectionStatus] = useRemoteLiveSeries(
+  // Step 9 — `/live` is **disabled in the dashboard**. The raw
+  // firehose at ≥5k events/sec overflows the WebSocket receiver no
+  // matter how aggressively we shrink local retention; the only
+  // viable path is to stop subscribing. Every chart path already
+  // sources from `/live-agg`'s tick aggregates (steps 4–7); the
+  // remaining raw-stream consumers (rolling-CPU rollup, total-
+  // requests stat, EMA-trend across all hosts, threshold-mode high-
+  // CPU alert filter, last-20 events log) accept undefined/empty
+  // fallbacks and degrade gracefully. The `LiveSeries` is still
+  // mounted (its references are wired into the existing pipelines)
+  // but stays empty.
+  //
+  // The connection-status indicator now reflects `/live-agg`'s WS,
+  // not `/live` — that's the connection the dashboard actually
+  // depends on for any visible content.
+  const [liveSeries] = useRemoteLiveSeries(
     WS_URL,
     {
       name: 'metrics',
       schema,
-      retention: { maxAge: '6m' },
+      retention: { maxAge: '90s' },
     },
-    { throttle: 200 },
+    { throttle: 200, enabled: false },
   );
+  // The aggregate stream's connection status drives the page-summary
+  // indicator. Mapping is direct — `/live-agg`'s `ConnectionStatus`
+  // alphabet matches `/live`'s.
 
   // 1b. Aggregate stream — `/live-agg` mirror with the wire's
   //     per-host tick aggregates (cpu_avg, cpu_sd, cpu_n). Step 3
@@ -198,22 +218,22 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //    we can chain transforms on without worrying about live mutation.
   const timeSeries = useWindow(liveSeries, '5m', { throttle: 200 });
 
-  // 4. Host model: discovered live from the data via the `unique`
-  //    aggregator over the `host` column. Filtered through HOSTS so
+  // 4. Host model: discovered live from the data via the aggregate
+  //    stream's `latestPerHost` map (keys are the hosts that have
+  //    emitted at least one tick frame). Filtered through HOSTS so
   //    the canonical declaration order drives palette assignment —
   //    a host's color stays the same whatever order the data
   //    arrives in. Hosts not in HOSTS won't render until added
   //    there (M2's real producer may force this).
-  const { host: discoveredHosts } = useCurrent(
-    liveSeries,
-    { host: 'unique' },
-    { throttle: 500 },
-  );
+  //
+  //    Pre-step-9 this used `useCurrent(liveSeries, { host: 'unique' })`
+  //    over the raw stream. With /live disabled the discovery moves
+  //    to the aggregate stream — same hosts, same canonical
+  //    filtering, refreshed at the aggregate's tick cadence.
   const hosts = useMemo(() => {
-    if (!discoveredHosts || discoveredHosts.length === 0) return [];
-    const seen = new Set(discoveredHosts);
-    return HOSTS.filter((h) => seen.has(h));
-  }, [discoveredHosts]);
+    if (aggregate.latestPerHost.size === 0) return [];
+    return HOSTS.filter((h) => aggregate.latestPerHost.has(h));
+  }, [aggregate.latestPerHost]);
   const enabledHosts = useMemo(() => {
     const set = new Set<string>();
     for (const h of hosts) if (!disabledHosts.has(h)) set.add(h);
@@ -243,8 +263,15 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     { tail: '1m', throttle: 200 },
   );
 
-  // 6. Time axis pinned to the latest event with a fixed back-window.
-  const tEnd = timeSeries?.last()?.key().timestampMs();
+  // 6. Time axis pinned to the latest tick with a fixed back-window.
+  //    Step 9: sources from the aggregate snapshot (every chart path
+  //    already comes from /live-agg). Falls back to the timeSeries
+  //    derived from /live only if the aggregate hasn't produced a
+  //    frame yet — useful when /live is re-enabled for debugging,
+  //    no-op when disabled.
+  const tEnd =
+    aggSnapshot?.last()?.key().timestampMs() ??
+    timeSeries?.last()?.key().timestampMs();
   const tStart = tEnd != null ? tEnd - WINDOW_MS : undefined;
 
   // 7. CPU section — fully aggregate-driven now. Bands + smoothed
@@ -293,6 +320,12 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       const lower: ChartPoint[] = [];
       const smoothPoints: ChartPoint[] = [];
       const anomalyDots: ChartPoint[] = [];
+      // Step 7 — per-tick CPU min/max envelope. Populated only when
+      // `showRaw` is on (the toggle's repurposed semantic). Each row's
+      // `cpu_min`/`cpu_max` cell is the extremum of the cpu column over
+      // the row's 200ms slice, or null when the slice is empty.
+      const minPoints: ChartPoint[] = [];
+      const maxPoints: ChartPoint[] = [];
       let lastAvg: number | undefined;
 
       // `cpu_n >= MIN_SAMPLES` is the gate-on-render mask, equivalent
@@ -342,16 +375,32 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
           upper.push({ ts: r.ts, value: undefined });
           lower.push({ ts: r.ts, value: undefined });
         }
+        // Min/max envelope tracks cpu_min/cpu_max on every row,
+        // independent of the cpu_n MIN_SAMPLES gate. The envelope is a
+        // direct readout of the per-tick 200ms slice — it's fine even
+        // when the 1m baseline gate is closed (early connect), and
+        // omitting the gap there means the line breaks with the
+        // smoothed line on a quiet host. We DO gate on the slice
+        // having content (n_current >= 1), since min/max of an empty
+        // slice is null on the wire.
+        if (showRaw) {
+          const sliceFilled = (r.n_current ?? 0) >= 1;
+          minPoints.push({
+            ts: r.ts,
+            value:
+              sliceFilled && typeof r.cpu_min === 'number'
+                ? r.cpu_min
+                : undefined,
+          });
+          maxPoints.push({
+            ts: r.ts,
+            value:
+              sliceFilled && typeof r.cpu_max === 'number'
+                ? r.cpu_max
+                : undefined,
+          });
+        }
       }
-
-      // The raw-samples scatter overlay (`showRaw`) is deferred — see
-      // WIRE.md: with aggregate-driven bands/smoothed-line on a 200ms
-      // tick clock, mixing in raw events at ~10ms cadence would
-      // introduce sparse rows in the chart's merged-by-ts data and
-      // break `connectNulls={false}` on the smoothed line + bands.
-      // The dashboard agent's repurpose-as-show-min/max plan lands in
-      // step 7 once `cpu_min`/`cpu_max` are on the wire. The toggle
-      // stays in UI but is a no-op until then.
 
       series.push({
         name: host,
@@ -367,13 +416,34 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
           allAnomalies.push(...anomalyDots);
         }
       }
+      if (showRaw && (minPoints.length >= 2 || maxPoints.length >= 2)) {
+        // Two thin host-coloured lines tracing the 200ms-slice
+        // extrema. Hidden from the legend (the host's smoothed line
+        // already represents it; this is overlay context). Slightly
+        // transparent + dashed so the smoothed line stays the
+        // primary visual.
+        series.push({
+          name: `${host} max`,
+          color,
+          points: maxPoints,
+          dashed: true,
+          width: 1,
+          opacity: 0.55,
+          hideFromLegend: true,
+        });
+        series.push({
+          name: `${host} min`,
+          color,
+          points: minPoints,
+          dashed: true,
+          width: 1,
+          opacity: 0.55,
+          hideFromLegend: true,
+        });
+      }
     }
 
     return { series, bands, dots, allAnomalies };
-    // `showRaw` and `timeSeries` are intentionally NOT deps: the
-    // CPU section is fully aggregate-driven now (step 4 retired the
-    // raw baseline pipeline). Re-introduce when step 7's
-    // cpu_min/cpu_max repurpose brings the raw overlay back.
   }, [
     aggSnapshot,
     aggregateThresholds,
@@ -381,6 +451,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     enabledHosts,
     hostColors,
     showBands,
+    showRaw,
     sigma,
   ]);
 
@@ -451,8 +522,42 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     if (showBands) {
       // Band mode: round-trip the flat anomaly points back into a tiny
       // TimeSeries via `fromPoints` so we can use pond's bucketing.
+      //
+      // **Sort first.** `cpu.allAnomalies` is built by appending each
+      // host's dots in chronological order, but across hosts the
+      // concatenated array isn't sorted — host A's dots at ts T1, T2
+      // come before host B's at T1', T2' even when T1' < T2.
+      // `TimeSeries.fromPoints` requires non-decreasing timestamps
+      // and throws "row N is out of order" otherwise. Pre-step-6 the
+      // simulator's IID noise rarely produced anomalies on multiple
+      // hosts in the same window, so the cross-host overlap was
+      // exotic; step 6's burst dynamics make it common (an active
+      // burst on host A and host B at the same tick produces
+      // interleaved timestamps after concatenation).
+      //
+      // **Cap first.** The natural ceiling on `cpu.allAnomalies` is
+      // 5m × 5 fps × N_hosts × 2 dots ≈ 24k entries even at maximum
+      // anomaly density. If we're handed an array meaningfully
+      // larger than that, something upstream is broken (LiveSeries
+      // not enforcing retention because React is in a render-error
+      // retry loop, etc.) and we should refuse rather than feed
+      // megabytes into `fromPoints` and OOM the tab. Slice to the
+      // most recent `MAX_ANOMALIES` entries — the bar chart only
+      // shows the visible-time-axis window anyway.
       if (cpu.allAnomalies.length === 0) return [];
-      const anomalyTs = TimeSeries.fromPoints(cpu.allAnomalies, {
+      const MAX_ANOMALIES = 50_000;
+      const trimmed =
+        cpu.allAnomalies.length > MAX_ANOMALIES
+          ? cpu.allAnomalies.slice(-MAX_ANOMALIES)
+          : cpu.allAnomalies;
+      if (cpu.allAnomalies.length > MAX_ANOMALIES) {
+        // Loud signal in dev — if this fires we want to know.
+        console.warn(
+          `[dashboard] cpu.allAnomalies has ${cpu.allAnomalies.length} entries; trimming to last ${MAX_ANOMALIES}`,
+        );
+      }
+      const sortedAnomalies = [...trimmed].sort((a, b) => a.ts - b.ts);
+      const anomalyTs = TimeSeries.fromPoints(sortedAnomalies, {
         name: 'anomalies',
         schema: [
           { name: 'time', kind: 'time' },
@@ -554,7 +659,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     totalRequests,
     eventsPerSec,
     evictedTotal,
-    connectionStatus,
+    connectionStatus: aggregate.status,
     hosts,
     enabledHosts,
     hostColors,

@@ -12,10 +12,19 @@ const PRODUCER_URL = process.env.PRODUCER_URL ?? '127.0.0.1:50051';
 
 const stopGc = startGcObserver();
 
+// Retention sized to the fused rolling's longest window (1m baseline)
+// plus headroom for boundary alignment + microtask drain. Earlier
+// drafts used 6m, which over-provisioned by 4× and at firehose rates
+// (5k+ events/sec) drove the aggregator's heap into V8's 2GB limit
+// after ~25 minutes of uptime. Nothing downstream needs >1m of raw
+// retention — the per-host fused rolling is the only consumer of
+// `live`'s contents and its longest window is 1m. The aggregate-
+// stream's snapshot history (M3.5 step 8) will live in a separate
+// bounded ring keyed off `HostTick`s, not raw events.
 const live = new LiveSeries({
   name: 'metrics',
   schema,
-  retention: { maxAge: '6m' },
+  retention: { maxAge: '90s' },
 });
 
 const stopIngest = startIngest(live, { producerUrl: PRODUCER_URL });

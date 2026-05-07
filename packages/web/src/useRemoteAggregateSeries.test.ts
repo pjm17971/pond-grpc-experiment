@@ -35,6 +35,11 @@ const mkTick = (
   requests_n: cpu_n,
   // Step 6 — window_age_seconds. Default to 60 (warm aggregator).
   window_age_seconds: 60,
+  // Step 7 — per-tick CPU extrema. Defaults span ±0.05 around
+  // cpu_avg (matches the mkTick default cpu_sd) for non-empty
+  // slices; null when n_current==0.
+  cpu_min: cpu_n > 0 ? cpu_avg - 0.05 : null,
+  cpu_max: cpu_n > 0 ? cpu_avg + 0.05 : null,
 });
 
 describe('applyAggregateFrame', () => {
@@ -151,6 +156,8 @@ describe('tickToRow', () => {
       requests_sum: 102_500,
       requests_n: 1000,
       window_age_seconds: 60,
+      cpu_min: 0.42,
+      cpu_max: 0.71,
     });
     expect(row).toEqual([
       1_700_000_000_000,
@@ -165,10 +172,12 @@ describe('tickToRow', () => {
       102_500,
       1000,
       60,
+      0.42,
+      0.71,
     ]);
   });
 
-  it('preserves nullable cpu_avg / cpu_sd / requests_avg', () => {
+  it('preserves nullable cpu_avg / cpu_sd / requests_avg / cpu_min / cpu_max', () => {
     const row = tickToRow({
       ts: 1_700_000_000_000,
       host: 'api-1',
@@ -182,6 +191,8 @@ describe('tickToRow', () => {
       requests_sum: 0,
       requests_n: 0,
       window_age_seconds: 0,
+      cpu_min: null,
+      cpu_max: null,
     });
     expect(row).toEqual([
       1_700_000_000_000,
@@ -196,6 +207,8 @@ describe('tickToRow', () => {
       0,
       0,
       0,
+      null,
+      null,
     ]);
   });
 
@@ -223,6 +236,8 @@ describe('tickToRow', () => {
         requests_sum: 5_000,
         requests_n: 50,
         window_age_seconds: 30,
+        cpu_min: 0.42,
+        cpu_max: 0.7,
       },
       {
         ts: 1_700_000_000_200,
@@ -237,6 +252,8 @@ describe('tickToRow', () => {
         requests_sum: 0,
         requests_n: 0,
         window_age_seconds: 30.2,
+        cpu_min: null,
+        cpu_max: null,
       },
       {
         ts: 1_700_000_000_400,
@@ -251,6 +268,8 @@ describe('tickToRow', () => {
         requests_sum: 6_300,
         requests_n: 60,
         window_age_seconds: 30.4,
+        cpu_min: 0.51,
+        cpu_max: 0.78,
       },
     ];
     expect(() => live.pushJson(ticks.map(tickToRow))).not.toThrow();
@@ -282,6 +301,8 @@ describe('tickToRow', () => {
     expect(first.get('requests_sum')).toBe(5_000);
     expect(first.get('requests_n')).toBe(50);
     expect(first.get('window_age_seconds')).toBe(30);
+    expect(first.get('cpu_min')).toBeCloseTo(0.42, 6);
+    expect(first.get('cpu_max')).toBeCloseTo(0.7, 6);
     expect(last.get('cpu_sd')).toBeCloseTo(0.09, 6);
     expect(last.get('cpu_n')).toBe(60);
     expect(last.get('n_current')).toBe(6);
@@ -290,6 +311,8 @@ describe('tickToRow', () => {
     expect(last.get('requests_sum')).toBe(6_300);
     expect(last.get('requests_n')).toBe(60);
     expect(last.get('window_age_seconds')).toBeCloseTo(30.4, 6);
+    expect(last.get('cpu_min')).toBeCloseTo(0.51, 6);
+    expect(last.get('cpu_max')).toBeCloseTo(0.78, 6);
 
     // The middle-row null cells: confirm undefined (not 0/NaN) for
     // nullable columns when the wire shipped null, and 0 for
@@ -299,6 +322,8 @@ describe('tickToRow', () => {
     expect(events[1].get('requests_sum')).toBe(0);
     expect(events[1].get('requests_n')).toBe(0);
     expect(events[1].get('window_age_seconds')).toBeCloseTo(30.2, 6);
+    expect(events[1].get('cpu_min')).toBeUndefined();
+    expect(events[1].get('cpu_max')).toBeUndefined();
   });
 });
 

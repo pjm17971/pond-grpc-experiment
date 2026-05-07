@@ -72,6 +72,13 @@ export type AppendMsg = { type: 'append'; rows: ReadonlyArray<WireRow> };
  *   request-rate displays don't show a 60s diagonal warmup ramp on
  *   a freshly-started aggregator. Same value across hosts at a
  *   given tick — repeated per row for self-describing chart history.
+ * - `cpu_min`, `cpu_max` (step 7) — extrema of the `cpu` column over
+ *   the 200ms slice (same window as `cpu_samples` / `n_current`).
+ *   Tick-resolution envelope around `cpu_avg`. Drives the dashboard's
+ *   "show min/max envelope" toggle (the WIRE.md repurpose of the
+ *   deprecated raw-samples scatter overlay) — visible texture even
+ *   when the 1m smoothed line is flat. Nullable: both are `null`
+ *   when the slice is empty (`n_current === 0`).
  */
 export type HostTick = {
   ts: number;
@@ -86,6 +93,8 @@ export type HostTick = {
   requests_sum: number;
   requests_n: number;
   window_age_seconds: number;
+  cpu_min: number | null;
+  cpu_max: number | null;
 };
 
 /**
