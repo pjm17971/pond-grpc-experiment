@@ -91,6 +91,82 @@ export type ChartOpts = {
   sigma: number;
 };
 
+/**
+ * Sample-count-weighted average of `cpu_avg` across enabled hosts in
+ * a `latestPerHost` snapshot. Equivalent to the raw-event mean a
+ * `useCurrent(liveSeries, { cpu: 'avg' }, { tail: '1m' })` call would
+ * have produced over the un-aggregated stream.
+ *
+ * Why weighted: each host's `cpu_avg` is *its own* mean over its
+ * events in the rolling 1m window; the count of events behind that
+ * mean is `cpu_n`. A naïve mean-of-means would weight a host
+ * emitting 10 events/s the same as one emitting 1000/s, biasing the
+ * cluster headline. Weighting by `cpu_n` recovers the underlying
+ * raw-event average exactly:
+ *
+ *   sum(cpu_avg_i × cpu_n_i) / sum(cpu_n_i) = mean of all raw events
+ *
+ * Returns `undefined` when no enabled host has weighted samples
+ * (empty map, all hosts disabled, or every entry has cpu_n ≤ 0).
+ */
+export function computeWeightedRollingCpu(
+  latestPerHost: ReadonlyMap<string, HostTick>,
+  enabledHosts: ReadonlySet<string>,
+): number | undefined {
+  let weightedSum = 0;
+  let totalN = 0;
+  for (const [host, tick] of latestPerHost) {
+    if (!enabledHosts.has(host)) continue;
+    if (typeof tick.cpu_avg !== 'number') continue;
+    const n = tick.cpu_n;
+    if (typeof n !== 'number' || n <= 0) continue;
+    weightedSum += tick.cpu_avg * n;
+    totalN += n;
+  }
+  return totalN > 0 ? weightedSum / totalN : undefined;
+}
+
+/**
+ * Cluster req/sec headline — sum of each enabled host's most recent
+ * rate (`requests_sum / window_age_seconds`), gated on freshness
+ * against `tEnd`.
+ *
+ * The aggregate wire **omits silent hosts**, but `latestPerHost`
+ * preserves the last-known tick across silences (so the chart's
+ * per-host lines don't disappear during brief gaps). For the
+ * headline that's wrong: a host that genuinely went silent would
+ * keep contributing its stale rate until eviction ages it out. The
+ * staleness gate (`tEnd - tick.ts ≤ stalenessMs`) ensures host
+ * failure / partition / shutdown reflects in the headline within
+ * one staleness window, not minutes later.
+ *
+ * `stalenessMs` defaults to 3 s — generous given the wire's 200 ms
+ * tick cadence (15× tickMs covers normal jitter without mistaking a
+ * slow tick for a dead host).
+ */
+export function computeTotalReqPerSec(
+  latestPerHost: ReadonlyMap<string, HostTick>,
+  enabledHosts: ReadonlySet<string>,
+  tEnd: number | undefined,
+  stalenessMs = 3_000,
+): number {
+  if (tEnd == null) return 0;
+  let total = 0;
+  for (const [host, tick] of latestPerHost) {
+    if (!enabledHosts.has(host)) continue;
+    if (typeof tick.requests_sum !== 'number') continue;
+    if (tick.requests_n < 1) continue;
+    if (tEnd - tick.ts > stalenessMs) continue;
+    const ageSec =
+      typeof tick.window_age_seconds === 'number'
+        ? tick.window_age_seconds
+        : 60;
+    const denom = Math.max(0.001, ageSec);
+    total += tick.requests_sum / denom;
+  }
+  return total;
+}
+
 export type DashboardArgs = {
   disabledHosts: Set<string>;
   chartOpts: ChartOpts;
@@ -229,26 +305,12 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   }, []);
 
   // 5. Rolling 1m CPU avg across enabled hosts, sourced from the
-  //    aggregate stream's `latestPerHost` map. Each entry's
-  //    `cpu_avg` is already the host's 1m baseline; averaging
-  //    those gives the all-host rolling. Equivalent in spirit to
-  //    the pre-step 9 `useCurrent(liveSeries, { cpu: 'avg' },
-  //    { tail: '1m' })` — same statistical meaning, just sourced
-  //    from per-host pre-aggregated samples instead of raw events.
-  //    Refreshes whenever `latestPerHost` changes (every tick the
-  //    wire delivers).
-  const rollingCpu = useMemo(() => {
-    if (aggregate.latestPerHost.size === 0) return undefined;
-    let sum = 0;
-    let count = 0;
-    for (const [host, tick] of aggregate.latestPerHost) {
-      if (!enabledHosts.has(host)) continue;
-      if (typeof tick.cpu_avg !== 'number') continue;
-      sum += tick.cpu_avg;
-      count += 1;
-    }
-    return count > 0 ? sum / count : undefined;
-  }, [aggregate.latestPerHost, enabledHosts]);
+  //    aggregate stream's `latestPerHost` map. See
+  //    `computeWeightedRollingCpu` for the weighting math.
+  const rollingCpu = useMemo(
+    () => computeWeightedRollingCpu(aggregate.latestPerHost, enabledHosts),
+    [aggregate.latestPerHost, enabledHosts],
+  );
 
   // 6. Time axis pinned to the latest aggregate tick with a fixed
   //    back-window. Single source of truth — every chart path now
@@ -529,25 +591,52 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   ]);
 
   // 8. EMA-smoothed CPU trend across all enabled hosts (summary stat
-  //    only). Sourced from the aggregate snapshot — `aggregate(...)`
-  //    folds every-host's `cpu_avg` for a tick into a single mean per
-  //    200ms boundary, `smooth(..., 'ema')` runs the EMA across those
-  //    boundaries. Pre-step 9 this ran over the raw event series; the
-  //    aggregate-side equivalent is what we now have post-retirement.
-  //    Filter to enabled hosts so disabling a host immediately drops
-  //    its contribution from the trend.
+  //    only). Sourced from the aggregate snapshot. Per-tick the
+  //    cluster CPU is the **sample-count-weighted** average across
+  //    enabled hosts (same formula as `rollingCpu`, applied per
+  //    ts); the EMA runs across the resulting per-tick series.
+  //
+  //    Pre-step-9 this ran an unweighted `aggregate(every('200ms'),
+  //    { cpu_avg: 'avg' })` then EMA, which Codex flagged as biased
+  //    when hosts have different sample counts. Pond's built-in
+  //    `'avg'` reducer is per-column unweighted; weighting needs
+  //    either a custom function reducer (snapshot-side only in
+  //    0.16) or the manual JS pass below. JS pass is fine here —
+  //    one walk over the windowed snapshot per render, bounded by
+  //    the same retention as the chart memos.
   const trendCpu = useMemo(() => {
     if (!aggSnapshot || aggSnapshot.length === 0) return undefined;
-    const filtered = aggSnapshot.filter((e) => {
-      const h = e.get('host');
-      return typeof h === 'string' && enabledHosts.has(h);
-    });
-    if (filtered.length === 0) return undefined;
-    return filtered
-      .aggregate(Sequence.every('200ms'), { cpu_avg: 'avg' })
-      .smooth('cpu_avg', 'ema', { alpha: 0.3, output: 'cpuTrend' })
-      .last()
-      ?.get('cpuTrend');
+    // Group enabled-host events by ts; collect weighted sum + total
+    // sample count per ts boundary.
+    const perTs = new Map<number, { weightedSum: number; totalN: number }>();
+    for (const e of aggSnapshot) {
+      const host = e.get('host');
+      if (typeof host !== 'string' || !enabledHosts.has(host)) continue;
+      const cpuAvg = e.get('cpu_avg');
+      const cpuN = e.get('cpu_n');
+      if (typeof cpuAvg !== 'number' || typeof cpuN !== 'number' || cpuN <= 0) {
+        continue;
+      }
+      const ts = e.key().timestampMs();
+      const acc = perTs.get(ts);
+      if (acc) {
+        acc.weightedSum += cpuAvg * cpuN;
+        acc.totalN += cpuN;
+      } else {
+        perTs.set(ts, { weightedSum: cpuAvg * cpuN, totalN: cpuN });
+      }
+    }
+    if (perTs.size === 0) return undefined;
+    const sortedTs = [...perTs.keys()].sort((a, b) => a - b);
+    const alpha = 0.3;
+    let ema: number | undefined;
+    for (const ts of sortedTs) {
+      const { weightedSum, totalN } = perTs.get(ts)!;
+      if (totalN <= 0) continue;
+      const wAvg = weightedSum / totalN;
+      ema = ema === undefined ? wAvg : alpha * wAvg + (1 - alpha) * ema;
+    }
+    return ema;
   }, [aggSnapshot, enabledHosts]);
 
   // 9. Static 70%-threshold line, mounted via `useTimeSeries`. Two rows
@@ -771,11 +860,13 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     return out;
   }, [aggSnapshot, hosts, enabledHosts, hostColors]);
 
-  // 14. Total req/sec across visible hosts — sum of the latest point per series.
-  const totalReqPerSec = reqSeries.reduce((sum, s) => {
-    const last = s.points[s.points.length - 1];
-    return sum + (last?.value ?? 0);
-  }, 0);
+  // 14. Total req/sec across visible hosts — see
+  //     `computeTotalReqPerSec` for the freshness-gate math.
+  const totalReqPerSec = useMemo(
+    () =>
+      computeTotalReqPerSec(aggregate.latestPerHost, enabledHosts, tEnd),
+    [aggregate.latestPerHost, enabledHosts, tEnd],
+  );
 
   // 15. Logs section — most recent host-tick frames from the
   //     aggregate snapshot, newest first. Pre-step 9 the Logs
