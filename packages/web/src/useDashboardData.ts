@@ -25,11 +25,20 @@ import { Sequence, TimeSeries, type SeriesSchema } from 'pond-ts';
  * Target points per chart series. The CPU/Requests charts are ~420px
  * wide; rendering more than ~1 point per pixel is wasted SVG-node
  * churn that React+Recharts has to diff every frame. With a 5-min
- * window of 5 fps/host ticks (1500 raw rows), TARGET_CHART_POINTS=500
- * gives ~3× downsample with no visible loss. See M3.5 friction note
- * "Recharts as the dashboard's render bottleneck".
+ * window of 5 fps/host ticks (1500 raw rows), TARGET_CHART_POINTS=250
+ * gives ~6× downsample with no visible loss (one point every ~1.7 px
+ * at chart scale).
+ *
+ * History: 1500 (none) → 500 (M3.5 perf follow-ups) → 250 (this
+ * commit). At firehose × 10 hosts the 500-point version still
+ * produced ~25k SVG nodes per render and the main thread stayed
+ * starved across 200ms throttle ticks; halving the per-series count
+ * + suppressing the per-Line `<Scatter>` overlay at high point
+ * densities (see Chart.tsx `SCATTER_DOT_THRESHOLD`) is the cheap
+ * mitigation that bridges us to a canvas-based chart (the M5
+ * `@pond-ts/charts` extraction).
  */
-const TARGET_CHART_POINTS = 500;
+const TARGET_CHART_POINTS = 250;
 import {
   type ChartBand,
   type ChartDots,

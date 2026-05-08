@@ -150,6 +150,26 @@ export type AggregateCounters = {
    * frame, the true wire compression ratio).
    */
   totalEvents: number;
+  /**
+   * Bytes received in the latest aggregate-append frame (the
+   * decoded WS message size). Drives the wire-meta panel's
+   * "what's actually arriving on the socket" readout.
+   */
+  latestFrameBytes: number;
+  /**
+   * Cumulative bytes received since this dashboard's first frame.
+   * Snapshot frames count too — the panel shows total wire pressure
+   * the dashboard absorbed, not just append frames.
+   */
+  totalBytes: number;
+  /**
+   * Wall-clock ms of the most recent frame (snapshot or append),
+   * captured at WS message receive time. The panel uses
+   * `Date.now() - lastFrameAt` to display a freshness indicator;
+   * stale readings flag a slow / disconnected feed visibly even
+   * before the connection-status state catches up.
+   */
+  lastFrameAt: number | null;
 };
 
 export type RemoteAggregateState = {
@@ -192,6 +212,9 @@ const ZERO_COUNTERS: AggregateCounters = {
   latestFrameEvents: 0,
   totalFrames: 0,
   totalEvents: 0,
+  latestFrameBytes: 0,
+  totalBytes: 0,
+  lastFrameAt: null,
 };
 
 /**
@@ -268,6 +291,18 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
         // frame from the old subscription would briefly write into
         // the new view.
         if (cancelled) return;
+        // Capture the raw payload size before decode so byte counters
+        // reflect what actually crossed the WS — wire-meta panel reads
+        // bytes/sec from these. Strings are JSON; pre-binary cutover
+        // this matches the over-the-wire UTF-8 length closely enough
+        // for the dashboard's "what's actually arriving" readout.
+        const frameBytes =
+          typeof ev.data === 'string'
+            ? ev.data.length
+            : ev.data instanceof ArrayBuffer
+              ? ev.data.byteLength
+              : 0;
+        const frameAt = Date.now();
         const msg = decode(ev.data as string);
         if (msg.type !== 'aggregate-snapshot' && msg.type !== 'aggregate-append') {
           // Misconfigured server sending raw frames on this socket —
@@ -283,6 +318,17 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
           if (msg.globals && msg.globals.length > 0) {
             setLatestGlobals(msg.globals[msg.globals.length - 1]);
           }
+          // Snapshot bytes count toward `totalBytes` so the wire-meta
+          // panel reflects everything that crossed the socket. Frame
+          // count and per-event delta belong to the append path
+          // (snapshots are reconnect backfill, not steady-state
+          // ticks); keep those in the append branch below.
+          setCounters((prev) => ({
+            ...prev,
+            latestFrameBytes: frameBytes,
+            totalBytes: prev.totalBytes + frameBytes,
+            lastFrameAt: frameAt,
+          }));
         }
         // Push every row into the mounted LiveSeries so windowed
         // queries (`useWindow`, `partitionBy`) work over the wire.
@@ -344,6 +390,9 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
               latestFrameEvents: frameEvents,
               totalFrames: prev.totalFrames + 1,
               totalEvents: eventsThisSession,
+              latestFrameBytes: frameBytes,
+              totalBytes: prev.totalBytes + frameBytes,
+              lastFrameAt: frameAt,
             }));
           } else {
             // No globals on the wire — count frames only, leave
@@ -353,6 +402,9 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
               latestFrameEvents: 0,
               totalFrames: prev.totalFrames + 1,
               totalEvents: prev.totalEvents,
+              latestFrameBytes: frameBytes,
+              totalBytes: prev.totalBytes + frameBytes,
+              lastFrameAt: frameAt,
             }));
           }
           if (msg.globals) {

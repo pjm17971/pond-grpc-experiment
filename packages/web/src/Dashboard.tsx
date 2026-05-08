@@ -31,11 +31,13 @@ import { useDashboardData } from './useDashboardData';
 export function Dashboard() {
   const [chartOpts, setChartOpts] = useState<ChartOpts>({
     showBands: true,
-    // Show raw samples by default — the most direct visual signal of
-    // "data is flowing right now". When the source pauses, the raw line
-    // breaks immediately at the next undefined cell; the smoothed line
-    // can lag because its rolling window still contains pre-pause data.
-    showRaw: true,
+    // Min/max envelope is off by default — at firehose × N-host loads
+    // it doubles the per-host line count (smoothed + min + max), and
+    // those extra `<Line>`s are the second-largest SVG contributor
+    // after the bands. Off-by-default means a first-time visitor at
+    // firehose doesn't enter the worst-case render path; flip the
+    // toggle on demand to inspect within-tick variation.
+    showRaw: false,
     sigma: 2,
   });
   // The set of hosts the user has explicitly disabled. Hosts default

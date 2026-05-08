@@ -202,11 +202,17 @@ export function Chart({
             // at every defined value; in dense regions the dot overlaps
             // the line and reads as a slightly thicker stroke, in sparse
             // regions it's the only thing that shows the data exists.
-            // Raw-sample overlays in particular need the scatter — the
-            // materialized grid alternates defined/undefined cells when
-            // the source rate is below the grid step (e.g., during a
-            // backgrounded-tab throttle), so most raw points are isolated.
-            const showDots = !s.dashed;
+            //
+            // **Suppress at dense point counts.** When a series has more
+            // points than `SCATTER_DOT_THRESHOLD` the Scatter is
+            // redundant — every point is connected to its neighbour, so
+            // there are no isolated-defined cells the line would skip.
+            // At firehose × N-host loads each series has ~250 points;
+            // suppressing the scatter cuts the per-Line SVG-circle
+            // count to zero. This is one of the cheap mitigations
+            // bridging us to a canvas-based chart (M5).
+            const SCATTER_DOT_THRESHOLD = 60;
+            const showDots = !s.dashed && s.points.length <= SCATTER_DOT_THRESHOLD;
             const lineOpacity = s.opacity ?? (s.dashed ? 0.7 : 0.95);
             return (
               <Fragment key={s.name}>
