@@ -255,7 +255,17 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //    summary indicator — that's the only WS the dashboard depends
   //    on for any visible content.
   const aggregate = useRemoteAggregateSeries(AGG_WS_URL);
-  const aggSnapshot = useWindow(aggregate.liveSeries, '5m', { throttle: 200 });
+  // Snapshot throttle. The wire delivers per-tick aggregate frames
+  // every 200 ms, but the chart renders at the snapshot's cadence —
+  // one redraw per throttle period across ~30 series + bands + dots.
+  // At 200 ms (5 fps) the browser's render-engine GC fell behind the
+  // SVG-subtree allocation rate at firehose × 10 hosts (renderer
+  // killed at ~5-6 min). At 500 ms (2 fps) we halve the render-tree
+  // allocation rate while staying visually-live for a demo
+  // dashboard. The wire-meta panel below this still updates at
+  // 5 fps because it reads from `aggregate.counters` directly, not
+  // from the windowed snapshot.
+  const aggSnapshot = useWindow(aggregate.liveSeries, '5m', { throttle: 500 });
   // The σ-threshold list the snapshot frame's `thresholds` field
   // delivers. Step-4 anomaly-density interpolation keys off this —
   // see `anomalyInterpolation.ts`. Falls back to the default while
