@@ -34,7 +34,16 @@ export type ChartBand = {
   color: string;
   upper: ChartPoint[];
   lower: ChartPoint[];
+  /** Fill opacity for the band. Defaults to 0.12. */
   opacity?: number;
+  /**
+   * Render the band's edges as dashed strokes (in the band's
+   * `color`). Off by default — bands are unstroked filled regions.
+   * Set true on the stacked-bands design (±σ inner + min/max
+   * outer) so each band's boundary stays visually distinct even
+   * when two bands of the same host overlap.
+   */
+  dashed?: boolean;
 };
 
 export type ChartDots = {
@@ -51,7 +60,13 @@ type Props = {
   dots?: ChartDots[];
   tStart?: number;
   tEnd?: number;
-  width?: number;
+  /**
+   * Width — accepts a CSS px number or a percent template string
+   * matching Recharts' `ResponsiveContainer` signature. Defaults
+   * to `'100%'` so the chart fills its container; pass a number
+   * for fixed-width testing.
+   */
+  width?: number | `${number}%`;
   height?: number;
   yMin?: number;
   yMax?: number;
@@ -71,7 +86,7 @@ export function Chart({
   dots = [],
   tStart,
   tEnd,
-  width = 420,
+  width = '100%',
   height = 220,
   yMin: yMinOverride,
   yMax: yMaxOverride,
@@ -184,7 +199,10 @@ export function Chart({
                 const hi = d[bandKey(b.name, 'upper')];
                 return lo == null || hi == null ? undefined : [lo, hi];
               }}
-              stroke="none"
+              stroke={b.dashed ? b.color : 'none'}
+              strokeDasharray={b.dashed ? '4 3' : undefined}
+              strokeWidth={b.dashed ? 1 : 0}
+              strokeOpacity={b.dashed ? 0.55 : 0}
               fill={b.color}
               fillOpacity={b.opacity ?? 0.12}
               isAnimationActive={false}

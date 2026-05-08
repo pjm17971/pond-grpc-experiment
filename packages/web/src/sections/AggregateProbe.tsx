@@ -12,13 +12,6 @@ type Props = {
   aggregate: RemoteAggregateState;
 };
 
-const STATUS_LABEL: Record<string, string> = {
-  connecting: 'connecting',
-  connected: 'live',
-  reconnecting: 'reconnecting',
-  closed: 'disconnected',
-};
-
 /**
  * "Behind the curtain" — what's actually arriving on the
  * `/live-agg` WebSocket. The dashboard's headlines look like a
@@ -32,7 +25,7 @@ const STATUS_LABEL: Record<string, string> = {
  * inspection happens in the chart itself.
  */
 export function AggregateProbe({ aggregate }: Props) {
-  const { status, counters } = aggregate;
+  const { counters } = aggregate;
   // Drive the freshness display off a 1Hz wall-clock state bump so
   // "last frame N s ago" keeps growing during a disconnect (when no
   // ticks arrive and React would otherwise not re-render). 1s is
@@ -57,23 +50,12 @@ export function AggregateProbe({ aggregate }: Props) {
   const sinceLastFrameMs =
     counters.lastFrameAt != null ? renderedAt - counters.lastFrameAt : null;
 
+  // Header dropped per dashboard-feedback round: the page-summary
+  // status indicator at the top covers connection state, and the
+  // section's identity is implied by its position at the bottom of
+  // the dashboard. The four stats below carry the entire payload.
   return (
     <section className="metric-section aggregate-probe">
-      <div className="section-header">
-        <h2>Behind the curtain — /live-agg wire feed</h2>
-        <div className="section-stats">
-          <span
-            className={`connection-indicator connection-indicator-${status}`}
-            role="status"
-            aria-label={`live-agg connection ${status}`}
-          >
-            <span className="connection-dot" />
-            <span className="connection-label">
-              /live-agg {STATUS_LABEL[status] ?? status}
-            </span>
-          </span>
-        </div>
-      </div>
       <p className="section-note">
         The headlines above read as the producer's gRPC firehose. On the
         wire, the dashboard receives a small stream of per-tick aggregate
