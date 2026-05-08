@@ -69,6 +69,17 @@ const fanoutBroadcastMs = new Histogram();
  * batch listener.
  */
 const arrivalTimes = new Map<string, number[]>();
+/**
+ * Hard cap on `arrivalTimes` Map size. V8's `Map` ceiling is ~16M
+ * entries; without a cap, the aggregator at firehose × no-/live-
+ * subscribers (post-step-9 dashboard) accumulates entries because
+ * `recordIngest` is upstream of any fanout / sample filter while
+ * `recordFanout` only fires when a /live client is broadcasting.
+ * Drop ingest entries beyond this cap — latency-percentile stats
+ * become incomplete but the aggregator stays alive.
+ */
+const ARRIVAL_TIMES_MAX_KEYS = 200_000;
+let arrivalTimesDropped = 0;
 let eventsIngested = 0;
 let eventsFannedOut = 0;
 let bytesFannedOut = 0;
@@ -120,11 +131,18 @@ export function startGcObserver(): () => void {
  * to the per-key queue for later latency calculation.
  */
 export function recordIngest(host: string, timeMs: number): void {
+  const t = performance.now();
   const key = `${host}:${timeMs}`;
   const list = arrivalTimes.get(key);
-  const t = performance.now();
-  if (list) list.push(t);
-  else arrivalTimes.set(key, [t]);
+  if (list) {
+    list.push(t);
+  } else if (arrivalTimes.size < ARRIVAL_TIMES_MAX_KEYS) {
+    arrivalTimes.set(key, [t]);
+  } else {
+    // Cap reached — drop the entry. Latency pairing for this
+    // event won't happen, but the aggregator survives.
+    arrivalTimesDropped += 1;
+  }
   eventsIngested += 1;
 }
 
@@ -206,6 +224,15 @@ export type MetricsSnapshot = {
   liveSeriesLength: number;
   /** Events seen by ingest but not yet by fanout — heap pressure proxy. */
   arrivalQueueLength: number;
+  /**
+   * Ingest events dropped from the latency-pairing Map because the
+   * cap (`ARRIVAL_TIMES_MAX_KEYS`) was reached. Indicates the
+   * dashboard isn't subscribing to /live (no fanout to drain) and
+   * the latency stats below are computed from a sample. Survival
+   * gauge: as long as this stays at or below the cap, the
+   * aggregator won't OOM the V8 Map ceiling.
+   */
+  arrivalTimesDropped: number;
   latency: {
     ingestToFanoutMs:
       | { p50: number; p95: number; p99: number; count: number }
@@ -263,6 +290,7 @@ export function snapshot(args: {
     },
     liveSeriesLength: args.liveSeriesLength,
     arrivalQueueLength: countArrivalEntries(),
+    arrivalTimesDropped,
     latency: {
       ingestToFanoutMs: ingestToFanout.snapshot(),
       pushManyTotalMs: pushManyTotalMs.snapshot(),
