@@ -268,7 +268,18 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //    The aggregate stream's `ConnectionStatus` drives the page-
   //    summary indicator — that's the only WS the dashboard depends
   //    on for any visible content.
-  const aggregate = useRemoteAggregateSeries(AGG_WS_URL);
+  //
+  //    `topN: 5` ships a `{type:'set-top-n', n: 5}` control message
+  //    on WS open so the **server** drops everything outside the
+  //    busiest 5 hosts before broadcasting. Replaces the older
+  //    client-side `topHosts.filter(...)` step that ran inside the
+  //    chart memos: now the wire only ships ~5 host-rows per frame
+  //    and the dashboard's chart pipeline doesn't have to re-derive
+  //    a top-N cut on every render. Keep the constant in lockstep
+  //    with the chart-section's expected legend size; a slider PR
+  //    will replace it with state.
+  const TOP_N_HOSTS = 5;
+  const aggregate = useRemoteAggregateSeries(AGG_WS_URL, TOP_N_HOSTS);
   // Snapshot throttle. The wire delivers per-tick aggregate frames
   // every 200 ms, but the chart renders at the snapshot's cadence —
   // one redraw per throttle period across ~30 series + bands + dots.
@@ -337,28 +348,31 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     return map;
   }, []);
 
-  // 4b. Top-N enabled hosts ranked by latest cpu_avg. Both charts
-  //     (CPU and Requests) draw the same 5 hosts so a host visible
-  //     on one is visible on the other — keeps the visual cross-
-  //     section coherent and stops the chart legend from bloating
-  //     to 10+ rows when the user enables every host. The
-  //     HostToggles UI still lets the user exclude hosts from the
-  //     candidate pool. Recomputed per render off `latestPerHost`;
-  //     ties + null cpu_avgs land at the bottom.
-  const TOP_N_HOSTS = 5;
-  const topHosts = useMemo<readonly string[]>(() => {
-    const candidates: Array<{ host: string; cpu: number }> = [];
-    for (const h of hosts) {
-      if (!enabledHosts.has(h)) continue;
-      const tick = aggregate.latestPerHost.get(h);
-      const cpu =
-        tick && typeof tick.cpu_avg === 'number' ? tick.cpu_avg : -1;
-      candidates.push({ host: h, cpu });
-    }
-    candidates.sort((a, b) => b.cpu - a.cpu);
-    return candidates.slice(0, TOP_N_HOSTS).map((c) => c.host);
-  }, [hosts, enabledHosts, aggregate.latestPerHost]);
-  const topHostsSet = useMemo(() => new Set(topHosts), [topHosts]);
+  // 4b. Visible-hosts notes (no derivation needed). Server-side top-N
+  //     (see `useRemoteAggregateSeries(url, TOP_N_HOSTS)` above + the
+  //     aggregator's `projectAppend`) already trims each broadcast
+  //     frame to the top-N busiest by 1m baseline `cpu_avg`, so
+  //     `latestPerHost` and `aggSnapshot` only carry rows for hosts
+  //     that have been in the cut at some point. The CPU + Requests
+  //     charts iterate `hosts` (HOSTS-declaration order, intersected
+  //     with the wire's actual contents) and gate on `enabledHosts`
+  //     for the user-toggle filter — no separate top-N memo runs
+  //     client-side anymore.
+  //
+  //     Hosts that fall out of the cut keep their last-known tick in
+  //     `latestPerHost` (the wire just stops shipping rows; the map
+  //     doesn't drop them) and stay visible on the chart until they
+  //     scroll off the 5min back-window. That's a visual quirk of
+  //     the no-hysteresis cut — boundary hosts can pop in and out
+  //     across ticks. A future hysteresis pass on the server
+  //     (deferred, `friction-notes/M3.5.md`) will smooth this out.
+  //
+  //     The HostToggles UI still excludes hosts from the chart's
+  //     `enabledHosts`, but the server can't see those toggles — a
+  //     "disabled" host that's in the server-side top-N still ships
+  //     its rows; the chart memos drop them via the `enabledHosts`
+  //     gate below. Net effect: server sends ~5 hosts; the chart
+  //     shows ≤5 (anything the user toggled off is hidden).
 
   // 5. Rolling 1m CPU avg across enabled hosts, sourced from the
   //    aggregate stream's `latestPerHost` map. See
@@ -421,19 +435,20 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       return { series, bands, dots, allAnomalies };
     }
 
-    if (topHosts.length === 0) {
+    if (enabledHosts.size === 0) {
       return { series, bands, dots, allAnomalies };
     }
 
-    // **Filter to top-N hosts before partitioning** — at firehose ×
-    // 80-host wire the full partition would allocate ~120k row
-    // objects per render to use ~1.5k of them. Filtering scopes the
-    // allocation to the chart's working set. Pond's `filter` +
-    // `partitionBy` walk the snapshot once each; the expensive step
-    // (`toPoints` row materialisation) sees only what we'll draw.
+    // **Filter to enabled hosts before partitioning** — server-side
+    // top-N has already capped the wire to ~5 host-rows per frame,
+    // so the snapshot is small to begin with; this drops anything
+    // the user has explicitly toggled off via HostToggles. Pond's
+    // `filter` + `partitionBy` walk the snapshot once each; the
+    // expensive step (`toPoints` row materialisation) sees only
+    // what we'll draw.
     const filtered = aggSnapshot.filter((e) => {
       const h = e.get('host');
-      return typeof h === 'string' && topHostsSet.has(h);
+      return typeof h === 'string' && enabledHosts.has(h);
     });
     if (filtered.length === 0) {
       return { series, bands, dots, allAnomalies };
@@ -494,7 +509,8 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
         ? aggregateThresholds
         : DEFAULT_AGGREGATE_THRESHOLDS;
 
-    for (const host of topHosts) {
+    for (const host of hosts) {
+      if (!enabledHosts.has(host)) continue;
       const color = hostColors[host];
 
       // ── Pass 1: per-tick anomaly dots (full resolution). Anomalies
@@ -736,8 +752,8 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   }, [
     aggSnapshot,
     aggregateThresholds,
-    topHosts,
-    topHostsSet,
+    hosts,
+    enabledHosts,
     hostColors,
     sigma,
     showBands,
@@ -875,7 +891,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //     smoothing's added lag.
   const reqSeries = useMemo<ChartSeries[]>(() => {
     if (!aggSnapshot || aggSnapshot.length === 0) return [];
-    if (topHosts.length === 0) return [];
+    if (enabledHosts.size === 0) return [];
     // Same filter-before-partition + downsample pattern as the CPU
     // section. `requests_sum` is already a 1-min rolling sum, so
     // averaging it across the bucket gives the natural plot value;
@@ -883,17 +899,18 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     // sample at the bucket's terminal tick. No spike-preserving
     // signal here so all reducers are smooth-friendly.
     //
-    // Filtered to the same top-5 hosts as the CPU chart so a host
-    // visible on one section is visible on the other (consistent
-    // cross-section reading). Hosts that are enabled but didn't
-    // make the top-5 cpu cut are skipped here too.
+    // Server-side top-N already caps the wire to the same hosts
+    // that drive the CPU chart, so cross-section visual coherence
+    // (a host visible in one is visible in the other) holds without
+    // a client-side re-derivation. The only client filter left
+    // here is the user's HostToggles (`enabledHosts`).
     const aggBucketMs = Math.max(
       200,
       Math.ceil(WINDOW_MS / TARGET_CHART_POINTS),
     );
     const filtered = aggSnapshot.filter((e) => {
       const h = e.get('host');
-      return typeof h === 'string' && topHostsSet.has(h);
+      return typeof h === 'string' && enabledHosts.has(h);
     });
     if (filtered.length === 0) return [];
     const perHostRows = filtered
@@ -906,7 +923,8 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       .toMap((g) => g.toPoints());
 
     const out: ChartSeries[] = [];
-    for (const host of topHosts) {
+    for (const host of hosts) {
+      if (!enabledHosts.has(host)) continue;
       const rows = perHostRows.get(host) ?? [];
       const points: ChartPoint[] = [];
       let latestRate: number | undefined;
@@ -937,7 +955,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       });
     }
     return out;
-  }, [aggSnapshot, topHosts, topHostsSet, hostColors]);
+  }, [aggSnapshot, hosts, enabledHosts, hostColors]);
 
   // 14. Total req/sec across visible hosts — see
   //     `computeTotalReqPerSec` for the freshness-gate math.

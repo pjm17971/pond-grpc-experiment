@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useLiveSeries } from '@pond-ts/react';
 import type { LiveSeries } from 'pond-ts';
 import type { JsonRowForSchema } from 'pond-ts/types';
@@ -236,8 +236,24 @@ const ZERO_COUNTERS: AggregateCounters = {
  * raw events. The `latestPerHost` map kept its place — it's the
  * cheapest way to drive the diagnostic probe and (in step 4+) the
  * "current cell" anomaly readout.
+ *
+ * **`topN` (per-connection top-N filter)**: optional integer that the
+ * hook ships to the server as a `{type:'set-top-n', n}` control
+ * message right after WS open and again whenever the prop changes
+ * (without reconnecting). The server clamps + applies per-tick at
+ * broadcast time so this client only receives the top-N rows by 1m
+ * baseline `cpu_avg` per frame — see `server.ts.projectAppend`.
+ *
+ * `null` (the default) is "no filter, ship every host's row" —
+ * matches the pre-control-channel server behaviour for
+ * back-compat. Reconnects re-send the current preference in the
+ * fresh WS's onopen, so the user's selection survives a flap
+ * without needing the server to remember anything across the gap.
  */
-export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
+export function useRemoteAggregateSeries(
+  url: string,
+  topN: number | null = null,
+): RemoteAggregateState {
   // `useLiveSeries` from `@pond-ts/react` owns the LiveSeries
   // lifecycle for the component's lifetime — created once on mount,
   // stable ref afterwards. URL changes don't reconstruct it (the
@@ -262,6 +278,33 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
   const [counters, setCounters] = useState<AggregateCounters>(ZERO_COUNTERS);
   const [latestGlobals, setLatestGlobals] = useState<GlobalsTick | null>(null);
 
+  // Refs that the WS lifecycle effect reaches into so it can react to
+  // `topN` changes *without* re-running (a re-run would tear down the
+  // socket and slam through a reconnect on every slider tick — bad
+  // UX). The flow is:
+  //
+  //   - `topNRef` mirrors the latest prop value; the WS `onopen`
+  //     handler reads it and ships an immediate `set-top-n` so the
+  //     server's per-client filter starts at the user's preference.
+  //   - `wsRef` exposes the current socket to the change-effect
+  //     below so a prop update can send a fresh `set-top-n` over
+  //     the live connection. Cleared on cleanup / close so the
+  //     check `readyState === OPEN` reliably gates writes.
+  const topNRef = useRef(topN);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // Send `set-top-n` immediately when the prop changes, without
+  // tearing the socket. If the WS isn't open yet (initial mount, or
+  // mid-reconnect), the next `onopen` will read `topNRef.current`
+  // and ship the right value — no message is dropped.
+  useEffect(() => {
+    topNRef.current = topN;
+    const ws = wsRef.current;
+    if (ws && ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: 'set-top-n', n: topN }));
+    }
+  }, [topN]);
+
   useEffect(() => {
     // Reset compression-ratio counters when the URL changes (treated
     // as a fresh subscription). Reconnect to the same URL preserves
@@ -283,9 +326,23 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
     const connect = () => {
       setStatus(isReconnect ? 'reconnecting' : 'connecting');
       ws = new WebSocket(url);
+      // Expose the socket to the topN-change effect so prop updates
+      // can write to the live connection without bouncing through a
+      // reconnect.
+      wsRef.current = ws;
       ws.onopen = () => {
         if (!cancelled) setStatus('connected');
         attempt = 0;
+        // Restore (or set) the per-connection top-N preference on
+        // every open. The server forgets it across disconnects; this
+        // re-arms the filter on reconnect so the user's selection
+        // survives WS flaps. `null` is the server-side default
+        // ("no filter") so we skip the message in that case rather
+        // than send a redundant clear.
+        const desired = topNRef.current;
+        if (desired !== null && ws && ws.readyState === ws.OPEN) {
+          ws.send(JSON.stringify({ type: 'set-top-n', n: desired }));
+        }
       };
       ws.onmessage = (ev) => {
         // Cleanup may have run between this frame being queued and us
@@ -416,6 +473,10 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
         }
       };
       ws.onclose = () => {
+        // Drop the ref before any reconnect so the topN-change effect
+        // can't fire a `send()` against a CLOSING/CLOSED socket. The
+        // next successful `connect()` re-anchors `wsRef.current`.
+        if (wsRef.current === ws) wsRef.current = null;
         if (cancelled) return;
         setStatus('reconnecting');
         isReconnect = true;
@@ -430,6 +491,7 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
       cancelled = true;
       setStatus('closed');
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      wsRef.current = null;
       ws?.close();
     };
   }, [url]);

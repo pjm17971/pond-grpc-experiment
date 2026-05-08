@@ -12,7 +12,6 @@ import {
   type GlobalsTick,
   type HostTick,
   type Schema,
-  encode,
 } from '@pond-experiment/shared';
 
 /**
@@ -117,7 +116,20 @@ type BaselineParts = {
 
 export function startAggregate(
   live: LiveSeries<Schema>,
-  broadcast: (frame: string) => void,
+  /**
+   * Per-tick callback. Receives the structured `AggregateAppendMsg`
+   * (not pre-encoded) so the broadcast layer can apply per-subscriber
+   * projections (e.g. top-N row filtering) before encoding. The
+   * caller in `server.ts` iterates connected clients, projects per
+   * each client's `ClientPrefs`, and encodes once per client.
+   *
+   * Pre-step-9.1 this took an already-encoded `string` and the
+   * broadcast was a single `JSON.stringify`-shared payload across
+   * all clients. The wire-projection rework moved the encode step
+   * out so per-client projections work without round-tripping
+   * encoded JSON.
+   */
+  broadcast: (msg: AggregateAppendMsg) => void,
   opts: AggregateOptions = {},
 ): {
   stop: () => void;
@@ -338,7 +350,7 @@ export function startAggregate(
         rows,
         globals,
       };
-      broadcast(encode(msg));
+      broadcast(msg);
       pendingByTs.delete(ts);
 
       // Mirror into the snapshot-history ring. Append-then-evict

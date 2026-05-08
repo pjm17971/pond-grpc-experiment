@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest';
 import { LiveSeries } from 'pond-ts';
 import {
   schema,
-  decode,
   type AggregateAppendMsg,
 } from '@pond-experiment/shared';
 import { startAggregate, assembleTick } from './aggregate.js';
@@ -20,12 +19,18 @@ import { startAggregate, assembleTick } from './aggregate.js';
  * "are mean/sd backed by enough samples?"), `n_current` is the
  * `tickMs` slice's count. Numerically-precise reducer behaviour is
  * pond's responsibility and is covered in its own test suite.
+ *
+ * `startAggregate`'s broadcast callback now hands back structured
+ * `AggregateAppendMsg` objects (was pre-encoded JSON `string`s) so
+ * the broadcast layer can apply per-subscriber wire projections —
+ * see the per-connection top-N work in `server.ts`. Tests collect
+ * structured messages directly; no decode round-trip needed.
  */
 
-function decodedFrames(frames: string[]): AggregateAppendMsg[] {
-  return frames
-    .map((f) => decode(f))
-    .filter((m): m is AggregateAppendMsg => m.type === 'aggregate-append');
+function decodedFrames(
+  frames: AggregateAppendMsg[],
+): AggregateAppendMsg[] {
+  return frames.filter((m) => m.type === 'aggregate-append');
 }
 
 describe('startAggregate', () => {
@@ -35,7 +40,7 @@ describe('startAggregate', () => {
       schema,
       retention: { maxAge: '6m' },
     });
-    const frames: string[] = [];
+    const frames: AggregateAppendMsg[] = [];
     const { stop } = startAggregate(live, (f) => frames.push(f), {
       tickMs: 50,
     });
@@ -103,7 +108,7 @@ describe('startAggregate', () => {
       schema,
       retention: { maxAge: '6m' },
     });
-    const frames: string[] = [];
+    const frames: AggregateAppendMsg[] = [];
     const { stop } = startAggregate(live, (f) => frames.push(f), {
       tickMs: 50,
     });
@@ -137,7 +142,7 @@ describe('startAggregate', () => {
       schema,
       retention: { maxAge: '6m' },
     });
-    const frames: string[] = [];
+    const frames: AggregateAppendMsg[] = [];
     const { stop } = startAggregate(live, (f) => frames.push(f), {
       tickMs: 50,
     });
@@ -176,7 +181,7 @@ describe('startAggregate', () => {
       schema,
       retention: { maxAge: '6m' },
     });
-    const frames: string[] = [];
+    const frames: AggregateAppendMsg[] = [];
     const { stop } = startAggregate(live, (f) => frames.push(f), {
       tickMs: 30,
     });
@@ -217,7 +222,7 @@ describe('startAggregate', () => {
       schema,
       retention: { maxAge: '6m' },
     });
-    const frames: string[] = [];
+    const frames: AggregateAppendMsg[] = [];
     const { stop } = startAggregate(live, (f) => frames.push(f), {
       tickMs: 50,
     });
@@ -264,7 +269,7 @@ describe('startAggregate', () => {
       schema,
       retention: { maxAge: '6m' },
     });
-    const frames: string[] = [];
+    const frames: AggregateAppendMsg[] = [];
     const { stop } = startAggregate(live, (f) => frames.push(f), {
       tickMs: 50,
     });
@@ -330,7 +335,7 @@ describe('startAggregate', () => {
       schema,
       retention: { maxAge: '6m' },
     });
-    const frames: string[] = [];
+    const frames: AggregateAppendMsg[] = [];
     const { stop, getSnapshotHistory } = startAggregate(
       live,
       (f) => frames.push(f),
