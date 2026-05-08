@@ -552,40 +552,53 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       const smoothPoints: ChartPoint[] = [];
       let lastAvg: number | undefined;
 
-      // `cpu_n >= MIN_SAMPLES` is the gate-on-render mask, equivalent
-      // to the raw side's `baseline(..., { minSamples: 30 })`. Under
-      // bucket-count `cpu_n` semantics (the library agent's correction
-      // during the 0.13 review), `cpu_n` is already the rolling-1m
-      // sample count for that bucket — so the gate is just a per-row
-      // check, no client-side sum across rows needed. Kills the
-      // staircase artefact when the producer pauses and the rolling
-      // window has too few samples to trust mean/sd.
+      // Two independent gates per row:
+      //
+      //   - `liveGate`: `n_current >= 1` — the 200ms slice has at
+      //     least one sample. Drives the smoothed center line, which
+      //     plots `current_avg` (the 200ms-slice mean). Trades a
+      //     little visual jitter for *responsiveness* — the line
+      //     tracks bursts as soon as samples land in the slice,
+      //     instead of lagging the 1m baseline mean by tens of
+      //     seconds. (Pre-this commit the line plotted `cpu_avg`
+      //     over the 1m baseline, which was very smooth but
+      //     surprising next to the band edges: `cpu_sd` is far more
+      //     responsive to outliers than `cpu_avg`, so the band
+      //     widened around a burst while the center line just sat
+      //     there.)
+      //
+      //   - `baselineGate`: `cpu_n >= MIN_SAMPLES` — the 1m baseline
+      //     is warmed up enough that mean / sd are trustworthy.
+      //     Drives the ±σ band edges (`cpu_avg ± σ·cpu_sd`). Pre-
+      //     baseline-warmup the bands hold off; the responsive
+      //     center line still plots.
       const MIN_SAMPLES = 30;
       const aggRows = downsampledPerHost.get(host) ?? [];
       for (const r of aggRows) {
-        const gated = (r.cpu_n ?? 0) >= MIN_SAMPLES;
-        if (gated && r.cpu_avg != null) {
-          smoothPoints.push({ ts: r.ts, value: r.cpu_avg });
-          lastAvg = r.cpu_avg;
-          // ±σ baseline edges (showBands toggle). Built every render;
-          // the toggle decides whether they're emitted into `series`.
-          if (r.cpu_sd != null) {
-            sigmaUpper.push({
-              ts: r.ts,
-              value: r.cpu_avg + sigma * r.cpu_sd,
-            });
-            sigmaLower.push({
-              ts: r.ts,
-              value: r.cpu_avg - sigma * r.cpu_sd,
-            });
-          } else {
-            sigmaUpper.push({ ts: r.ts, value: undefined });
-            sigmaLower.push({ ts: r.ts, value: undefined });
-          }
+        const liveGate = (r.n_current ?? 0) >= 1;
+        const baselineGate = (r.cpu_n ?? 0) >= MIN_SAMPLES;
+        // Center line — `current_avg` per 200ms slice. Plots whenever
+        // the slice has data, even before the baseline warms up.
+        if (liveGate && typeof r.current_avg === 'number') {
+          smoothPoints.push({ ts: r.ts, value: r.current_avg });
+          lastAvg = r.current_avg;
         } else {
-          // Below the gate or stats absent — render a gap (the
-          // dashboard agent's render-gap convention from WIRE.md).
           smoothPoints.push({ ts: r.ts, value: undefined });
+        }
+        // Baseline σ band edges. Independent of `liveGate` — the band
+        // is the threshold reference, not the current value, so it
+        // can render even when the current slice is empty (as long
+        // as the baseline is warm).
+        if (baselineGate && r.cpu_avg != null && r.cpu_sd != null) {
+          sigmaUpper.push({
+            ts: r.ts,
+            value: r.cpu_avg + sigma * r.cpu_sd,
+          });
+          sigmaLower.push({
+            ts: r.ts,
+            value: r.cpu_avg - sigma * r.cpu_sd,
+          });
+        } else {
           sigmaUpper.push({ ts: r.ts, value: undefined });
           sigmaLower.push({ ts: r.ts, value: undefined });
         }
