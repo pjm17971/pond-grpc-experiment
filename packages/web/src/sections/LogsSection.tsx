@@ -5,61 +5,69 @@ type Props = {
 };
 
 /**
- * The Logs section: the most recent 20 raw events from the windowed
- * snapshot, newest first. Demonstrates direct event iteration —
- * `timeSeries.toArray()` gives a typed `EventForSchema<S>[]` and
- * `e.get('cpu')` etc. narrow on the schema with no casts.
+ * Logs section — most recent host-tick frames from the aggregate
+ * stream's windowed snapshot, newest first. Each row is one
+ * `(host, ts)` pair from `/live-agg` carrying the per-host tick
+ * aggregates (cpu_avg over the 1m baseline, n_current as the count
+ * of raw samples in the leading-edge slice, requests_avg as the
+ * running average). Step 9 repurpose: pre-step-9 the section
+ * iterated raw `cpu`/`requests` events from `/live`'s `LiveSeries`,
+ * which is gone post-firehose-retirement; the aggregate wire's per-
+ * tick rollups are the only stream the dashboard subscribes to now.
  *
- * Hidden entirely while `/live` is retired: the section iterates raw
- * events, which the aggregate stream doesn't carry. Step 9 either
- * reintroduces a small per-host log tail on the aggregate wire or
- * removes the section permanently — either way, hiding here avoids
- * the empty-table state Codex flagged on PR #29.
+ * Demonstrates direct iteration over a `LiveSeries<aggregateSchema>`
+ * snapshot — same affordance as the pre-step-9 version, just on the
+ * aggregate stream. The `recentTicks` derivation lives in
+ * `useDashboardData` so this component stays a pure renderer.
  */
 export function LogsSection({ data }: Props) {
-  if (!data.liveStreamEnabled) return null;
-  const { timeSeries, hostColors } = data;
+  const { recentTicks, hostColors } = data;
   return (
     <section className="logs-section">
       <header className="section-header">
         <h2>Logs</h2>
-        <div className="section-note">last 20 events across all hosts</div>
+        <div className="section-note">
+          last 20 host ticks from /live-agg, newest first
+        </div>
       </header>
       <table>
         <thead>
           <tr>
             <th>Time</th>
             <th>Host</th>
-            <th>CPU</th>
-            <th>Requests</th>
+            <th>CPU avg (1m)</th>
+            <th>n (slice)</th>
+            <th>Requests avg</th>
           </tr>
         </thead>
         <tbody>
-          {timeSeries &&
-            timeSeries
-              .toArray()
-              .slice(-20)
-              .reverse()
-              .map((e, i) => {
-                const ts = e.key().timestampMs();
-                const host = e.get('host');
-                const color = hostColors[host];
-                return (
-                  <tr key={`${ts}-${i}`}>
-                    <td>{new Date(ts).toLocaleTimeString()}</td>
-                    <td>
-                      <span
-                        className="host-pill"
-                        style={{ borderColor: color, color }}
-                      >
-                        {host}
-                      </span>
-                    </td>
-                    <td>{(e.get('cpu') * 100).toFixed(1)}%</td>
-                    <td>{e.get('requests')}</td>
-                  </tr>
-                );
-              })}
+          {recentTicks.map((tick, i) => {
+            const color = hostColors[tick.host];
+            return (
+              <tr key={`${tick.ts}-${tick.host}-${i}`}>
+                <td>{new Date(tick.ts).toLocaleTimeString()}</td>
+                <td>
+                  <span
+                    className="host-pill"
+                    style={{ borderColor: color, color }}
+                  >
+                    {tick.host}
+                  </span>
+                </td>
+                <td>
+                  {tick.cpu_avg != null
+                    ? `${(tick.cpu_avg * 100).toFixed(1)}%`
+                    : '—'}
+                </td>
+                <td>{tick.n_current}</td>
+                <td>
+                  {tick.requests_avg != null
+                    ? tick.requests_avg.toFixed(1)
+                    : '—'}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </section>
