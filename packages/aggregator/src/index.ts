@@ -10,6 +10,20 @@ const PORT = Number(process.env.AGGREGATOR_PORT ?? '8080');
 // (IPv4-only). Friction-noted for M2 — see friction-notes/M2.md.
 const PRODUCER_URL = process.env.PRODUCER_URL ?? '127.0.0.1:50051';
 
+/**
+ * Stride-sampling factor — the experiment's user-space prototype
+ * for the proposed `live.partitionBy(...).sample({ stride: N })`
+ * library primitive. `SAMPLE_STRIDE=1` is the default (no
+ * sampling, full firehose); `SAMPLE_STRIDE=10` keeps every 10th
+ * event before pushing to the LiveSeries, cutting rolling-state
+ * memory ~10× while leaving rolling stats statistically
+ * equivalent. See M3.5 friction note "Bounded-memory rolling via
+ * sampling" for the math + caveats. Counts post-sample under
+ * stride > 1 (prototype limitation; real implementation would
+ * track true ingest separately at the gRPC layer).
+ */
+const SAMPLE_STRIDE = Math.max(1, Number(process.env.SAMPLE_STRIDE ?? '1'));
+
 const stopGc = startGcObserver();
 
 // Retention sized as a small ingest buffer, NOT the rolling's
@@ -31,11 +45,14 @@ const live = new LiveSeries({
   retention: { maxAge: '30s' },
 });
 
-const stopIngest = startIngest(live, { producerUrl: PRODUCER_URL });
+const stopIngest = startIngest(live, {
+  producerUrl: PRODUCER_URL,
+  sampleStride: SAMPLE_STRIDE,
+});
 const server = await startServer({ port: PORT, live });
 
 console.log(
-  `aggregator listening on :${PORT} (producer=${PRODUCER_URL})`,
+  `aggregator listening on :${PORT} (producer=${PRODUCER_URL}, sampleStride=${SAMPLE_STRIDE})`,
 );
 
 const shutdown = async (signal: string) => {
