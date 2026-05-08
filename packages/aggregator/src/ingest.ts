@@ -13,6 +13,30 @@ export type IngestOptions = {
   producerUrl: string;
   /** Optional override; defaults to insecure (M2 is plaintext, TLS is M6). */
   channelCredentials?: ChannelCredentials;
+  /**
+   * **Prototype** — stride-sampling factor before `live.pushMany`.
+   * Defaults to 1 (push every event, current behaviour). When set
+   * to N > 1, only every Nth event from the gRPC stream lands in
+   * the LiveSeries; the rolling state and listener fan-out
+   * downstream see N× fewer events.
+   *
+   * This is the experiment's user-space stand-in for the
+   * `live.partitionBy(...).sample({ stride: N })` library primitive
+   * proposed in the M3.5 friction note. The math says rolling
+   * `cpu_avg` / `cpu_sd` are visually identical at sample rates
+   * below 1-in-100 (standard error of the mean grows √N but stays
+   * orders of magnitude below per-event noise at firehose).
+   *
+   * Caveat for this prototype: counts post-sample, so the wire's
+   * reported `events_ingested_total` and `events_per_sec` reflect
+   * the **observed** count rather than the true gRPC firehose. A
+   * real implementation would track a separate true-ingest
+   * counter at the gRPC layer (before the stride) and surface
+   * both `count_observed` and `count_total`. Keep that in mind
+   * when reading the dashboard's headline numbers under
+   * `SAMPLE_STRIDE > 1`.
+   */
+  sampleStride?: number;
 };
 
 /**
@@ -32,6 +56,19 @@ export function startIngest(
 ): () => void {
   const creds = opts.channelCredentials ?? credentials.createInsecure();
   const client = new ProducerClient(opts.producerUrl, creds);
+  const sampleStride = Math.max(1, Math.floor(opts.sampleStride ?? 1));
+  // Per-host stride counters. A *global* stride counter would bias
+  // when the input stream has structure: this experiment's producer
+  // emits one event per host per tick in a fixed host order, so a
+  // single shared counter at stride=10 keeps the same 8 hosts from
+  // every batch and drops the other 72 entirely. Per-host stride
+  // gives each host a uniform 1/N effective rate, which is what the
+  // proposed library primitive (`partitionBy(...).sample(...)`)
+  // does naturally — chaining after `partitionBy` thins per-stream.
+  // For the prototype we don't have pond's partitioning available
+  // before pushMany, so we maintain the per-host counters in a
+  // small Map and look them up by host on each event.
+  const sampleCounters = sampleStride > 1 ? new Map<string, number>() : null;
 
   let cancelled = false;
   let attempt = 0;
@@ -56,16 +93,33 @@ export function startIngest(
         firstFrame = false;
       }
       const events = batch.events;
-      const rows: IngestRow[] = new Array(events.length);
+      const rows: IngestRow[] = [];
       for (let i = 0; i < events.length; i++) {
         const event = events[i];
         recordIngest(event.host, event.timeMs);
-        rows[i] = [
-          new Date(event.timeMs),
-          event.cpu,
-          event.requests,
-          event.host,
-        ];
+        // Per-host stride sampling. `sampleStride === 1` is the
+        // no-op path (every event passes; same shape as pre-
+        // prototype). At stride > 1 we keep one in N per host —
+        // each host's counter ticks independently, so every host
+        // gets a uniform 1/N effective rate even when the producer
+        // emits events in a fixed host order across batches. See
+        // the counter declaration above for why a global counter
+        // is wrong in this experiment.
+        let pass = true;
+        if (sampleCounters !== null) {
+          const host = event.host;
+          const c = sampleCounters.get(host) ?? 0;
+          pass = c % sampleStride === 0;
+          sampleCounters.set(host, c + 1);
+        }
+        if (pass) {
+          rows.push([
+            new Date(event.timeMs),
+            event.cpu,
+            event.requests,
+            event.host,
+          ]);
+        }
       }
       if (rows.length > 0) {
         const t0 = performance.now();

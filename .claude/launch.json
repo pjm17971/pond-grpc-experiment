@@ -45,6 +45,15 @@
         ". ~/.nvm/nvm.sh && nvm use 22 --silent && NODE_OPTIONS='--max-old-space-size=8192' pnpm dev:aggregator"
       ],
       "port": 8080
+    },
+    {
+      "name": "aggregator-firehose-sampled",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        ". ~/.nvm/nvm.sh && nvm use 22 --silent && NODE_OPTIONS='--max-old-space-size=8192' SAMPLE_STRIDE=10 pnpm dev:aggregator"
+      ],
+      "port": 8080
     }
   ]
 }
