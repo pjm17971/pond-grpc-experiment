@@ -119,6 +119,14 @@ export type HostTick = {
  * - `evicted_total` — cumulative number of events the LiveSeries
  *   retention policy has evicted since aggregator start. Useful for
  *   spotting "we're behind on backpressure" silently.
+ * - `requests_ingested_total` (step 9) — cumulative `requests`-column
+ *   sum across every event since aggregator start. Parallel to
+ *   `events_ingested_total` but for the requests integer rather than
+ *   the event count. Drives the dashboard's "Total requests" headline
+ *   stat after `/live` retirement — pre-step-9 the dashboard rolled
+ *   that up client-side from the raw stream, which is the kind of
+ *   firehose-overflow the wire-aggregate redesign was meant to
+ *   eliminate. Optional for forward-compat with pre-step-9 servers.
  *
  * One frame per tick (alongside the per-host rows). Optional on
  * `AggregateAppendMsg` for forward-compat with pre-step-6 servers
@@ -129,6 +137,12 @@ export type GlobalsTick = {
   events_ingested_total: number;
   events_per_sec: number;
   evicted_total: number;
+  /**
+   * Step 9 — see docstring. `?` for forward-compat: pre-step-9
+   * aggregators ship globals without this field, the dashboard reads
+   * it as `undefined` and renders the stat as "—".
+   */
+  requests_ingested_total?: number;
 };
 
 /**

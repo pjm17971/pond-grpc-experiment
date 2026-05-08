@@ -18,13 +18,8 @@
  *  11. roll-up scalars
  */
 import { useMemo } from 'react';
-import { useCurrent, useTimeSeries, useWindow } from '@pond-ts/react';
-import {
-  Sequence,
-  TimeSeries,
-  type LiveSeries,
-  type SeriesSchema,
-} from 'pond-ts';
+import { useTimeSeries, useWindow } from '@pond-ts/react';
+import { Sequence, TimeSeries, type SeriesSchema } from 'pond-ts';
 
 /**
  * Target points per chart series. The CPU/Requests charts are ~420px
@@ -46,7 +41,7 @@ import {
   DEFAULT_AGGREGATE_THRESHOLDS,
   HOSTS,
   baselineSchema,
-  schema,
+  type HostTick,
 } from '@pond-experiment/shared';
 import { countAtSigma } from './anomalyInterpolation';
 import {
@@ -54,29 +49,13 @@ import {
   PALETTE,
   WINDOW_MS,
 } from './dashboardSchema';
-import {
-  useRemoteLiveSeries,
-  type ConnectionStatus,
-} from './useRemoteLiveSeries';
+import { type ConnectionStatus } from './useRemoteLiveSeries';
 import {
   useRemoteAggregateSeries,
   type RemoteAggregateState,
 } from './useRemoteAggregateSeries';
 
 const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8080/live';
-
-/**
- * `/live` stream toggle. Step 9 (the M3.5 finish line) re-wires the
- * remaining raw-stream consumers — rolling 1m CPU avg, EMA trend,
- * total requests cumulative, threshold-mode high-CPU alerts, and the
- * last-20 events log — onto the aggregate stream's globals plus the
- * per-host rolling output. Until then this branch keeps `/live`
- * disabled (the firehose-side fix) and section renderers gate the
- * affected surfaces on this flag so they're hidden rather than shown
- * as misleading "—" or empty tables. Single source of truth — both
- * the WS subscription and the UI gating read from here.
- */
-const LIVE_STREAM_ENABLED = false;
 
 /**
  * Derive the `/live-agg` URL from `WS_URL` so a single `VITE_WS_URL`
@@ -118,17 +97,6 @@ export type DashboardArgs = {
 };
 
 export type DashboardData = {
-  liveSeries: LiveSeries<typeof schema>;
-
-  /**
-   * False while `/live` is retired (this branch). Section renderers
-   * use this flag to hide UI surfaces that would otherwise show stale
-   * "—" or empty content because their data sources are unreachable.
-   * Step 9 re-derives every gated surface from the aggregate stream
-   * and flips this back to `true`.
-   */
-  liveStreamEnabled: boolean;
-
   // basic counters
   totalEvents: number;
   totalRequests: number | undefined;
@@ -157,8 +125,16 @@ export type DashboardData = {
   reqSeries: ChartSeries[];
   totalReqPerSec: number;
 
-  // Logs section — raw windowed snapshot.
-  timeSeries: TimeSeries<typeof schema> | null;
+  /**
+   * Logs section — most recent host-tick frames from the aggregate
+   * stream's windowed snapshot. Step 9 repurpose: pre-step-9 the
+   * Logs section iterated raw events from `/live`'s `LiveSeries`;
+   * post-retirement it shows the actual aggregate-wire flow (one
+   * row per host per 200ms tick, newest first). Same "demonstrate
+   * direct event iteration" affordance, just on the only live
+   * stream the dashboard now subscribes to.
+   */
+  recentTicks: ReadonlyArray<HostTick>;
 
   // Aggregate stream state — the dashboard owns the single
   // subscription; `AggregateProbe` and section-7's bands consume it
@@ -179,47 +155,20 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   // two extra thin lines tracing the per-tick CPU extrema.
   const { showBands, showRaw, sigma } = chartOpts;
 
-  // 1. LiveSeries — the single mutable buffer for ingest. Identical
-  //    in shape to the M0 useLiveSeries call; the difference is the
-  //    source of events: useRemoteLiveSeries opens a WebSocket to the
-  //    aggregator, ingests the snapshot frame, then push()es each
-  //    append frame. Same retention so client and aggregator drop the
-  //    same rows at the same moment. The third tuple slot is the
-  //    WS lifecycle status — surfaces in the page summary as a
-  //    connection indicator.
-  // Step 9 — `/live` is **disabled in the dashboard**. The raw
-  // firehose at ≥5k events/sec overflows the WebSocket receiver no
-  // matter how aggressively we shrink local retention; the only
-  // viable path is to stop subscribing. Every chart path already
-  // sources from `/live-agg`'s tick aggregates (steps 4–7); the
-  // remaining raw-stream consumers (rolling-CPU rollup, total-
-  // requests stat, EMA-trend across all hosts, threshold-mode high-
-  // CPU alert filter, last-20 events log) accept undefined/empty
-  // fallbacks and degrade gracefully. The `LiveSeries` is still
-  // mounted (its references are wired into the existing pipelines)
-  // but stays empty.
+  // 1. Aggregate stream — `/live-agg` mirror with the wire's per-host
+  //    tick aggregates and per-tick globals. The dashboard's only live
+  //    subscription post-step 9: `/live` is retired (the firehose
+  //    didn't survive the WS round-trip at scale, see M3.5 friction
+  //    notes), and every UI surface that used to read raw events
+  //    re-derives off this stream instead — bands and smoothed line
+  //    off `cpu_avg`/`cpu_sd` (steps 3–4), headline counters off the
+  //    globals tick (step 6), snapshot history backfill on connect
+  //    (step 8), and the rolling/EMA/total-requests/threshold-alert/
+  //    logs surfaces all moved here in this commit.
   //
-  // The connection-status indicator now reflects `/live-agg`'s WS,
-  // not `/live` — that's the connection the dashboard actually
-  // depends on for any visible content.
-  const [liveSeries] = useRemoteLiveSeries(
-    WS_URL,
-    {
-      name: 'metrics',
-      schema,
-      retention: { maxAge: '90s' },
-    },
-    { throttle: 200, enabled: LIVE_STREAM_ENABLED },
-  );
-  // The aggregate stream's connection status drives the page-summary
-  // indicator. Mapping is direct — `/live-agg`'s `ConnectionStatus`
-  // alphabet matches `/live`'s.
-
-  // 1b. Aggregate stream — `/live-agg` mirror with the wire's
-  //     per-host tick aggregates (cpu_avg, cpu_sd, cpu_n). Step 3
-  //     of M3.5 sources the CPU bands + smoothed line from this
-  //     stream rather than from `timeSeries.baseline(...)` over raw
-  //     events. Probe + counters keep their step-2 home.
+  //    The aggregate stream's `ConnectionStatus` drives the page-
+  //    summary indicator — that's the only WS the dashboard depends
+  //    on for any visible content.
   const aggregate = useRemoteAggregateSeries(AGG_WS_URL);
   const aggSnapshot = useWindow(aggregate.liveSeries, '5m', { throttle: 200 });
   // The σ-threshold list the snapshot frame's `thresholds` field
@@ -244,11 +193,13 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   const totalEventsGlobal = globals?.events_ingested_total ?? 0;
   const eventsPerSec = globals?.events_per_sec;
   const evictedTotal = globals?.evicted_total ?? 0;
-
-  // 3. Throttled 5-min windowed snapshot. `useWindow` owns the live
-  //    view subscription; what we get back is an immutable TimeSeries
-  //    we can chain transforms on without worrying about live mutation.
-  const timeSeries = useWindow(liveSeries, '5m', { throttle: 200 });
+  // Step 9 — total requests cumulative now ships in the globals tick
+  // alongside `events_ingested_total`. Pre-step 9 the dashboard rolled
+  // it up client-side off the raw `/live` firehose, which was the
+  // path the wire-side aggregate redesign was supposed to eliminate.
+  // `undefined` for pre-step-9 servers (the field is optional on
+  // `GlobalsTick`); the Stat renderer falls back to "—".
+  const totalRequests = globals?.requests_ingested_total;
 
   // 4. Host model: discovered live from the data via the aggregate
   //    stream's `latestPerHost` map (keys are the hosts that have
@@ -277,33 +228,32 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     return map;
   }, []);
 
-  // 5. Whole-source rollups (computed live, not from the window).
-  //    `useCurrent` is sugar for `useSnapshot(src).tail(t).reduce(map)`.
-  //    Event rate moved to globals (step 6) — see §2 above. The
-  //    remaining client-side rollups are the ones the wire doesn't
-  //    yet ship: a cumulative `requests` total (waiting on a
-  //    requests global; could be added to `GlobalsTick` if useful)
-  //    and the rolling 1m CPU avg displayed in the section header.
-  const { requests: totalRequests } = useCurrent(
-    liveSeries,
-    { requests: 'sum' },
-    { throttle: 500 },
-  );
-  const { cpu: rollingCpu } = useCurrent(
-    liveSeries,
-    { cpu: 'avg' },
-    { tail: '1m', throttle: 200 },
-  );
+  // 5. Rolling 1m CPU avg across enabled hosts, sourced from the
+  //    aggregate stream's `latestPerHost` map. Each entry's
+  //    `cpu_avg` is already the host's 1m baseline; averaging
+  //    those gives the all-host rolling. Equivalent in spirit to
+  //    the pre-step 9 `useCurrent(liveSeries, { cpu: 'avg' },
+  //    { tail: '1m' })` — same statistical meaning, just sourced
+  //    from per-host pre-aggregated samples instead of raw events.
+  //    Refreshes whenever `latestPerHost` changes (every tick the
+  //    wire delivers).
+  const rollingCpu = useMemo(() => {
+    if (aggregate.latestPerHost.size === 0) return undefined;
+    let sum = 0;
+    let count = 0;
+    for (const [host, tick] of aggregate.latestPerHost) {
+      if (!enabledHosts.has(host)) continue;
+      if (typeof tick.cpu_avg !== 'number') continue;
+      sum += tick.cpu_avg;
+      count += 1;
+    }
+    return count > 0 ? sum / count : undefined;
+  }, [aggregate.latestPerHost, enabledHosts]);
 
-  // 6. Time axis pinned to the latest tick with a fixed back-window.
-  //    Step 9: sources from the aggregate snapshot (every chart path
-  //    already comes from /live-agg). Falls back to the timeSeries
-  //    derived from /live only if the aggregate hasn't produced a
-  //    frame yet — useful when /live is re-enabled for debugging,
-  //    no-op when disabled.
-  const tEnd =
-    aggSnapshot?.last()?.key().timestampMs() ??
-    timeSeries?.last()?.key().timestampMs();
+  // 6. Time axis pinned to the latest aggregate tick with a fixed
+  //    back-window. Single source of truth — every chart path now
+  //    sources from `/live-agg`.
+  const tEnd = aggSnapshot?.last()?.key().timestampMs();
   const tStart = tEnd != null ? tEnd - WINDOW_MS : undefined;
 
   // 7. CPU section — fully aggregate-driven now. Bands + smoothed
@@ -578,14 +528,27 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     sigma,
   ]);
 
-  // 8. EMA-smoothed trend across all hosts (summary stat only).
+  // 8. EMA-smoothed CPU trend across all enabled hosts (summary stat
+  //    only). Sourced from the aggregate snapshot — `aggregate(...)`
+  //    folds every-host's `cpu_avg` for a tick into a single mean per
+  //    200ms boundary, `smooth(..., 'ema')` runs the EMA across those
+  //    boundaries. Pre-step 9 this ran over the raw event series; the
+  //    aggregate-side equivalent is what we now have post-retirement.
+  //    Filter to enabled hosts so disabling a host immediately drops
+  //    its contribution from the trend.
   const trendCpu = useMemo(() => {
-    if (!timeSeries || timeSeries.length === 0) return undefined;
-    return timeSeries
-      .smooth('cpu', 'ema', { alpha: 0.3, output: 'cpuTrend' })
+    if (!aggSnapshot || aggSnapshot.length === 0) return undefined;
+    const filtered = aggSnapshot.filter((e) => {
+      const h = e.get('host');
+      return typeof h === 'string' && enabledHosts.has(h);
+    });
+    if (filtered.length === 0) return undefined;
+    return filtered
+      .aggregate(Sequence.every('200ms'), { cpu_avg: 'avg' })
+      .smooth('cpu_avg', 'ema', { alpha: 0.3, output: 'cpuTrend' })
       .last()
       ?.get('cpuTrend');
-  }, [timeSeries]);
+  }, [aggSnapshot, enabledHosts]);
 
   // 9. Static 70%-threshold line, mounted via `useTimeSeries`. Two rows
   //    spanning ±1h around mount; the chart clips it to the visible
@@ -624,17 +587,33 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
         },
       ];
 
-  // 11. High-CPU filter: events from enabled hosts where cpu > threshold.
-  //     Used for the "Alerts" stat AND as the source for the threshold-mode
-  //     bar chart bucketing. Filtering on `timeSeries` (a snapshot) so the
-  //     enabledHosts set can change without rebuilding a LiveView.
+  // 11. High-CPU filter: aggregate-stream rows from enabled hosts where
+  //     `cpu_avg` exceeds the static 70% threshold. Used for the
+  //     "Alerts" stat AND as the source for the threshold-mode bar
+  //     chart bucketing. Pre-step 9 this filtered raw events over the
+  //     `/live` snapshot; post-retirement it filters per-tick host
+  //     aggregates. The unit changes — pre-step 9 each match was one
+  //     raw event over threshold, now each match is one (host, tick)
+  //     pair where the host's 1m baseline is over threshold — so the
+  //     count semantics shift from "how many over-threshold events"
+  //     to "how many over-threshold host-ticks." Same shape, denser
+  //     data: 80 hosts × 5 fps = 400 potential alerts/sec on the
+  //     aggregate stream regardless of underlying event rate. The
+  //     dashboard label stays "Alerts" because the visual story
+  //     ("how often is something hot?") is unchanged.
   const highCpuFiltered = useMemo(() => {
-    if (!timeSeries) return null;
-    return timeSeries.filter(
-      (e) =>
-        enabledHosts.has(e.get('host')) && e.get('cpu') > HIGH_CPU_THRESHOLD,
-    );
-  }, [timeSeries, enabledHosts]);
+    if (!aggSnapshot) return null;
+    return aggSnapshot.filter((e) => {
+      const h = e.get('host');
+      const cpu = e.get('cpu_avg');
+      return (
+        typeof h === 'string' &&
+        enabledHosts.has(h) &&
+        typeof cpu === 'number' &&
+        cpu > HIGH_CPU_THRESHOLD
+      );
+    });
+  }, [aggSnapshot, enabledHosts]);
 
   // 12. Bar chart buckets: 15-second bins of either anomalies (band mode)
   //     or alerts (threshold mode). Both paths end in `aggregate(...)
@@ -695,11 +674,13 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       );
     }
 
-    // Threshold mode: aggregate the live filter directly.
+    // Threshold mode: aggregate the live filter directly. Counts
+    // (host, tick) pairs over threshold per 15s bucket — see the
+    // semantic note on `highCpuFiltered` above.
     if (!highCpuFiltered || highCpuFiltered.length === 0) return [];
     return aggregateToBars(
-      highCpuFiltered.aggregate(Sequence.every('15s'), { cpu: 'count' }),
-      'cpu',
+      highCpuFiltered.aggregate(Sequence.every('15s'), { cpu_avg: 'count' }),
+      'cpu_avg',
       tStart,
       tEnd,
     );
@@ -796,9 +777,55 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     return sum + (last?.value ?? 0);
   }, 0);
 
+  // 15. Logs section — most recent host-tick frames from the
+  //     aggregate snapshot, newest first. Pre-step 9 the Logs
+  //     section iterated raw events from `/live`; post-retirement it
+  //     shows the actual aggregate-wire flow. Keeps the "demonstrate
+  //     direct event iteration" affordance the section was always
+  //     for. Filtered to enabled hosts so the toggle behaviour
+  //     matches the rest of the dashboard.
+  const recentTicks = useMemo<ReadonlyArray<HostTick>>(() => {
+    if (!aggSnapshot || aggSnapshot.length === 0) return [];
+    const out: HostTick[] = [];
+    // Iterate the snapshot's tail; pond keeps events in chronological
+    // order so iterating from `length-1` backwards gives newest-first.
+    // Cap the scan at 200 to bound the work even at firehose; we only
+    // need the top 20 after filtering.
+    const maxScan = 200;
+    const start = Math.max(0, aggSnapshot.length - maxScan);
+    for (let i = aggSnapshot.length - 1; i >= start && out.length < 20; i--) {
+      const e = aggSnapshot.at(i);
+      if (!e) continue;
+      const host = e.get('host');
+      if (typeof host !== 'string' || !enabledHosts.has(host)) continue;
+      // The aggregate wire row's columns map cleanly onto HostTick;
+      // pond's typed accessors give the right shape per
+      // `aggregateSchema`.
+      out.push({
+        ts: e.key().timestampMs(),
+        host,
+        cpu_avg: (e.get('cpu_avg') as number | null) ?? null,
+        cpu_sd: (e.get('cpu_sd') as number | null) ?? null,
+        cpu_n: e.get('cpu_n'),
+        n_current: e.get('n_current'),
+        anomalies_above:
+          (e.get('anomalies_above') as ReadonlyArray<number> | undefined) ??
+          [],
+        anomalies_below:
+          (e.get('anomalies_below') as ReadonlyArray<number> | undefined) ??
+          [],
+        requests_avg: (e.get('requests_avg') as number | null) ?? null,
+        requests_sum: e.get('requests_sum'),
+        requests_n: e.get('requests_n'),
+        window_age_seconds: e.get('window_age_seconds'),
+        cpu_min: (e.get('cpu_min') as number | null) ?? null,
+        cpu_max: (e.get('cpu_max') as number | null) ?? null,
+      });
+    }
+    return out;
+  }, [aggSnapshot, enabledHosts]);
+
   return {
-    liveSeries,
-    liveStreamEnabled: LIVE_STREAM_ENABLED,
     totalEvents: totalEventsGlobal,
     totalRequests,
     eventsPerSec,
@@ -817,7 +844,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     bars,
     reqSeries,
     totalReqPerSec,
-    timeSeries,
+    recentTicks,
     aggregate,
     tStart,
     tEnd,

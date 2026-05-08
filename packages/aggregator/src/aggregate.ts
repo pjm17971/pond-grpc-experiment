@@ -191,6 +191,15 @@ export function startAggregate(
   // natural shape here.
   let eventsIngested = 0;
   let eventsEvicted = 0;
+  // Step 9 — cumulative `requests`-column sum across every ingested
+  // event. Drives the dashboard's "Total requests" headline after
+  // /live retirement; previously the dashboard rolled it up itself
+  // off the raw firehose, which was exactly the path the wire-side
+  // aggregate redesign was supposed to eliminate. Same listener
+  // shape as `eventsIngested`; pond's `Event.get('requests')` is
+  // narrowed to `number` by the schema so no nullability handling
+  // needed at the row level.
+  let requestsIngested = 0;
   // `firstEventTs` — wall-clock of the first event the aggregator
   // ever sees. Used to compute `window_age_seconds` per emitted
   // tick. Once the rolling window has been full for >=60s, age
@@ -198,6 +207,9 @@ export function startAggregate(
   let firstEventTs: number | null = null;
   const offBatch = live.on('batch', (events) => {
     eventsIngested += events.length;
+    for (const e of events) {
+      requestsIngested += e.get('requests');
+    }
     if (firstEventTs === null && events.length > 0) {
       firstEventTs = events[0].key().timestampMs();
     }
@@ -306,6 +318,7 @@ export function startAggregate(
         events_ingested_total: eventsIngested,
         events_per_sec: Math.round(latestEventsPerSec),
         evicted_total: eventsEvicted,
+        requests_ingested_total: requestsIngested,
       };
 
       const msg: AggregateAppendMsg = {
