@@ -41,6 +41,12 @@ const mkTick = (
   // slices; null when n_current==0.
   cpu_min: cpu_n > 0 ? cpu_avg - 0.05 : null,
   cpu_max: cpu_n > 0 ? cpu_avg + 0.05 : null,
+  // Per-tick distribution avg/stddev (200ms slice). Defaults
+  // mirror the cpu_avg/cpu_sd shape — tests don't exercise
+  // current-window stats specifically, just need the field
+  // present so HostTick is structurally complete.
+  current_avg: cpu_n > 0 ? cpu_avg : null,
+  current_sd: cpu_n > 1 ? 0.04 : null,
 });
 
 describe('applyAggregateFrame', () => {
@@ -159,6 +165,8 @@ describe('tickToRow', () => {
       window_age_seconds: 60,
       cpu_min: 0.42,
       cpu_max: 0.71,
+      current_avg: 0.56,
+      current_sd: 0.05,
     });
     expect(row).toEqual([
       1_700_000_000_000,
@@ -175,10 +183,12 @@ describe('tickToRow', () => {
       60,
       0.42,
       0.71,
+      0.56,
+      0.05,
     ]);
   });
 
-  it('preserves nullable cpu_avg / cpu_sd / requests_avg / cpu_min / cpu_max', () => {
+  it('preserves nullable cpu_avg / cpu_sd / requests_avg / cpu_min / cpu_max / current_*', () => {
     const row = tickToRow({
       ts: 1_700_000_000_000,
       host: 'api-1',
@@ -194,6 +204,8 @@ describe('tickToRow', () => {
       window_age_seconds: 0,
       cpu_min: null,
       cpu_max: null,
+      current_avg: null,
+      current_sd: null,
     });
     expect(row).toEqual([
       1_700_000_000_000,
@@ -208,6 +220,8 @@ describe('tickToRow', () => {
       0,
       0,
       0,
+      null,
+      null,
       null,
       null,
     ]);
@@ -239,6 +253,8 @@ describe('tickToRow', () => {
         window_age_seconds: 30,
         cpu_min: 0.42,
         cpu_max: 0.7,
+        current_avg: 0.52,
+        current_sd: 0.06,
       },
       {
         ts: 1_700_000_000_200,
@@ -255,6 +271,8 @@ describe('tickToRow', () => {
         window_age_seconds: 30.2,
         cpu_min: null,
         cpu_max: null,
+        current_avg: null,
+        current_sd: null,
       },
       {
         ts: 1_700_000_000_400,
@@ -271,6 +289,8 @@ describe('tickToRow', () => {
         window_age_seconds: 30.4,
         cpu_min: 0.51,
         cpu_max: 0.78,
+        current_avg: 0.62,
+        current_sd: 0.07,
       },
     ];
     expect(() => live.pushJson(ticks.map(tickToRow))).not.toThrow();

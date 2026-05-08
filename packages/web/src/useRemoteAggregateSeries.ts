@@ -21,8 +21,9 @@ type AggregateRow = JsonRowForSchema<AggregateSchema>;
  * accepts. Tuple order matches `aggregateSchema`'s column order:
  * `[time, host, cpu_avg, cpu_sd, cpu_n, n_current, anomalies_above,
  * anomalies_below, requests_avg, requests_sum, requests_n,
- * window_age_seconds, cpu_min, cpu_max]`. Stays close to the rest
- * of the experiment's "convert at the boundary" pattern.
+ * window_age_seconds, cpu_min, cpu_max, current_avg, current_sd]`.
+ * Stays close to the rest of the experiment's "convert at the
+ * boundary" pattern.
  */
 export function tickToRow(tick: HostTick): AggregateRow {
   return [
@@ -40,6 +41,8 @@ export function tickToRow(tick: HostTick): AggregateRow {
     tick.window_age_seconds,
     tick.cpu_min,
     tick.cpu_max,
+    tick.current_avg,
+    tick.current_sd,
   ];
 }
 

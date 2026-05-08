@@ -88,6 +88,8 @@ export const aggregateSchema = [
   { name: 'window_age_seconds', kind: 'number' },
   { name: 'cpu_min', kind: 'number', required: false },
   { name: 'cpu_max', kind: 'number', required: false },
+  { name: 'current_avg', kind: 'number', required: false },
+  { name: 'current_sd', kind: 'number', required: false },
 ] as const satisfies SeriesSchema;
 
 export type AggregateSchema = typeof aggregateSchema;

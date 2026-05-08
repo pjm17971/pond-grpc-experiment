@@ -30,6 +30,13 @@ import { useDashboardData } from './useDashboardData';
  */
 export function Dashboard() {
   const [chartOpts, setChartOpts] = useState<ChartOpts>({
+    // Anomaly bands (dashed σ edges + dots) are the headline overlay
+    // — on by default. Distribution band (raw points) is off by
+    // default; flip on to inspect within-tick spread of the
+    // underlying samples without paying for the extra two filled
+    // areas per host on first paint.
+    showBands: true,
+    showRaw: false,
     sigma: 2,
   });
   // The set of hosts the user has explicitly disabled. Hosts default

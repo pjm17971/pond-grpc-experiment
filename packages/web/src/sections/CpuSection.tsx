@@ -10,19 +10,28 @@ type Props = {
 };
 
 /**
- * The CPU section: header stats, the per-host line chart with two
- * stacked bands (inner ±σ + outer min/max) plus anomaly dots, the
- * σ slider, and the anomaly bucket bar chart underneath.
+ * The CPU section: header stats, the per-host line chart, two
+ * independent overlay toggles, the σ slider, and the anomaly bucket
+ * bar chart underneath.
  *
- * Single display mode now — the previous showBands / showRaw
- * toggles were retired in the dashboard-feedback round when the
- * stacked bands made both signals always-visible. The σ slider
- * controls the inner band's width; the outer min/max band tracks
- * the per-tick `cpu_min` / `cpu_max` extrema directly and is
- * independent of σ.
+ * Two overlays the chart can carry, controlled by two toggles:
+ *
+ * - **Show ±σ bands** (`showBands`): dashed-line edges per host at
+ *   `cpu_avg ± σ × cpu_sd` over the **1m baseline** window — the
+ *   anomaly threshold visualisation. Comes with red anomaly dots
+ *   placed at the per-tick `cpu_max` / `cpu_min` (the actual
+ *   sample that broke through the band). The σ slider only does
+ *   anything when this is on.
+ *
+ * - **Show raw points** (`showRaw`): two stacked filled bands per
+ *   host visualising the **per-tick (200 ms slice)** distribution
+ *   of the underlying samples — inner `current_avg ± current_sd`
+ *   at 30% opacity, outer `cpu_min … cpu_max` at 10%. No dots.
+ *   Distinct from the bands toggle: this is sample-distribution,
+ *   not anomaly-threshold.
  */
 export function CpuSection({ data, chartOpts, onChartOptsChange }: Props) {
-  const { sigma } = chartOpts;
+  const { showBands, showRaw, sigma } = chartOpts;
   const update = (patch: Partial<ChartOpts>) =>
     onChartOptsChange({ ...chartOpts, ...patch });
 
@@ -62,9 +71,17 @@ export function CpuSection({ data, chartOpts, onChartOptsChange }: Props) {
           yMax={0.9}
         />
         <div className="chart-toggles">
-          <span className="toggle-static">
-            ±{sigma.toFixed(1)}σ band (inner) · min/max envelope (outer)
-          </span>
+          <label
+            className="toggle"
+            title="Render dashed-line edges at cpu_avg ± σ·cpu_sd over the 1m baseline plus anomaly dots at the per-tick extreme value (cpu_max / cpu_min)."
+          >
+            <input
+              type="checkbox"
+              checked={showBands}
+              onChange={(e) => update({ showBands: e.target.checked })}
+            />
+            Show ±{sigma.toFixed(1)}σ bands
+          </label>
           <input
             type="range"
             min={0.5}
@@ -72,9 +89,21 @@ export function CpuSection({ data, chartOpts, onChartOptsChange }: Props) {
             step={0.1}
             value={sigma}
             onChange={(e) => update({ sigma: parseFloat(e.target.value) })}
+            disabled={!showBands}
             className="sigma-slider"
-            aria-label="inner band width in σ"
+            aria-label="band width in σ"
           />
+          <label
+            className="toggle"
+            title="Render two filled bands per host visualising the per-tick (200ms slice) distribution of samples: inner current_avg ± current_sd at 30% opacity, outer cpu_min … cpu_max at 10%. No dots."
+          >
+            <input
+              type="checkbox"
+              checked={showRaw}
+              onChange={(e) => update({ showRaw: e.target.checked })}
+            />
+            Show raw points
+          </label>
         </div>
         <BarChart
           title="Anomalies — 15s buckets"

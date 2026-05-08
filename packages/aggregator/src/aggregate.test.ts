@@ -459,6 +459,8 @@ describe('assembleTick', () => {
     window_age_seconds: 60,
     cpu_min: null,
     cpu_max: null,
+    current_avg: null,
+    current_sd: null,
   };
 
   it('returns zero-filled arrays when baseline stats are null', () => {
@@ -569,6 +571,8 @@ describe('assembleTick', () => {
         window_age_seconds: 60,
         cpu_min: 0.42,
         cpu_max: 0.58,
+        current_avg: 0.5,
+        current_sd: 0.06,
       },
       [0.6],
       thresholds,
@@ -579,6 +583,8 @@ describe('assembleTick', () => {
     expect(tickWithBaseline.window_age_seconds).toBe(60);
     expect(tickWithBaseline.cpu_min).toBe(0.42);
     expect(tickWithBaseline.cpu_max).toBe(0.58);
+    expect(tickWithBaseline.current_avg).toBe(0.5);
+    expect(tickWithBaseline.current_sd).toBe(0.06);
 
     // And on a null-baseline tick (no cpu stats yet, but requests
     // can still be present — the two columns gate independently).
@@ -599,6 +605,8 @@ describe('assembleTick', () => {
         window_age_seconds: 25,
         cpu_min: null,
         cpu_max: null,
+        current_avg: null,
+        current_sd: null,
       },
       [],
       thresholds,
@@ -609,6 +617,8 @@ describe('assembleTick', () => {
     expect(tickNullBaseline.requests_n).toBe(10);
     expect(tickNullBaseline.cpu_min).toBeNull();
     expect(tickNullBaseline.cpu_max).toBeNull();
+    expect(tickNullBaseline.current_avg).toBeNull();
+    expect(tickNullBaseline.current_sd).toBeNull();
     expect(tickNullBaseline.window_age_seconds).toBe(25);
   });
 });

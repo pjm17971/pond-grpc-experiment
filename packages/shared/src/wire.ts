@@ -74,11 +74,21 @@ export type AppendMsg = { type: 'append'; rows: ReadonlyArray<WireRow> };
  *   given tick — repeated per row for self-describing chart history.
  * - `cpu_min`, `cpu_max` (step 7) — extrema of the `cpu` column over
  *   the 200ms slice (same window as `cpu_samples` / `n_current`).
- *   Tick-resolution envelope around `cpu_avg`. Drives the dashboard's
- *   "show min/max envelope" toggle (the WIRE.md repurpose of the
- *   deprecated raw-samples scatter overlay) — visible texture even
- *   when the 1m smoothed line is flat. Nullable: both are `null`
+ *   Tick-resolution envelope around `cpu_avg`. Drives the outer
+ *   layer of the dashboard's "Show raw points" distribution overlay
+ *   (the wider per-tick min … max band). Nullable: both are `null`
  *   when the slice is empty (`n_current === 0`).
+ * - `current_avg`, `current_sd` — average and standard deviation of
+ *   the `cpu` column over the **200ms slice** (same window as
+ *   `cpu_min` / `cpu_max` / `n_current`). Distinct from `cpu_avg` /
+ *   `cpu_sd` which are over the **1m baseline**. The dashboard's
+ *   "Show raw points" toggle uses these for the inner per-tick
+ *   distribution band (`current_avg ± current_sd`) inside the
+ *   wider `cpu_min … cpu_max` envelope — visualises the
+ *   distribution of the underlying samples *at this tick* rather
+ *   than the smoother rolling 1m shape. Nullable: both are `null`
+ *   when the slice is empty; `current_sd` is also `null` when
+ *   `n_current < 2` (variance undefined for n ≤ 1).
  */
 export type HostTick = {
   ts: number;
@@ -95,6 +105,8 @@ export type HostTick = {
   window_age_seconds: number;
   cpu_min: number | null;
   cpu_max: number | null;
+  current_avg: number | null;
+  current_sd: number | null;
 };
 
 /**

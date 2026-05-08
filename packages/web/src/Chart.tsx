@@ -36,14 +36,6 @@ export type ChartBand = {
   lower: ChartPoint[];
   /** Fill opacity for the band. Defaults to 0.12. */
   opacity?: number;
-  /**
-   * Render the band's edges as dashed strokes (in the band's
-   * `color`). Off by default — bands are unstroked filled regions.
-   * Set true on the stacked-bands design (±σ inner + min/max
-   * outer) so each band's boundary stays visually distinct even
-   * when two bands of the same host overlap.
-   */
-  dashed?: boolean;
 };
 
 export type ChartDots = {
@@ -199,10 +191,7 @@ export function Chart({
                 const hi = d[bandKey(b.name, 'upper')];
                 return lo == null || hi == null ? undefined : [lo, hi];
               }}
-              stroke={b.dashed ? b.color : 'none'}
-              strokeDasharray={b.dashed ? '4 3' : undefined}
-              strokeWidth={b.dashed ? 1 : 0}
-              strokeOpacity={b.dashed ? 0.55 : 0}
+              stroke="none"
               fill={b.color}
               fillOpacity={b.opacity ?? 0.12}
               isAnimationActive={false}

@@ -88,10 +88,27 @@ function deriveAggregateUrl(rawUrl: string): string {
 
 export type ChartOpts = {
   /**
-   * Inner band width in standard deviations. Drives the
-   * cpu_avg ± σ × cpu_sd band per host. The outer min/max band
-   * is independent of this — it tracks the actual per-tick
-   * extrema regardless of σ.
+   * "Show ±σ bands" toggle — when on, the CPU chart renders dashed
+   * line edges at `cpu_avg ± σ·cpu_sd` (the **1m baseline** stats)
+   * per host plus the per-tick anomaly dots. When off, both the
+   * dashed edges and the dots are hidden. The σ slider is only
+   * meaningful with this on.
+   */
+  showBands: boolean;
+  /**
+   * "Show raw points" toggle — when on, the CPU chart renders two
+   * stacked filled bands per host visualising the **per-tick (200
+   * ms slice)** distribution of underlying samples:
+   *   - inner band: `current_avg ± current_sd` (30% opacity)
+   *   - outer band: `cpu_min … cpu_max` (10% opacity)
+   * No dots on these bands; off-by-default to keep the first-time
+   * render path light.
+   */
+  showRaw: boolean;
+  /**
+   * Width of the bands toggle's ±σ edges, in standard deviations.
+   * Drives `cpu_avg ± σ·cpu_sd` over the 1m baseline. Only
+   * meaningful when `showBands` is true.
    */
   sigma: number;
 };
@@ -228,11 +245,14 @@ export type DashboardData = {
 
 export function useDashboardData(args: DashboardArgs): DashboardData {
   const { disabledHosts, chartOpts } = args;
-  // Inner-band width in σ. The per-host CPU chart always renders
-  // both the inner ±σ band (cpu_avg ± σ·cpu_sd) and the outer
-  // min/max band (cpu_min … cpu_max); this slider tunes the σ
-  // multiplier on the inner band only.
-  const { sigma } = chartOpts;
+  // Two independent overlay toggles + the σ slider.
+  // - `showBands`: dashed-edges anomaly bands at `cpu_avg ± σ·cpu_sd`
+  //   over the 1m baseline, plus anomaly dots.
+  // - `showRaw`: filled distribution bands over the 200ms slice
+  //   (inner `current_avg ± current_sd`, outer `cpu_min … cpu_max`).
+  // - `sigma`: tunes the inner ±σ multiplier; only relevant when
+  //   `showBands` is on.
+  const { showBands, showRaw, sigma } = chartOpts;
 
   // 1. Aggregate stream — `/live-agg` mirror with the wire's per-host
   //    tick aggregates and per-tick globals. The dashboard's only live
@@ -447,6 +467,13 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
         n_current: 'last',
         cpu_min: 'min',
         cpu_max: 'max',
+        // 200ms-slice distribution stats — averaged across the
+        // downsample bucket. The "raw points" toggle plots
+        // current_avg ± current_sd as the inner distribution band.
+        // Bucket-averaging slightly blurs the per-tick spread but
+        // that's fine for visualisation at chart scale.
+        current_avg: 'avg',
+        current_sd: 'avg',
       })
       .toMap((g) => g.toPoints());
     const tDownsample = perf ? performance.now() : 0;
@@ -506,15 +533,22 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       }
 
       // ── Pass 2: line + band points from the downsampled bucket
-      //    rows. Two bands per host:
-      //      - inner ±σ band: cpu_avg ± σ·cpu_sd
-      //      - outer min/max band: cpu_min … cpu_max (the spike
-      //        envelope; pond's `'min'`/`'max'` reducers preserve
-      //        single-tick extrema across the downsample bucket)
-      const innerUpper: ChartPoint[] = [];
-      const innerLower: ChartPoint[] = [];
-      const outerUpper: ChartPoint[] = [];
-      const outerLower: ChartPoint[] = [];
+      //    rows. Up to four overlay layers per host depending on
+      //    toggles:
+      //      - smoothed line: always (cpu_avg, gated on cpu_n >= 30)
+      //      - showBands: dashed-line edges at cpu_avg ± σ·cpu_sd
+      //        (1m baseline) — emitted as two `hideFromLegend`
+      //        ChartSeries with `dashed: true`, NOT a filled band
+      //      - showRaw inner: filled band at current_avg ±
+      //        current_sd (200ms slice), 30% opacity, no edges
+      //      - showRaw outer: filled band at cpu_min … cpu_max
+      //        (200ms slice), 10% opacity, no edges
+      const sigmaUpper: ChartPoint[] = [];
+      const sigmaLower: ChartPoint[] = [];
+      const distInnerUpper: ChartPoint[] = [];
+      const distInnerLower: ChartPoint[] = [];
+      const distOuterUpper: ChartPoint[] = [];
+      const distOuterLower: ChartPoint[] = [];
       const smoothPoints: ChartPoint[] = [];
       let lastAvg: number | undefined;
 
@@ -533,41 +567,64 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
         if (gated && r.cpu_avg != null) {
           smoothPoints.push({ ts: r.ts, value: r.cpu_avg });
           lastAvg = r.cpu_avg;
+          // ±σ baseline edges (showBands toggle). Built every render;
+          // the toggle decides whether they're emitted into `series`.
           if (r.cpu_sd != null) {
-            innerUpper.push({
+            sigmaUpper.push({
               ts: r.ts,
               value: r.cpu_avg + sigma * r.cpu_sd,
             });
-            innerLower.push({
+            sigmaLower.push({
               ts: r.ts,
               value: r.cpu_avg - sigma * r.cpu_sd,
             });
           } else {
-            innerUpper.push({ ts: r.ts, value: undefined });
-            innerLower.push({ ts: r.ts, value: undefined });
+            sigmaUpper.push({ ts: r.ts, value: undefined });
+            sigmaLower.push({ ts: r.ts, value: undefined });
           }
         } else {
           // Below the gate or stats absent — render a gap (the
           // dashboard agent's render-gap convention from WIRE.md).
           smoothPoints.push({ ts: r.ts, value: undefined });
-          innerUpper.push({ ts: r.ts, value: undefined });
-          innerLower.push({ ts: r.ts, value: undefined });
+          sigmaUpper.push({ ts: r.ts, value: undefined });
+          sigmaLower.push({ ts: r.ts, value: undefined });
         }
-        // Outer band tracks cpu_min/cpu_max on every row,
-        // independent of the cpu_n MIN_SAMPLES gate (the smoothed
-        // line gates on baseline-sample-count, but the per-tick
-        // extrema are valid as long as the 200ms slice had any
-        // samples). Gate on slice content (`n_current >= 1`);
-        // empty slices ship null and render as a gap.
+        // Distribution bands (showRaw toggle). Independent of the
+        // cpu_n MIN_SAMPLES gate — they describe the per-tick
+        // 200ms slice, not the 1m baseline. Gate on slice content
+        // (`n_current >= 1`); empty slices ship null and render
+        // as a gap.
         const sliceFilled = (r.n_current ?? 0) >= 1;
-        outerUpper.push({
+        // Inner distribution band: current_avg ± current_sd.
+        // current_sd is null when n_current < 2 (variance
+        // undefined); fall back to a zero-width band at
+        // current_avg in that case so the band degenerates to
+        // a line at the single observed value.
+        const innerCenter =
+          sliceFilled && typeof r.current_avg === 'number'
+            ? r.current_avg
+            : undefined;
+        const innerSd =
+          sliceFilled && typeof r.current_sd === 'number'
+            ? r.current_sd
+            : 0;
+        distInnerUpper.push({
+          ts: r.ts,
+          value: innerCenter != null ? innerCenter + innerSd : undefined,
+        });
+        distInnerLower.push({
+          ts: r.ts,
+          value: innerCenter != null ? innerCenter - innerSd : undefined,
+        });
+        // Outer distribution band: cpu_min … cpu_max.
+        distOuterUpper.push({
           ts: r.ts,
           value:
             sliceFilled && typeof r.cpu_max === 'number'
               ? r.cpu_max
               : undefined,
         });
-        outerLower.push({
+        distOuterLower.push({
           ts: r.ts,
           value:
             sliceFilled && typeof r.cpu_min === 'number'
@@ -583,29 +640,58 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
           lastAvg != null ? `${(lastAvg * 100).toFixed(0)}%` : undefined,
         points: smoothPoints,
       });
-      // Outer band first so it renders BEHIND the inner band (Recharts
-      // paints `<Area>` in document order). 10% fill, dashed edges.
-      if (outerUpper.length >= 2) {
+
+      // showRaw distribution bands: outer first (renders behind),
+      // inner on top. Filled, no dashed edges, no dots.
+      if (showRaw && distOuterUpper.length >= 2) {
         bands.push({
-          name: `${host}-outer`,
+          name: `${host}-dist-outer`,
           color,
-          upper: outerUpper,
-          lower: outerLower,
+          upper: distOuterUpper,
+          lower: distOuterLower,
           opacity: 0.1,
-          dashed: true,
         });
       }
-      if (innerUpper.length >= 2) {
+      if (showRaw && distInnerUpper.length >= 2) {
         bands.push({
-          name: `${host}-inner`,
+          name: `${host}-dist-inner`,
           color,
-          upper: innerUpper,
-          lower: innerLower,
+          upper: distInnerUpper,
+          lower: distInnerLower,
           opacity: 0.3,
-          dashed: true,
         });
       }
-      if (anomalyDots.length > 0) {
+
+      // showBands ±σ edges — two dashed `hideFromLegend` series
+      // (NOT a filled band). The legend already lists the host
+      // via the smoothed line; the dashed edges are visual
+      // context, not separate entries.
+      if (showBands && sigmaUpper.length >= 2) {
+        series.push({
+          name: `${host}-sigma-upper`,
+          color,
+          points: sigmaUpper,
+          dashed: true,
+          width: 1,
+          opacity: 0.7,
+          hideFromLegend: true,
+        });
+        series.push({
+          name: `${host}-sigma-lower`,
+          color,
+          points: sigmaLower,
+          dashed: true,
+          width: 1,
+          opacity: 0.7,
+          hideFromLegend: true,
+        });
+      }
+
+      // Anomaly dots only emitted when bands toggle is on (they're
+      // the "look here, this broke through the band" cue). Without
+      // bands the dots have no reference frame; the distribution
+      // band shows the spread but not the threshold.
+      if (showBands && anomalyDots.length > 0) {
         dots.push({ name: host, color: '#e23b3b', points: anomalyDots });
         allAnomalies.push(...anomalyDots);
       }
@@ -641,6 +727,8 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     topHostsSet,
     hostColors,
     sigma,
+    showBands,
+    showRaw,
   ]);
 
   // 8. EMA-smoothed CPU trend across all enabled hosts (summary stat
@@ -889,6 +977,8 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
         window_age_seconds: e.get('window_age_seconds'),
         cpu_min: (e.get('cpu_min') as number | null) ?? null,
         cpu_max: (e.get('cpu_max') as number | null) ?? null,
+        current_avg: (e.get('current_avg') as number | null) ?? null,
+        current_sd: (e.get('current_sd') as number | null) ?? null,
       });
     }
     return out;

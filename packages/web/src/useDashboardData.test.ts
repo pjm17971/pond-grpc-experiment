@@ -26,6 +26,8 @@ const mkTick = (overrides: Partial<HostTick>): HostTick => ({
   window_age_seconds: 60,
   cpu_min: 0.45,
   cpu_max: 0.55,
+  current_avg: 0.5,
+  current_sd: 0.04,
   ...overrides,
 });
 
