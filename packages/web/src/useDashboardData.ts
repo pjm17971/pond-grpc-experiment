@@ -50,6 +50,7 @@ import {
   DEFAULT_AGGREGATE_THRESHOLDS,
   HOSTS,
   type HostTick,
+  type RankKey,
 } from '@pond-experiment/shared';
 import { countAtSigma } from './anomalyInterpolation';
 import { PALETTE, WINDOW_MS } from './dashboardSchema';
@@ -194,17 +195,24 @@ export type DashboardArgs = {
   chartOpts: ChartOpts;
   /**
    * Per-connection top-N preference. Drives the WS control message
-   * the dashboard sends after WS open / on slider drag — server
+   * the dashboard sends after WS open / on dropdown change — server
    * filters per tick at broadcast time to only the top-N busiest
-   * hosts by 1m baseline `cpu_avg`. Server-side hysteresis (margin 1)
-   * smooths boundary churn; the dashboard receives N or N+1 hosts
-   * per frame depending on stability.
+   * hosts by `rankBy`. Server-side hysteresis (margin 1) smooths
+   * boundary churn; the dashboard receives N or N+1 hosts per
+   * frame depending on stability.
    *
    * `null` clears the filter (server ships every host's row, the
    * pre-control-channel default behaviour). Numeric values are
    * server-clamped to `[1, max(hostCount, 1000)]`.
    */
   topN: number | null;
+  /**
+   * Rank metric for the top-N cut. Server sorts each tick's rows
+   * by this column, descending, before applying the cut + hysteresis.
+   * Restricted to 1m baseline metrics so the cut is "settled" rather
+   * than thrashing on per-tick noise. See `shared/wire.ts.RankKey`.
+   */
+  rankBy: RankKey;
 };
 
 export type DashboardData = {
@@ -251,13 +259,26 @@ export type DashboardData = {
   // through this slot.
   aggregate: RemoteAggregateState;
 
+  /**
+   * Per-host short window of `rankBy` values for the HostTable's
+   * sparkline column. Last ~60 ticks (~12 s at default 200ms cadence).
+   * Map key is host; value is chronologically-ordered samples.
+   * Empty entries (host present in `currentTopHosts` but no recent
+   * data in the windowed snapshot) are omitted; the table renders
+   * an empty cell in that case.
+   *
+   * Computed in this hook off `aggSnapshot` so the table doesn't
+   * need direct pond-ts knowledge.
+   */
+  sparklineData: ReadonlyMap<string, ReadonlyArray<number>>;
+
   // Shared time axis for both the CPU and Requests charts.
   tStart: number | undefined;
   tEnd: number | undefined;
 };
 
 export function useDashboardData(args: DashboardArgs): DashboardData {
-  const { disabledHosts, chartOpts, topN } = args;
+  const { disabledHosts, chartOpts, topN, rankBy } = args;
   // Two independent overlay toggles + the σ slider.
   // - `showBands`: dashed-edges anomaly bands at `cpu_avg ± σ·cpu_sd`
   //   over the 1m baseline, plus anomaly dots.
@@ -291,7 +312,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //    dashboard sees the cut already applied; chart memos iterate
   //    `hosts` and gate on `enabledHosts` without re-deriving a
   //    top-N slice client-side.
-  const aggregate = useRemoteAggregateSeries(AGG_WS_URL, topN);
+  const aggregate = useRemoteAggregateSeries(AGG_WS_URL, topN, rankBy);
   // Snapshot throttle. The wire delivers per-tick aggregate frames
   // every 200 ms, but the chart renders at the snapshot's cadence —
   // one redraw per throttle period across ~30 series + bands + dots.
@@ -447,20 +468,29 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       return { series, bands, dots, allAnomalies };
     }
 
-    if (enabledHosts.size === 0) {
+    if (enabledHosts.size === 0 || aggregate.currentTopHosts.size === 0) {
       return { series, bands, dots, allAnomalies };
     }
 
-    // **Filter to enabled hosts before partitioning** — server-side
-    // top-N has already capped the wire to ~5 host-rows per frame,
-    // so the snapshot is small to begin with; this drops anything
-    // the user has explicitly toggled off via HostToggles. Pond's
-    // `filter` + `partitionBy` walk the snapshot once each; the
-    // expensive step (`toPoints` row materialisation) sees only
-    // what we'll draw.
+    // **Filter to enabled ∩ current-top-N before partitioning.**
+    // The server-side cut already trims the wire to top-N rows per
+    // frame, but `aggSnapshot` retains 5min of history including
+    // hosts that have since dropped out — without this gate, the
+    // chart would render trails for hosts the table no longer
+    // shows. The HostTable model is "table is the chart's host
+    // selector": rows in the table = lines on the chart.
+    // `enabledHosts` is the user's per-row checkbox state on top
+    // of that. Pond's `filter` + `partitionBy` walk the snapshot
+    // once each; the expensive step (`toPoints` row materialisation)
+    // sees only what we'll draw.
+    const currentTopHosts = aggregate.currentTopHosts;
     const filtered = aggSnapshot.filter((e) => {
       const h = e.get('host');
-      return typeof h === 'string' && enabledHosts.has(h);
+      return (
+        typeof h === 'string' &&
+        enabledHosts.has(h) &&
+        currentTopHosts.has(h)
+      );
     });
     if (filtered.length === 0) {
       return { series, bands, dots, allAnomalies };
@@ -523,6 +553,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
 
     for (const host of hosts) {
       if (!enabledHosts.has(host)) continue;
+      if (!currentTopHosts.has(host)) continue;
       const color = hostColors[host];
 
       // ── Pass 1: per-tick anomaly dots (full resolution). Anomalies
@@ -766,6 +797,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     aggregateThresholds,
     hosts,
     enabledHosts,
+    aggregate.currentTopHosts,
     hostColors,
     sigma,
     showBands,
@@ -903,7 +935,9 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //     smoothing's added lag.
   const reqSeries = useMemo<ChartSeries[]>(() => {
     if (!aggSnapshot || aggSnapshot.length === 0) return [];
-    if (enabledHosts.size === 0) return [];
+    if (enabledHosts.size === 0 || aggregate.currentTopHosts.size === 0) {
+      return [];
+    }
     // Same filter-before-partition + downsample pattern as the CPU
     // section. `requests_sum` is already a 1-min rolling sum, so
     // averaging it across the bucket gives the natural plot value;
@@ -911,18 +945,22 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     // sample at the bucket's terminal tick. No spike-preserving
     // signal here so all reducers are smooth-friendly.
     //
-    // Server-side top-N already caps the wire to the same hosts
-    // that drive the CPU chart, so cross-section visual coherence
-    // (a host visible in one is visible in the other) holds without
-    // a client-side re-derivation. The only client filter left
-    // here is the user's HostToggles (`enabledHosts`).
+    // Filtered to current-top-N ∩ enabled — same model as the CPU
+    // chart: the HostTable's row set is the chart's host selector.
+    // Cross-section coherence (a host visible in CPU is visible in
+    // Requests) is automatic since both filter on the same set.
+    const currentTopHosts = aggregate.currentTopHosts;
     const aggBucketMs = Math.max(
       200,
       Math.ceil(WINDOW_MS / TARGET_CHART_POINTS),
     );
     const filtered = aggSnapshot.filter((e) => {
       const h = e.get('host');
-      return typeof h === 'string' && enabledHosts.has(h);
+      return (
+        typeof h === 'string' &&
+        enabledHosts.has(h) &&
+        currentTopHosts.has(h)
+      );
     });
     if (filtered.length === 0) return [];
     const perHostRows = filtered
@@ -937,6 +975,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     const out: ChartSeries[] = [];
     for (const host of hosts) {
       if (!enabledHosts.has(host)) continue;
+      if (!currentTopHosts.has(host)) continue;
       const rows = perHostRows.get(host) ?? [];
       const points: ChartPoint[] = [];
       let latestRate: number | undefined;
@@ -967,7 +1006,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       });
     }
     return out;
-  }, [aggSnapshot, hosts, enabledHosts, hostColors]);
+  }, [aggSnapshot, hosts, enabledHosts, aggregate.currentTopHosts, hostColors]);
 
   // 14. Total req/sec across visible hosts — see
   //     `computeTotalReqPerSec` for the freshness-gate math.
@@ -1027,6 +1066,59 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     return out;
   }, [aggSnapshot, enabledHosts]);
 
+  // 16. Sparkline data for the HostTable. Per-host short window of
+  //     `rankBy` values, used by the table's per-row sparkline cell
+  //     to show a 12s-ish trend at a glance. Cap at the most recent
+  //     ~60 ticks (`SPARKLINE_POINTS`) to bound canvas draw cost; at
+  //     the default 200ms cadence that's a 12s window which is the
+  //     minimum useful "is this host trending up/down" view.
+  //
+  //     Iterates the snapshot's tail backwards (newest-first) and
+  //     bails when every visible host has filled its buffer or the
+  //     scan budget is exhausted. The reverse output is then flipped
+  //     to chronological order before storing — sparkline draws
+  //     oldest-left, newest-right.
+  const sparklineData = useMemo<
+    ReadonlyMap<string, ReadonlyArray<number>>
+  >(() => {
+    if (!aggSnapshot || aggSnapshot.length === 0) return new Map();
+    if (aggregate.currentTopHosts.size === 0) return new Map();
+    const SPARKLINE_POINTS = 60;
+    // Reverse-order accumulator: each host gets up to N points
+    // newest-first, then we reverse before returning.
+    const reverseAcc = new Map<string, number[]>();
+    for (const host of aggregate.currentTopHosts) reverseAcc.set(host, []);
+    // Bound the scan: most we ever need is N hosts × SPARKLINE_POINTS
+    // events, plus slack for hosts with sparse data. 8× headroom.
+    const maxScan = Math.min(
+      aggSnapshot.length,
+      aggregate.currentTopHosts.size * SPARKLINE_POINTS * 8,
+    );
+    let filled = 0;
+    const target = aggregate.currentTopHosts.size;
+    for (let i = aggSnapshot.length - 1; i >= aggSnapshot.length - maxScan; i--) {
+      if (filled >= target) break;
+      const e = aggSnapshot.at(i);
+      if (!e) continue;
+      const host = e.get('host');
+      if (typeof host !== 'string') continue;
+      const arr = reverseAcc.get(host);
+      if (!arr || arr.length >= SPARKLINE_POINTS) continue;
+      const v = e.get(rankBy);
+      if (typeof v === 'number') {
+        arr.push(v);
+        if (arr.length >= SPARKLINE_POINTS) filled += 1;
+      }
+    }
+    // Flip each per-host buffer so output is oldest→newest.
+    const out = new Map<string, ReadonlyArray<number>>();
+    for (const [host, arr] of reverseAcc) {
+      if (arr.length === 0) continue;
+      out.set(host, arr.slice().reverse());
+    }
+    return out;
+  }, [aggSnapshot, aggregate.currentTopHosts, rankBy]);
+
   return {
     totalEvents: totalEventsGlobal,
     totalRequests,
@@ -1047,6 +1139,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     totalReqPerSec,
     recentTicks,
     aggregate,
+    sparklineData,
     tStart,
     tEnd,
   };
