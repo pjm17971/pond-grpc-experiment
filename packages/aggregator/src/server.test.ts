@@ -39,6 +39,12 @@ const mkRow = (host: string, cpu: number | null) => ({
   current_sd: cpu != null ? 0.04 : null,
 });
 
+/** Tiny prefs helper — defaults `lastTopHosts: null` so most cases read clean. */
+const prefs = (
+  topN: number | null,
+  lastTopHosts: ReadonlySet<string> | null = null,
+) => ({ topN, lastTopHosts });
+
 describe('projectAppend (per-subscriber wire projection)', () => {
   const baseMsg: AggregateAppendMsg = {
     type: 'aggregate-append',
@@ -58,23 +64,32 @@ describe('projectAppend (per-subscriber wire projection)', () => {
   };
 
   it('passes through unchanged when prefs.topN is null', () => {
-    expect(projectAppend(baseMsg, { topN: null })).toBe(baseMsg);
+    const out = projectAppend(baseMsg, prefs(null));
+    expect(out.msg).toBe(baseMsg);
+    expect(out.lastTopHosts).toBeNull();
   });
 
   it('passes through unchanged when topN >= row count', () => {
-    expect(projectAppend(baseMsg, { topN: 5 })).toBe(baseMsg);
-    expect(projectAppend(baseMsg, { topN: 10 })).toBe(baseMsg);
+    expect(projectAppend(baseMsg, prefs(5)).msg).toBe(baseMsg);
+    expect(projectAppend(baseMsg, prefs(10)).msg).toBe(baseMsg);
+    // Everyone-fits path still records the host set so the next
+    // call's hysteresis has a non-null reference if rows grow past N.
+    const out = projectAppend(baseMsg, prefs(5));
+    expect(out.lastTopHosts).not.toBeNull();
+    expect(out.lastTopHosts!.size).toBe(5);
+    expect(out.lastTopHosts!.has('api-2')).toBe(true);
   });
 
   it('keeps top-N hosts ranked by cpu_avg, descending', () => {
-    const out = projectAppend(baseMsg, { topN: 2 });
-    expect(out.rows.map((r) => r.host)).toEqual(['api-2', 'api-4']);
+    const out = projectAppend(baseMsg, prefs(2));
+    expect(out.msg.rows.map((r) => r.host)).toEqual(['api-2', 'api-4']);
+    expect(out.lastTopHosts).toEqual(new Set(['api-2', 'api-4']));
   });
 
   it('preserves the rest of the message envelope (globals, type)', () => {
-    const out = projectAppend(baseMsg, { topN: 3 });
-    expect(out.type).toBe('aggregate-append');
-    expect(out.globals).toBe(baseMsg.globals);
+    const out = projectAppend(baseMsg, prefs(3));
+    expect(out.msg.type).toBe('aggregate-append');
+    expect(out.msg.globals).toBe(baseMsg.globals);
   });
 
   it('sorts hosts with null cpu_avg to the bottom (would otherwise outrank live hosts)', () => {
@@ -87,13 +102,192 @@ describe('projectAppend (per-subscriber wire projection)', () => {
         mkRow('api-4', 0.6),
       ],
     };
-    const out = projectAppend(msg, { topN: 2 });
-    expect(out.rows.map((r) => r.host)).toEqual(['api-4', 'api-2']);
+    const out = projectAppend(msg, prefs(2));
+    expect(out.msg.rows.map((r) => r.host)).toEqual(['api-4', 'api-2']);
   });
 
   it('returns an empty rows array when topN is 0 (degenerate edge — clamped at parse, but defensive)', () => {
-    const out = projectAppend(baseMsg, { topN: 0 });
-    expect(out.rows).toEqual([]);
+    const out = projectAppend(baseMsg, prefs(0));
+    expect(out.msg.rows).toEqual([]);
+  });
+});
+
+describe('projectAppend hysteresis', () => {
+  // Build five hosts at evenly-spaced cpu_avg so the rank order is
+  // stable and we can simulate "F sneaks ahead of E" without
+  // needing precise floating-point control. Top-5 cut, hysteresis
+  // margin 1 (the default).
+  const STABLE_RANKING: Array<[string, number]> = [
+    ['A', 0.9],
+    ['B', 0.8],
+    ['C', 0.7],
+    ['D', 0.6],
+    ['E', 0.5],
+    ['F', 0.4],
+    ['G', 0.3],
+  ];
+  const buildMsg = (
+    pairs: ReadonlyArray<[string, number]>,
+  ): AggregateAppendMsg => ({
+    type: 'aggregate-append',
+    rows: pairs.map(([h, cpu]) => mkRow(h, cpu)),
+  });
+
+  it('margin: 0 disables hysteresis entirely (regression-equivalent to strict top-N)', () => {
+    // Edge regime — useful for callers that want strict top-N
+    // (the pre-hysteresis behaviour, equivalent to passing 0
+    // through). Same input + lastTopHosts as the next test;
+    // the only difference is margin=0 vs margin=1.
+    const msg = buildMsg([
+      ['A', 0.9],
+      ['B', 0.8],
+      ['C', 0.7],
+      ['D', 0.6],
+      ['F', 0.55], // F sneaks above E
+      ['E', 0.5],
+    ]);
+    const out = projectAppend(
+      msg,
+      prefs(5, new Set(['A', 'B', 'C', 'D', 'E'])),
+      0,
+    );
+    expect(out.msg.rows.map((r) => r.host)).toEqual([
+      'A',
+      'B',
+      'C',
+      'D',
+      'F',
+    ]);
+    // E is dropped — no carry-over at margin 0.
+    expect(out.lastTopHosts).toEqual(new Set(['A', 'B', 'C', 'D', 'F']));
+  });
+
+  it('stable state: same hosts every tick, lastTopHosts converges and stays equal', () => {
+    // Two consecutive calls with the canonical ranking. The set
+    // `{A,B,C,D,E}` is the steady state; the second call should
+    // produce an identical set (no drift).
+    const msg = buildMsg(STABLE_RANKING);
+    const out1 = projectAppend(msg, prefs(5));
+    expect(out1.msg.rows.map((r) => r.host)).toEqual([
+      'A',
+      'B',
+      'C',
+      'D',
+      'E',
+    ]);
+    const out2 = projectAppend(msg, prefs(5, out1.lastTopHosts));
+    expect(out2.msg.rows.map((r) => r.host)).toEqual([
+      'A',
+      'B',
+      'C',
+      'D',
+      'E',
+    ]);
+    expect(out2.lastTopHosts).toEqual(out1.lastTopHosts);
+  });
+
+  it('single-rank boundary swap: keeps both edge hosts visible (N+1 hosts during churn)', () => {
+    // The flicker case the friction note documents. lastTopHosts
+    // = `{A,B,C,D,E}` (E was at rank 5). New tick: F sneaks above
+    // E, so strict top-5 = `{A,B,C,D,F}`. With margin 1, E (now
+    // at rank 6) is in lastTopHosts and inside the [N+1, N+margin]
+    // band, so it carries over. Output: 6 hosts, not 5.
+    const msg = buildMsg([
+      ['A', 0.9],
+      ['B', 0.8],
+      ['C', 0.7],
+      ['D', 0.6],
+      ['F', 0.55],
+      ['E', 0.5],
+      ['G', 0.3],
+    ]);
+    const out = projectAppend(
+      msg,
+      prefs(5, new Set(['A', 'B', 'C', 'D', 'E'])),
+    );
+    expect(out.msg.rows.map((r) => r.host)).toEqual([
+      'A',
+      'B',
+      'C',
+      'D',
+      'F',
+      'E',
+    ]);
+    // E and F both in the carry; the cut size is N+1 transiently.
+    expect(out.lastTopHosts).toEqual(new Set(['A', 'B', 'C', 'D', 'E', 'F']));
+  });
+
+  it('sustained drop: host past rank N+margin expels from cut', () => {
+    // F was carried in last frame (cut was {A,B,C,D,E,F}). This
+    // frame F drops decisively to rank 7 — outside the [N+1, N+1]
+    // carry band, so it's expelled. E recovers to rank 5; cut
+    // returns to N=5.
+    const msg = buildMsg([
+      ['A', 0.9],
+      ['B', 0.8],
+      ['C', 0.7],
+      ['D', 0.6],
+      ['E', 0.5],
+      ['G', 0.45],
+      ['F', 0.3], // dropped
+    ]);
+    const out = projectAppend(
+      msg,
+      prefs(5, new Set(['A', 'B', 'C', 'D', 'E', 'F'])),
+    );
+    expect(out.msg.rows.map((r) => r.host)).toEqual([
+      'A',
+      'B',
+      'C',
+      'D',
+      'E',
+    ]);
+    expect(out.lastTopHosts).toEqual(new Set(['A', 'B', 'C', 'D', 'E']));
+  });
+
+  it('burst entry: new host vaulting from far rank into top-N admits immediately', () => {
+    // Hysteresis is one-way (delays expulsion, never delays
+    // admission). A host that wasn't in lastTopHosts but is now at
+    // rank ≤ N joins the cut on its first tick.
+    const msg = buildMsg([
+      ['Z', 0.95], // burst from nowhere
+      ['A', 0.9],
+      ['B', 0.8],
+      ['C', 0.7],
+      ['D', 0.6],
+      ['E', 0.5],
+    ]);
+    const out = projectAppend(
+      msg,
+      prefs(5, new Set(['A', 'B', 'C', 'D', 'E'])),
+    );
+    // Z admitted, E carried (at new rank 6, which is in [N+1, N+1]).
+    expect(out.msg.rows.map((r) => r.host)).toEqual([
+      'Z',
+      'A',
+      'B',
+      'C',
+      'D',
+      'E',
+    ]);
+    expect(out.lastTopHosts).toEqual(
+      new Set(['Z', 'A', 'B', 'C', 'D', 'E']),
+    );
+  });
+
+  it('null lastTopHosts (cold start) is strict top-N — hysteresis warms up over the next frame', () => {
+    // First frame after connect, or after a `set-top-n` change;
+    // no carry-over reference yet. Cut equals strict top-N.
+    const msg = buildMsg([
+      ['A', 0.9],
+      ['B', 0.8],
+      ['C', 0.7],
+      ['F', 0.55],
+      ['E', 0.5],
+    ]);
+    const out = projectAppend(msg, prefs(3, null));
+    expect(out.msg.rows.map((r) => r.host)).toEqual(['A', 'B', 'C']);
+    expect(out.lastTopHosts).toEqual(new Set(['A', 'B', 'C']));
   });
 });
 
