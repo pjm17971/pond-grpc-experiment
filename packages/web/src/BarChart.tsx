@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import {
   Bar,
   BarChart as RBarChart,
@@ -30,7 +31,15 @@ type Props = {
   height?: number;
 };
 
-export function BarChart({
+/**
+ * Wrapped in `React.memo` for the same reason as `Chart` — the
+ * dashboard re-renders at WS-frame cadence (5 fps) but `bars`
+ * only changes at the snapshot throttle (500 ms). Memoisation
+ * skips the recharts reconciliation when bars haven't changed.
+ */
+export const BarChart = memo(BarChartImpl);
+
+function BarChartImpl({
   title,
   emptyLabel = 'no events yet',
   bars,

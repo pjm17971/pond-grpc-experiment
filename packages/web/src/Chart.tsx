@@ -1,4 +1,4 @@
-import { Fragment } from 'react';
+import { Fragment, memo } from 'react';
 import {
   Area,
   CartesianGrid,
@@ -71,7 +71,21 @@ function bandKey(name: string, side: 'lower' | 'upper'): string {
   return `__band_${name}_${side}`;
 }
 
-export function Chart({
+/**
+ * Wrapped in `React.memo` because the dashboard re-renders at the
+ * WS frame rate (5 fps — `latestGlobals` / `counters` updates) but
+ * the chart's data props (`series` / `bands` / `dots`) only change
+ * at the snapshot throttle's 500 ms cadence. Without memoisation
+ * Recharts' `<ComposedChart>` reconciles 5 fps producing fresh
+ * SVG `d`-strings + path-shape objects on every WS frame, which
+ * was the residual heap-growth source after the `chartHostsSet`
+ * fix moved the chart memo to a 500 ms cadence. Shallow-compare
+ * is enough — `useDashboardData` already returns stable references
+ * for unchanged memo outputs.
+ */
+export const Chart = memo(ChartImpl);
+
+function ChartImpl({
   title,
   series,
   bands = [],
