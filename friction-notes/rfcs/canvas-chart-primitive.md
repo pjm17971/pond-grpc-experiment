@@ -241,6 +241,52 @@ Rather than separate effects per layer, the experiment does grid → bands → l
 - **Streaming decimation policy.** The dashboard does its own `aggregate(Sequence.every(bucketMs), {...})` upstream of the chart to bound point count. The chart itself shouldn't decide what to drop.
 - **Cross-chart sync (linked tooltips, zoom-shared, etc.).** Out of scope for v1; orthogonal complexity that grows with the consumer count.
 
+## Performance techniques learned from uPlot
+
+[uPlot](https://github.com/leeoniya/uPlot) is the fastest 2D-canvas charting library in the JS ecosystem. The experiment did **not** adopt it (third-party dep + opinionated data shape that doesn't fit pond's outputs), but we read the source ruthlessly to extract everything portable. Below is the ranked list of techniques to consider, each with a uPlot citation so the library author can verify against their source.
+
+The framing throughout: **uPlot is a general-purpose library**, so most of its perf wins target scales it has to support (100k+ points, 60 fps streams). The library version of `@pond-ts/charts` targets a narrower band — the streaming dashboard case the experiment exercised. Many uPlot techniques don't pay back at our scale; flagging them honestly is as useful as listing the ones that do.
+
+### High-ROI ports (do these in v1)
+
+**1. Px-align integer rounding for crisp 1-px lines.** uPlot's `pxRound` rounds all pixel coords to integers, plus a `(width % 2) / 2` translate when stroking 1-px lines so the stroke centres on a pixel boundary instead of straddling two. Free legibility win on DPR=1 displays; invisible on Retina. uPlot: `pxRoundGen` in `src/paths/utils.js:242-244`, `incrRound` for plot bbox at `src/uPlot.js:780-783`. ~5-10 LOC port.
+
+**2. Rollover time-axis labels at boundary crossings.** uPlot has a per-tick formatter table that prints `7:28:30` normally but `7/14\n7:28:30` (two-line) when a tick crosses a date boundary versus the prior tick. Our `toLocaleTimeString()` doesn't do this; a 5-minute window crossing midnight or an hour boundary ships ambiguous "12:01:00" labels with no context. uPlot: `src/opts.js:143-152`. ~10 LOC port.
+
+**3. Pixel-density-based dot suppression** (replace constant threshold). The experiment's `SCATTER_DOT_THRESHOLD = 60` is a constant; uPlot does `idxs[1] - idxs[0] <= dim / (pointSpace * pxRatio)` so dots auto-disappear when there's <2px between them. Auto-adapts on resize. uPlot: `src/opts.js:750-761`. 1-line change.
+
+### Bookmark for v2 (port when we add the feature)
+
+**4. `closestIdx` for tooltip hit-testing.** When tooltips arrive, this is the entire hit-testing primitive: invert the x-scale at the mouse position to get a timestamp, binary-search the timestamp into the sorted X column, look up Y values per series at that index. 7 lines of bitwise binary search. uPlot: `src/utils.js:2-21`, used in `mouseMove → updateCursor` at `src/uPlot.js:2763`. ~50 LOC for the surrounding tooltip plumbing (DOM overlay, positioning).
+
+**5. Path2D caching across redraws.** uPlot stores `Path2D` per series and only invalidates when (a) a scale changed range, (b) data was replaced, (c) the canvas was resized. Style state is recomputed cheaply per draw. At our scale this is overkill — at 250 points × 5 series × 2 fps the rebuild cost is negligible. **But:** when we hit a denser dashboard (30+ series, 5+ fps update), this is the path-rendering scaling lever. uPlot: `src/uPlot.js:1556-1567` (invalidation), `1608-1619` (cache check), `1656-1661` (style recompute). ~30-50 LOC port.
+
+**6. `getOuterIdxs` — extend by one on each side.** Before drawing a series for visible range `[i0, i1]`, uPlot extends to `[i0-1, i1+1]` so the line connects past the plot edges and gets clipped, rather than ending exactly at the edge (which leaves a visible gap when the next data point is just offscreen). Only matters if/when consumers pre-window data upstream. uPlot: `src/uPlot.js:1583-1594`. Trivial port when relevant.
+
+### Explicitly skip (cargo-cult risk if read casually)
+
+The library author is going to read uPlot's source; these are the techniques that look impressive but do not pay back at our scale. Skipping them is correct, not lazy.
+
+**Typed arrays for data layout (`Float64Array` X column + parallel Y columns).** At 2,500 total points the iteration cost difference between `for (const p of s.points)` over `{ts, value}` objects and `for (let i; i < n; i++)` over typed arrays is unmeasurable — both stream through CPU cache fine. The shape change ripples through every consumer. **Only port if (a) heap pressure becomes a bottleneck or (b) hit-testing is being added and the binary-search code wants the columnar shape.** uPlot's reasoning is right at 100k points; ours is different.
+
+**Decimation (pixel-bucket min/max accumulator).** uPlot triggers decimation at `points >= 4 × pixelWidth` ≈ 2,400 points/series. Our cap is 250 (the chart memo's `TARGET_CHART_POINTS`). We hit decimation upstream via pond's `aggregate(Sequence.every(bucketMs), ...)`, not in the chart. **Skip unless rendering raw multi-week minute-resolution data on a single canvas.** uPlot: `src/paths/linear.js:51-117` (bucket accumulator), `src/paths/linear.js:4-15` (min/max/in/out drawing). 80 LOC of careful state machine if/when needed.
+
+**Context-style cache (only set `strokeStyle` when changed).** Setting `ctx.strokeStyle = '#abc'` is microseconds. We do it ~5-10 times per draw at 2 fps = ≤20 sets/second. The bookkeeping isn't worth it. uPlot's payback comes from chained interactions with `Map<color, Path2D>` for bar charts (next item) — neither of which applies to us. uPlot: `src/uPlot.js:1335-1354`.
+
+**`Map<color, Path2D>` batching for multi-color bars.** Groups bars by colour, builds one path per colour, emits one fill per colour. Saves state-set churn at hundreds-of-bars-per-frame. We don't have per-bar dynamic colouring (host colours are stable per row). The pattern is worth keeping mentally indexed for "30+ series sharing a small palette" later. uPlot: `src/paths/bars.js:103-117`.
+
+**Convergence loop for axis padding.** Axis sizes depend on label widths depend on values depend on scale depends on plot rect depends on axis sizes — uPlot loops `convergeSize()` up to `CYCLE_LIMIT = 3` times. We hardcode `PAD_L = 42` and that works because percentages cap at 100% (3 chars). Reconsider only if the library is ever asked to format raw bytes ("12.3 GB"). uPlot: `src/uPlot.js:789-809`.
+
+### What uPlot doesn't do (validates our design choices)
+
+These are **absent** from uPlot, which is informative — uPlot is a perf-careful library, so its absences are signals about what *isn't* a hot path issue at smaller scales:
+
+- **No `OffscreenCanvas` / Worker rendering.** uPlot is main-thread only. Confirms that "OffscreenCanvas + Worker" (see the dashboard's working-doc on this) is genuinely above-and-beyond uPlot territory, not table stakes. Library author shipping `@pond-ts/charts` with worker rendering would meaningfully exceed uPlot's perf model for the streaming-with-many-charts case.
+- **No dirty-rect tracking.** Every commit calls `ctx.clearRect(0, 0, can.width, can.height)` and redraws the world. Path-cache (#5) makes this cheap because most series don't *rebuild*, just *re-stroke*. Don't bother with dirty-rects.
+- **No `willReadFrequently` flag** on `getContext("2d")`. Implies they don't call `getImageData` (which we don't either). Skip.
+- **No `requestAnimationFrame` throttling.** Uses `microTask` for batch coalescing. At our 2 fps cadence, irrelevant.
+- **No incremental Path2D append on streaming data.** uPlot rebuilds paths from scratch on `setData` because it's a general library that doesn't know if data is streaming or replaced. **This is the architectural ceiling lift specific to our case** — see the relevant open question below.
+
 ## Open questions
 
 1. **Should `@pond-ts/charts` ship a `BarChart` too?** The dashboard has one (the anomaly-bucket chart) that's still on Recharts because its SVG is bounded — bar count = 5min/15s = 20 buckets. Migrating is mechanical, not heap-pressured. Worth shipping for consistency or leave as Recharts-friendly?
@@ -254,6 +300,27 @@ Rather than separate effects per layer, the experiment does grid → bands → l
 5. **TypeScript export shape.** The dashboard wants `ChartSeries` / `ChartBand` / `ChartPoint` types as part of the public API so the data adapter and the consumer's memo signatures can share the same types. Library should re-export.
 
 6. **Theming.** The experiment uses CSS variables (`currentColor`, `rgba(127, 127, 127, 0.5)`) so the chart inherits the dashboard's light/dark mode. Library should preserve the convention; no hardcoded hex values for axis labels / grid lines.
+
+7. **Append-only Path2D + ring buffer for streaming append.** This is the architectural ceiling lift uPlot doesn't take, and it's the place where a streaming-specific library can *exceed* a general-purpose one (see "What uPlot doesn't do" above).
+
+   **The setup.** uPlot rebuilds a series' `Path2D` from scratch on every `setData` because it doesn't know if the new data is "ten random rows replaced" or "the leftmost row dropped + one new row appended." Its assumption is full replacement.
+
+   **Our case is the latter.** A streaming dashboard's data update is structurally `[oldData[1..n], newPoint]` — drop one from the head, append one to the tail. **The geometry of every retained point is unchanged from frame to frame**; only the x-scale shifts (each point moves left by one bucket-width's worth of pixels). If we represent the per-series data as a ring buffer + a `Path2D` that tracks the buffer's tail, we can:
+   1. On each new sample, `path.lineTo(xScale(newTs), yScale(newValue))` — append-only.
+   2. When a sample falls off the left edge, leave the leading move in place — it'll be clipped by the canvas viewport.
+   3. Periodically (every N samples or when the path's accumulated commands grow too long), rebuild from the current ring contents.
+
+   The frame-to-frame draw cost is `O(1)` instead of `O(N)`. At our scale this is small relative savings; at higher streaming rates and longer windows it's the difference between holding 60 fps and not.
+
+   **What's tricky:**
+   - Path2D doesn't expose a "remove the head moveTo" operation, so we can't truly drop points from the front of an accumulated path. Either (a) accept that the path grows unboundedly and rebuild every K appends, or (b) keep two paths (active + spare), append to active, swap when active reaches K samples.
+   - X-axis scale changes (window slides left) require re-rendering — the cached path's x-coords are now stale. Either accept this and rebuild, or apply a `ctx.translate(deltaX, 0)` per frame and rebuild only when the translate accumulates beyond a tolerance.
+   - Resize / DPR changes invalidate everything. Same as uPlot's path cache — rebuild on these.
+   - Gap markers (our `value: undefined` sentinel that the data layer injects at expected-bucket-but-empty positions) become annoying to incrementally add — appending a `null` between two `lineTo`s requires breaking the path into "before-the-gap" and "after-the-gap" subpaths or tracking a `move = true` state.
+
+   **Open call:** is this worth the complexity for v1? I lean **no** — the bare canvas implementation already plateaus at 50 MB indefinitely under our load, and incremental Path2D would add ~150 LOC of state-machine + invalidation logic. It's the right *next* lever if streaming rate or window length grows past what uPlot's full-rebuild approach can support, but until then it's premature optimisation. Belongs in the RFC as a known opportunity, not a v1 blocker.
+
+   uPlot's relevant code, for the library author who wants to confirm uPlot doesn't do this: `resetYSeries(true)` zeroes all `_paths` on data change at `src/uPlot.js:1556`+, called from `setData` at `src/uPlot.js:2316-2325`. There's no incremental append path anywhere in the source.
 
 ## Citations
 
