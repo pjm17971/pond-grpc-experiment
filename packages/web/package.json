@@ -13,8 +13,8 @@
   },
   "dependencies": {
     "@pond-experiment/shared": "workspace:*",
-    "@pond-ts/react": "^0.16.1",
-    "pond-ts": "^0.16.1",
+    "@pond-ts/react": "^0.17.0",
+    "pond-ts": "^0.17.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
     "recharts": "^3.8.1"
