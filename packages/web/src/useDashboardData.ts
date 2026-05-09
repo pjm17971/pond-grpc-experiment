@@ -19,7 +19,7 @@
  */
 import { useMemo } from 'react';
 import { useWindow } from '@pond-ts/react';
-import { Sequence, TimeSeries, type SeriesSchema } from 'pond-ts';
+import { Sequence } from 'pond-ts';
 
 /**
  * Target points per chart series. The CPU/Requests charts are ~420px
@@ -924,31 +924,51 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   const bars: Bar[] = useMemo(() => {
     if (tStart == null || tEnd == null) return [];
     if (cpu.allAnomalies.length === 0) return [];
+    // Bucket directly into a fixed-grid count array — skip pond's
+    // `TimeSeries.fromPoints` + `aggregate(Sequence.every('15s'))`
+    // path. The pond pipeline allocates one Event per anomaly dot
+    // plus a TimeSeries clone per bucket; at high anomaly rates
+    // (5 hosts × ~2 dots/tick × 1500 ticks visible ≈ 15k dots) the
+    // memo runs every 500 ms and allocates ~4 MB per run for the
+    // intermediate TimeSeries + buckets, mostly GC'd but creating
+    // sustained pressure that the renderer was struggling with.
+    //
+    // Hand-rolled bucketing is O(N) over the input dots with one
+    // Bar object per non-empty 15s slot; ~10× lighter on allocation
+    // for the same output. The `anomalyTs.aggregate(...)` pattern
+    // would still be the right primitive if pond's per-bucket
+    // allocation cost shrinks, but for now this hot path is too
+    // hot for it.
+    const BUCKET_MS = 15_000;
     const MAX_ANOMALIES = 50_000;
-    const trimmed =
-      cpu.allAnomalies.length > MAX_ANOMALIES
-        ? cpu.allAnomalies.slice(-MAX_ANOMALIES)
-        : cpu.allAnomalies;
-    if (cpu.allAnomalies.length > MAX_ANOMALIES) {
-      // Loud signal in dev — if this fires we want to know.
+    const dots = cpu.allAnomalies;
+    const start = dots.length > MAX_ANOMALIES ? dots.length - MAX_ANOMALIES : 0;
+    if (dots.length > MAX_ANOMALIES) {
       console.warn(
-        `[dashboard] cpu.allAnomalies has ${cpu.allAnomalies.length} entries; trimming to last ${MAX_ANOMALIES}`,
+        `[dashboard] cpu.allAnomalies has ${dots.length} entries; trimming to last ${MAX_ANOMALIES}`,
       );
     }
-    const sortedAnomalies = [...trimmed].sort((a, b) => a.ts - b.ts);
-    const anomalyTs = TimeSeries.fromPoints(sortedAnomalies, {
-      name: 'anomalies',
-      schema: [
-        { name: 'time', kind: 'time' },
-        { name: 'value', kind: 'number' },
-      ] as const,
-    });
-    return aggregateToBars(
-      anomalyTs.aggregate(Sequence.every('15s'), { value: 'count' }),
-      'value',
-      tStart,
-      tEnd,
-    );
+    // Bucket-id → count. Each dot maps to one bucket via floor(ts/15s).
+    const counts = new Map<number, number>();
+    for (let i = start; i < dots.length; i++) {
+      const ts = dots[i].ts;
+      // Skip out-of-window dots — chart only shows tStart..tEnd.
+      if (ts < tStart || ts > tEnd) continue;
+      const bucket = Math.floor(ts / BUCKET_MS);
+      counts.set(bucket, (counts.get(bucket) ?? 0) + 1);
+    }
+    // Materialise as Bar[] sorted by time. ~tens of buckets in the
+    // visible window — sort cost is negligible.
+    const out: Bar[] = [];
+    const bucketIds = [...counts.keys()].sort((a, b) => a - b);
+    for (const id of bucketIds) {
+      out.push({
+        start: id * BUCKET_MS,
+        end: (id + 1) * BUCKET_MS,
+        count: counts.get(id)!,
+      });
+    }
+    return out;
   }, [cpu.allAnomalies, tStart, tEnd]);
 
   // 13. Requests: per-host rolling rate line + 1-min rolling rate as
@@ -1184,29 +1204,3 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   };
 }
 
-/**
- * Helper: turn a bucketed TimeSeries (output of `aggregate(seq,
- * { col: 'count' })`) into the bar chart's flat `Bar[]` shape, clipped
- * to the visible time axis.
- */
-function aggregateToBars(
-  buckets: TimeSeries<SeriesSchema>,
-  col: string,
-  tStart: number,
-  tEnd: number,
-): Bar[] {
-  const out: Bar[] = [];
-  for (const e of buckets) {
-    const start = e.key().begin();
-    const end = e.key().end();
-    if (end < tStart || start > tEnd) continue;
-    // Bucket events are dynamically typed (`SeriesSchema`); the count
-    // reducer always emits `number | undefined`.
-    out.push({
-      start,
-      end,
-      count: ((e.data() as Record<string, unknown>)[col] as number | undefined) ?? 0,
-    });
-  }
-  return out;
-}
