@@ -192,6 +192,19 @@ export function computeTotalReqPerSec(
 export type DashboardArgs = {
   disabledHosts: Set<string>;
   chartOpts: ChartOpts;
+  /**
+   * Per-connection top-N preference. Drives the WS control message
+   * the dashboard sends after WS open / on slider drag — server
+   * filters per tick at broadcast time to only the top-N busiest
+   * hosts by 1m baseline `cpu_avg`. Server-side hysteresis (margin 1)
+   * smooths boundary churn; the dashboard receives N or N+1 hosts
+   * per frame depending on stability.
+   *
+   * `null` clears the filter (server ships every host's row, the
+   * pre-control-channel default behaviour). Numeric values are
+   * server-clamped to `[1, max(hostCount, 1000)]`.
+   */
+  topN: number | null;
 };
 
 export type DashboardData = {
@@ -244,7 +257,7 @@ export type DashboardData = {
 };
 
 export function useDashboardData(args: DashboardArgs): DashboardData {
-  const { disabledHosts, chartOpts } = args;
+  const { disabledHosts, chartOpts, topN } = args;
   // Two independent overlay toggles + the σ slider.
   // - `showBands`: dashed-edges anomaly bands at `cpu_avg ± σ·cpu_sd`
   //   over the 1m baseline, plus anomaly dots.
@@ -269,17 +282,16 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //    summary indicator — that's the only WS the dashboard depends
   //    on for any visible content.
   //
-  //    `topN: 5` ships a `{type:'set-top-n', n: 5}` control message
-  //    on WS open so the **server** drops everything outside the
-  //    busiest 5 hosts before broadcasting. Replaces the older
-  //    client-side `topHosts.filter(...)` step that ran inside the
-  //    chart memos: now the wire only ships ~5 host-rows per frame
-  //    and the dashboard's chart pipeline doesn't have to re-derive
-  //    a top-N cut on every render. Keep the constant in lockstep
-  //    with the chart-section's expected legend size; a slider PR
-  //    will replace it with state.
-  const TOP_N_HOSTS = 5;
-  const aggregate = useRemoteAggregateSeries(AGG_WS_URL, TOP_N_HOSTS);
+  //    `topN` ships a `{type:'set-top-n', n}` control message on WS
+  //    open and on every prop change (no socket churn — see the
+  //    hook's wsRef/topNRef plumbing). The server drops everything
+  //    outside the busiest N hosts before broadcasting, applying
+  //    rank-based hysteresis (margin 1) so the visible cut doesn't
+  //    flicker when boundary hosts swap rank within a tick. The
+  //    dashboard sees the cut already applied; chart memos iterate
+  //    `hosts` and gate on `enabledHosts` without re-deriving a
+  //    top-N slice client-side.
+  const aggregate = useRemoteAggregateSeries(AGG_WS_URL, topN);
   // Snapshot throttle. The wire delivers per-tick aggregate frames
   // every 200 ms, but the chart renders at the snapshot's cadence —
   // one redraw per throttle period across ~30 series + bands + dots.
@@ -349,7 +361,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   }, []);
 
   // 4b. Visible-hosts notes (no derivation needed). Server-side top-N
-  //     (see `useRemoteAggregateSeries(url, TOP_N_HOSTS)` above + the
+  //     (see `useRemoteAggregateSeries(url, topN)` above + the
   //     aggregator's `projectAppend`) already trims each broadcast
   //     frame to the top-N busiest by 1m baseline `cpu_avg`, so
   //     `latestPerHost` and `aggSnapshot` only carry rows for hosts

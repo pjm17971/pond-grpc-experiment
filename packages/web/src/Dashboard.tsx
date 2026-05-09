@@ -47,8 +47,16 @@ export function Dashboard() {
   const [disabledHosts, setDisabledHosts] = useState<Set<string>>(
     () => new Set(HOSTS.slice(1)),
   );
+  // Per-connection top-N preference. Drives the WS control message
+  // the dashboard sends after open / on slider drag — see the
+  // `topN` prop on `useRemoteAggregateSeries` and the server-side
+  // `projectAppend`. Defaults to 5 — matches the chart's expected
+  // legend density at firehose × 10 hosts. Setting to `null` would
+  // ship every row (no filter); the slider clamps to [1, 15] in UI
+  // and the parser also clamps server-side.
+  const [topN, setTopN] = useState<number>(5);
 
-  const data = useDashboardData({ disabledHosts, chartOpts });
+  const data = useDashboardData({ disabledHosts, chartOpts, topN });
 
   const onToggleHost = (host: string) => {
     setDisabledHosts((prev) => {
@@ -72,7 +80,10 @@ export function Dashboard() {
         hosts={data.hosts}
         hostColors={data.hostColors}
         enabledHosts={data.enabledHosts}
+        currentTopHosts={data.aggregate.currentTopHosts}
         onToggle={onToggleHost}
+        topN={topN}
+        onTopNChange={setTopN}
       />
       <CpuSection
         data={data}

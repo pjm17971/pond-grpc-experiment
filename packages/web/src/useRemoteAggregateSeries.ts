@@ -189,6 +189,20 @@ export type RemoteAggregateState = {
   /** Most recent `HostTick` per host. Empty until the first append. */
   latestPerHost: ReadonlyMap<string, HostTick>;
   /**
+   * Host set from the most recent `aggregate-append` frame — the
+   * server-side top-N cut **plus** any hysteresis carry-overs.
+   * Distinct from `latestPerHost.keys()` which accumulates every
+   * host that has ever been in the cut (the map preserves stale
+   * ticks rather than dropping them — see `applyAggregateFrame`'s
+   * "host went silent briefly" semantic). `currentTopHosts` is
+   * the **right now** view: which hosts have a fresh row in the
+   * frame the dashboard is looking at.
+   *
+   * Drives the dashboard's faded host-pill UI. Empty until the
+   * first append frame; updated on every append.
+   */
+  currentTopHosts: ReadonlySet<string>;
+  /**
    * σ-threshold list from the most recent snapshot frame. Empty
    * before the first snapshot arrives. Step-4 anomaly interpolation
    * will key off this; step 2's probe and step 3's bands display it
@@ -273,6 +287,13 @@ export function useRemoteAggregateSeries(
   const [latestPerHost, setLatestPerHost] = useState<
     ReadonlyMap<string, HostTick>
   >(() => new Map());
+  // Host set from the most recent append frame's `rows` (server-side
+  // top-N + hysteresis carry-overs). Distinct from `latestPerHost`
+  // which preserves stale entries on host silence — this is "in the
+  // current frame" rather than "ever seen". Drives faded-pill UI.
+  const [currentTopHosts, setCurrentTopHosts] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const [thresholds, setThresholds] = useState<ReadonlyArray<number>>([]);
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [counters, setCounters] = useState<AggregateCounters>(ZERO_COUNTERS);
@@ -421,6 +442,17 @@ export function useRemoteAggregateSeries(
         const filteredMsg = { ...msg, rows: newerRows } as AggregateWireMsg;
         setLatestPerHost((prev) => applyAggregateFrame(prev, filteredMsg));
         if (msg.type === 'aggregate-append') {
+          // Track the current frame's host set — drives faded-pill UI.
+          // Use the **un-filtered** msg.rows here, not newerRows — even
+          // on a reconnect-replay where every row is older than the
+          // tail (newerRows is empty), the original frame still
+          // describes "who's in the cut right now". `setLatestPerHost`
+          // skips applying old rows, which is correct; here we want
+          // the wire's stated host set regardless. Skip empty frames
+          // to keep the previous set across silent ticks.
+          if (msg.rows.length > 0) {
+            setCurrentTopHosts(new Set(msg.rows.map((r) => r.host)));
+          }
           // True per-frame raw-event delta from globals. Falls back
           // to 0 for pre-step-6 servers that don't ship `globals`
           // (the counters then just report "0 raw events per
@@ -499,6 +531,7 @@ export function useRemoteAggregateSeries(
   return {
     liveSeries,
     latestPerHost,
+    currentTopHosts,
     thresholds,
     status,
     counters,

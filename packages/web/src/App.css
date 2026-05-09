@@ -116,8 +116,58 @@ header h1 {
   text-decoration: line-through;
 }
 
+/*
+ * Enabled host that's currently *outside* the server-side top-N cut
+ * (`currentTopHosts` doesn't include it). Distinct from `.off`: still
+ * eligible to render if it bursts into the cut, just dimmed so the
+ * eye reads the active cut at a glance. No strikethrough — the host
+ * isn't disabled, it's just quiet.
+ */
+.host-chip.on.faded {
+  opacity: 0.4;
+}
+.host-chip.on.faded:hover {
+  opacity: 0.7;
+}
+
 .host-chip .dot {
   border: 1px solid currentColor;
+}
+
+/*
+ * Top-N slider, sitting at the right end of the host-chip row.
+ * `margin-left: auto` pushes it to the right edge so the chips
+ * group on the left, the slider lives on the right — keeps the
+ * row scannable.
+ */
+.top-n-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+  padding-left: 0.75rem;
+  border-left: 1px solid rgba(127, 127, 127, 0.2);
+}
+
+.top-n-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  opacity: 0.55;
+}
+
+.top-n-slider {
+  flex: 0 0 100px;
+  accent-color: #4c8bf5;
+  cursor: pointer;
+}
+
+.top-n-value {
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  min-width: 1.4em;
+  text-align: right;
 }
 
 /* ── Sections ─────────────────────────────────────────── */
