@@ -293,14 +293,8 @@ function CanvasChartImpl({
       // them in lockstep; if the lengths differ we fall back to
       // ts-matching with a Map.
       const aligned = b.upper.length === b.lower.length;
-      // Implicit time-gap detection — same logic as the line
-      // drawing loop. A band shouldn't fill across a 90-second
-      // hole in the data even if both edges happen to be defined
-      // on each side of the gap.
-      const bandGapThresholdMs = Math.max(2_000, span * 0.015);
       if (aligned) {
         let runStart = -1;
-        let runLastTs = -Infinity;
         for (let i = 0; i <= b.upper.length; i++) {
           const u = i < b.upper.length ? b.upper[i] : undefined;
           const l = i < b.lower.length ? b.lower[i] : undefined;
@@ -310,21 +304,8 @@ function CanvasChartImpl({
             Number.isFinite(u.value) &&
             Number.isFinite(l.value) &&
             u.ts === l.ts;
-          // Time-gap: treat a too-wide jump from the previous
-          // defined point as a gap, splitting the run.
-          const tooFar =
-            hasBoth &&
-            runStart >= 0 &&
-            (u as ChartPoint).ts - runLastTs > bandGapThresholdMs;
           if (hasBoth && runStart < 0) {
             runStart = i;
-            runLastTs = (u as ChartPoint).ts;
-          } else if (hasBoth && tooFar) {
-            drawBandRun(ctx, b.upper, b.lower, runStart, i, xScale, yScale);
-            runStart = i;
-            runLastTs = (u as ChartPoint).ts;
-          } else if (hasBoth) {
-            runLastTs = (u as ChartPoint).ts;
           } else if (!hasBoth && runStart >= 0) {
             drawBandRun(ctx, b.upper, b.lower, runStart, i, xScale, yScale);
             runStart = -1;
@@ -361,36 +342,18 @@ function CanvasChartImpl({
     ctx.globalAlpha = 1;
 
     // ── 3. Series (lines, on top of bands) ─────────────────────
-    // Two gap signals — both required for a faithful render of
-    // sparse / discontinuous time series:
+    // Gap markers are the data layer's responsibility — what
+    // counts as "too far apart to bridge" is a domain question the
+    // chart can't answer in general (an annual-trend line over
+    // monthly samples should connect through gaps that on a
+    // 5-second feed would obviously be silence). The chart just
+    // honours explicit markers.
     //
-    // a) **Explicit gap markers** — `value` is null / undefined /
-    //    NaN / ±Infinity. `Number.isFinite` catches all four.
-    //    Pond's reducers emit NaN under degenerate bucket
-    //    conditions (which `value != null` would silently let
-    //    through, then `lineTo(NaN, NaN)` would behave as a "rest
-    //    the pen" instruction and visually bridge the gap with a
-    //    horizontal segment).
-    //
-    // b) **Implicit time gaps** — two consecutive defined points
-    //    that are wall-clock far apart relative to the visible
-    //    window. This handles the case where the upstream pipeline
-    //    didn't emit *any* rows for a stretch (e.g. a host that
-    //    fell outside the server-side top-N cut for 90s; pond's
-    //    `aggregate(Sequence.every(...))` only emits buckets for
-    //    times the host had data, so the gap shows up as missing
-    //    array entries rather than null markers). Without this
-    //    detection, the canvas chart connects the two surrounding
-    //    points with a straight line — the user-visible bridging.
-    //
-    //    Threshold: max of 2 seconds and 1.5% of the visible
-    //    window span. For the dashboard's 5-minute window that's
-    //    4.5s; for a 30s window it's 2s. The 1.5% scales with zoom
-    //    so the heuristic doesn't fall apart at unusual window
-    //    sizes. Hard-coded multiplier rather than learned from the
-    //    data because per-series median deltas would need a
-    //    two-pass walk and the constant works at our scales.
-    const gapThresholdMs = Math.max(2_000, span * 0.015);
+    // `Number.isFinite` (rather than `value != null`) rejects
+    // null, undefined, NaN, AND ±Infinity — so an upstream that
+    // emits NaN for a degenerate bucket reads as a gap, not as a
+    // `lineTo(NaN, NaN)` "rest pen" instruction that would
+    // visually bridge the surrounding defined points.
     for (const s of series) {
       ctx.strokeStyle = s.color;
       ctx.lineWidth = s.width ?? 1.5;
@@ -399,17 +362,10 @@ function CanvasChartImpl({
       ctx.setLineDash(s.dashed ? [4, 3] : []);
       ctx.beginPath();
       let move = true;
-      let lastTs = -Infinity;
       for (const p of s.points) {
         if (!Number.isFinite(p.value)) {
           move = true;
           continue;
-        }
-        // Implicit time-gap detection: if more than `gapThresholdMs`
-        // has passed since the last defined point we lifted the
-        // pen for, treat it as a gap.
-        if (!move && p.ts - lastTs > gapThresholdMs) {
-          move = true;
         }
         const x = xScale(p.ts);
         const y = yScale(p.value as number);
@@ -419,7 +375,6 @@ function CanvasChartImpl({
         } else {
           ctx.lineTo(x, y);
         }
-        lastTs = p.ts;
       }
       ctx.stroke();
     }

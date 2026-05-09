@@ -675,7 +675,34 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       //     center line still plots.
       const MIN_SAMPLES = 30;
       const aggRows = downsampledPerHost.get(host) ?? [];
+      // Gap detection: pond's `aggregate(Sequence.every(${aggBucketMs}ms))`
+      // only emits buckets where the source had events, so a host
+      // that fell out of the top-N filter for a stretch leaves a
+      // hole in `aggRows` rather than null markers. The chart can't
+      // tell "data is sparse on purpose" from "data is missing"
+      // without a domain hint, so we inject explicit `value:
+      // undefined` markers between rows whose ts-delta exceeds the
+      // expected bucket cadence — once per gap is enough to break
+      // the chart's line and band fills.
+      const GAP_FACTOR = 1.5;
+      let prevTs: number | undefined;
       for (const r of aggRows) {
+        if (prevTs !== undefined && r.ts - prevTs > aggBucketMs * GAP_FACTOR) {
+          // One gap marker mid-gap is enough — the chart treats any
+          // undefined entry as "lift the pen" so a single sentinel
+          // breaks both line and band rendering across the hole.
+          // Emit on every output array so the per-host loop's six
+          // overlay layers all see the gap.
+          const gapTs = prevTs + aggBucketMs;
+          smoothPoints.push({ ts: gapTs, value: undefined });
+          sigmaUpper.push({ ts: gapTs, value: undefined });
+          sigmaLower.push({ ts: gapTs, value: undefined });
+          distInnerUpper.push({ ts: gapTs, value: undefined });
+          distInnerLower.push({ ts: gapTs, value: undefined });
+          distOuterUpper.push({ ts: gapTs, value: undefined });
+          distOuterLower.push({ ts: gapTs, value: undefined });
+        }
+        prevTs = r.ts;
         const liveGate = (r.n_current ?? 0) >= 1;
         const baselineGate = (r.cpu_n ?? 0) >= MIN_SAMPLES;
         // Center line — `current_avg` per 200ms slice. Plots whenever
@@ -1034,23 +1061,30 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       const rows = perHostRows.get(host) ?? [];
       const points: ChartPoint[] = [];
       let latestRate: number | undefined;
+      // Same gap-detection pattern as the cpu memo above. Pond
+      // emits no rows for buckets where the host had no events
+      // (e.g. the host was outside the server-side top-N for a
+      // stretch); we inject `value: undefined` markers when
+      // consecutive rows are more than 1.5× the expected bucket
+      // cadence apart, so the chart breaks its lines through the
+      // hole rather than connecting the surrounding points.
+      const GAP_FACTOR = 1.5;
+      let prevTs: number | undefined;
       for (const r of rows) {
-        // Push **one point per bucket-row** including gaps, with
-        // `value: undefined` for the gate-failed rows. Pond's
-        // `aggregate(Sequence.every(...))` emits one event per
-        // bucket boundary regardless of bucket contents, so this
-        // loop sees every visible-window bucket; pushing undefined
-        // for the empty ones lets the canvas chart's gap detection
-        // see real gaps instead of bridging two distant defined
-        // points with a straight line. (Same pattern the cpu memo
-        // uses for `smoothPoints` above.)
+        if (prevTs !== undefined && r.ts - prevTs > aggBucketMs * GAP_FACTOR) {
+          points.push({ ts: prevTs + aggBucketMs, value: undefined });
+        }
+        prevTs = r.ts;
+        // Push **one point per bucket-row** including gate-failed
+        // ones, with `value: undefined` for the empty buckets so
+        // the chart sees a real gap and doesn't paint extrapolated
+        // rates. (Distinct from the time-gap-marker above: that's
+        // for missing rows; this is for rows present but
+        // gate-failed.)
         if (
           typeof r.requests_sum !== 'number' ||
           (r.requests_n ?? 0) < 1
         ) {
-          // requests_n < 1: the rolling window is empty for this
-          // bucket — paint nothing rather than extrapolate a rate
-          // from zero events.
           points.push({ ts: r.ts, value: undefined });
           continue;
         }
