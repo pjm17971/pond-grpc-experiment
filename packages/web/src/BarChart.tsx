@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import {
   Bar,
   BarChart as RBarChart,
@@ -19,17 +20,32 @@ type Props = {
   bars: Bar[];
   tStart?: number;
   tEnd?: number;
-  width?: number;
+  /**
+   * Width — accepts a CSS px number or a percent template string
+   * matching Recharts' `ResponsiveContainer` signature. Defaults
+   * to `'100%'` so the bar chart aligns with the line chart above
+   * it (which also defaults to `'100%'`); pass a number for
+   * fixed-width testing.
+   */
+  width?: number | `${number}%`;
   height?: number;
 };
 
-export function BarChart({
+/**
+ * Wrapped in `React.memo` for the same reason as `Chart` — the
+ * dashboard re-renders at WS-frame cadence (5 fps) but `bars`
+ * only changes at the snapshot throttle (500 ms). Memoisation
+ * skips the recharts reconciliation when bars haven't changed.
+ */
+export const BarChart = memo(BarChartImpl);
+
+function BarChartImpl({
   title,
   emptyLabel = 'no events yet',
   bars,
   tStart,
   tEnd,
-  width = 420,
+  width = '100%',
   height = 110,
 }: Props) {
   if (tStart == null || tEnd == null || bars.length === 0) {

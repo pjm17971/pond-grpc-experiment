@@ -17,6 +17,7 @@ export {
   type AggregateAppendMsg,
   type AggregateWireMsg,
   type WireMsg,
+  type RankKey,
   DEFAULT_AGGREGATE_THRESHOLDS,
   encode,
   decode,

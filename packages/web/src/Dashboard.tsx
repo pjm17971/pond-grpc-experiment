@@ -1,8 +1,8 @@
 import { useState } from 'react';
-import { HOSTS } from '@pond-experiment/shared';
+import type { RankKey } from '@pond-experiment/shared';
 import { AggregateProbe } from './sections/AggregateProbe';
 import { CpuSection } from './sections/CpuSection';
-import { HostToggles } from './sections/HostToggles';
+import { HostTable } from './sections/HostTable';
 import { LogsSection } from './sections/LogsSection';
 import { PageSummary } from './sections/PageSummary';
 import { RequestsSection } from './sections/RequestsSection';
@@ -39,16 +39,26 @@ export function Dashboard() {
     showRaw: false,
     sigma: 2,
   });
-  // The set of hosts the user has explicitly disabled. Hosts default
-  // to enabled; toggling adds/removes from this set. Hosts beyond
-  // `api-1` start disabled so the chart stays readable while the
-  // band/raw toggles are exercised — once a user toggles them on,
-  // the entry stays out of `disabledHosts`.
+  // The set of hosts the user has explicitly hidden from the chart.
+  // The wire still ships them (server-side cut is by rank metric,
+  // not user toggles); the chart memos drop them client-side via
+  // this set. Defaults to empty: with the table showing only the
+  // top-N (5 by default) and the chart matching, all visible hosts
+  // are on by default.
   const [disabledHosts, setDisabledHosts] = useState<Set<string>>(
-    () => new Set(HOSTS.slice(1)),
+    () => new Set(),
   );
+  // Per-connection top-N + rank metric. Both flow through to the
+  // server as `{type:'set-top-n', n, by}` control messages on
+  // dropdown change (no socket churn). Defaults: top-5 by 1m CPU
+  // — the most-loaded hosts by baseline CPU, the canonical
+  // monitoring view. Setting `topN: null` would ship every row
+  // (no filter); the table dropdown only offers a discrete set
+  // of values, server clamps to `[1, max(hostCount, 1000)]`.
+  const [topN, setTopN] = useState<number>(5);
+  const [rankBy, setRankBy] = useState<RankKey>('cpu_avg');
 
-  const data = useDashboardData({ disabledHosts, chartOpts });
+  const data = useDashboardData({ disabledHosts, chartOpts, topN, rankBy });
 
   const onToggleHost = (host: string) => {
     setDisabledHosts((prev) => {
@@ -68,11 +78,17 @@ export function Dashboard() {
         evictedTotal={data.evictedTotal}
         connectionStatus={data.connectionStatus}
       />
-      <HostToggles
-        hosts={data.hosts}
+      <HostTable
+        currentTopHosts={data.aggregate.currentTopHosts}
+        latestPerHost={data.aggregate.latestPerHost}
         hostColors={data.hostColors}
         enabledHosts={data.enabledHosts}
         onToggle={onToggleHost}
+        topN={topN}
+        onTopNChange={setTopN}
+        rankBy={rankBy}
+        onRankByChange={setRankBy}
+        sparklineData={data.sparklineData}
       />
       <CpuSection
         data={data}

@@ -10,6 +10,7 @@ import {
   type AggregateWireMsg,
   type GlobalsTick,
   type HostTick,
+  type RankKey,
 } from '@pond-experiment/shared';
 import type { ConnectionStatus } from './useRemoteLiveSeries';
 
@@ -189,6 +190,20 @@ export type RemoteAggregateState = {
   /** Most recent `HostTick` per host. Empty until the first append. */
   latestPerHost: ReadonlyMap<string, HostTick>;
   /**
+   * Host set from the most recent `aggregate-append` frame — the
+   * server-side top-N cut **plus** any hysteresis carry-overs.
+   * Distinct from `latestPerHost.keys()` which accumulates every
+   * host that has ever been in the cut (the map preserves stale
+   * ticks rather than dropping them — see `applyAggregateFrame`'s
+   * "host went silent briefly" semantic). `currentTopHosts` is
+   * the **right now** view: which hosts have a fresh row in the
+   * frame the dashboard is looking at.
+   *
+   * Drives the dashboard's faded host-pill UI. Empty until the
+   * first append frame; updated on every append.
+   */
+  currentTopHosts: ReadonlySet<string>;
+  /**
    * σ-threshold list from the most recent snapshot frame. Empty
    * before the first snapshot arrives. Step-4 anomaly interpolation
    * will key off this; step 2's probe and step 3's bands display it
@@ -237,22 +252,26 @@ const ZERO_COUNTERS: AggregateCounters = {
  * cheapest way to drive the diagnostic probe and (in step 4+) the
  * "current cell" anomaly readout.
  *
- * **`topN` (per-connection top-N filter)**: optional integer that the
- * hook ships to the server as a `{type:'set-top-n', n}` control
- * message right after WS open and again whenever the prop changes
- * (without reconnecting). The server clamps + applies per-tick at
- * broadcast time so this client only receives the top-N rows by 1m
- * baseline `cpu_avg` per frame — see `server.ts.projectAppend`.
+ * **`topN` + `rankBy` (per-connection top-N filter)**: the hook
+ * ships a `{type:'set-top-n', n, by}` control message right after
+ * WS open and again whenever either prop changes (without
+ * reconnecting). The server clamps + applies per-tick at broadcast
+ * time so this client only receives the top-N rows by `rankBy`
+ * descending, with rank-based hysteresis — see
+ * `server.ts.projectAppend`.
  *
- * `null` (the default) is "no filter, ship every host's row" —
- * matches the pre-control-channel server behaviour for
- * back-compat. Reconnects re-send the current preference in the
- * fresh WS's onopen, so the user's selection survives a flap
- * without needing the server to remember anything across the gap.
+ * `topN: null` (the default) is "no filter, ship every host's row"
+ * — matches the pre-control-channel server behaviour for
+ * back-compat. `rankBy` defaults to `'cpu_avg'` (the only metric
+ * pre-rank-by clients ever ranked by). Reconnects re-send both
+ * preferences in the fresh WS's onopen so the user's selection
+ * survives a flap without needing the server to remember anything
+ * across the gap.
  */
 export function useRemoteAggregateSeries(
   url: string,
   topN: number | null = null,
+  rankBy: RankKey = 'cpu_avg',
 ): RemoteAggregateState {
   // `useLiveSeries` from `@pond-ts/react` owns the LiveSeries
   // lifecycle for the component's lifetime — created once on mount,
@@ -273,37 +292,50 @@ export function useRemoteAggregateSeries(
   const [latestPerHost, setLatestPerHost] = useState<
     ReadonlyMap<string, HostTick>
   >(() => new Map());
+  // Host set from the most recent append frame's `rows` (server-side
+  // top-N + hysteresis carry-overs). Distinct from `latestPerHost`
+  // which preserves stale entries on host silence — this is "in the
+  // current frame" rather than "ever seen". Drives faded-pill UI.
+  const [currentTopHosts, setCurrentTopHosts] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const [thresholds, setThresholds] = useState<ReadonlyArray<number>>([]);
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [counters, setCounters] = useState<AggregateCounters>(ZERO_COUNTERS);
   const [latestGlobals, setLatestGlobals] = useState<GlobalsTick | null>(null);
 
-  // Refs that the WS lifecycle effect reaches into so it can react to
-  // `topN` changes *without* re-running (a re-run would tear down the
-  // socket and slam through a reconnect on every slider tick — bad
-  // UX). The flow is:
+  // Refs that the WS lifecycle effect reaches into so it can react
+  // to `topN` / `rankBy` changes *without* re-running (a re-run
+  // would tear down the socket and slam through a reconnect on
+  // every dropdown change — bad UX). The flow is:
   //
-  //   - `topNRef` mirrors the latest prop value; the WS `onopen`
-  //     handler reads it and ships an immediate `set-top-n` so the
-  //     server's per-client filter starts at the user's preference.
+  //   - `topNRef` / `rankByRef` mirror the latest prop values; the
+  //     WS `onopen` handler reads them and ships an immediate
+  //     `set-top-n` so the server's per-client filter starts at
+  //     the user's preference.
   //   - `wsRef` exposes the current socket to the change-effect
   //     below so a prop update can send a fresh `set-top-n` over
   //     the live connection. Cleared on cleanup / close so the
   //     check `readyState === OPEN` reliably gates writes.
   const topNRef = useRef(topN);
+  const rankByRef = useRef(rankBy);
   const wsRef = useRef<WebSocket | null>(null);
 
-  // Send `set-top-n` immediately when the prop changes, without
+  // Send `set-top-n` immediately when either prop changes, without
   // tearing the socket. If the WS isn't open yet (initial mount, or
-  // mid-reconnect), the next `onopen` will read `topNRef.current`
-  // and ship the right value — no message is dropped.
+  // mid-reconnect), the next `onopen` will read the refs and ship
+  // the right values — no message is dropped. Single message carries
+  // both fields so the server applies them atomically.
   useEffect(() => {
     topNRef.current = topN;
+    rankByRef.current = rankBy;
     const ws = wsRef.current;
     if (ws && ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({ type: 'set-top-n', n: topN }));
+      ws.send(
+        JSON.stringify({ type: 'set-top-n', n: topN, by: rankBy }),
+      );
     }
-  }, [topN]);
+  }, [topN, rankBy]);
 
   useEffect(() => {
     // Reset compression-ratio counters when the URL changes (treated
@@ -333,15 +365,24 @@ export function useRemoteAggregateSeries(
       ws.onopen = () => {
         if (!cancelled) setStatus('connected');
         attempt = 0;
-        // Restore (or set) the per-connection top-N preference on
-        // every open. The server forgets it across disconnects; this
-        // re-arms the filter on reconnect so the user's selection
-        // survives WS flaps. `null` is the server-side default
-        // ("no filter") so we skip the message in that case rather
-        // than send a redundant clear.
-        const desired = topNRef.current;
-        if (desired !== null && ws && ws.readyState === ws.OPEN) {
-          ws.send(JSON.stringify({ type: 'set-top-n', n: desired }));
+        // Restore (or set) the per-connection top-N + rank-by
+        // preferences on every open. The server forgets them across
+        // disconnects; this re-arms the filter on reconnect so the
+        // user's selection survives WS flaps. We send unconditionally
+        // when either prop is non-default — `topN: null` with
+        // explicit `by` is a meaningful state ("show everything,
+        // sort by req rate"). Single message carries both fields.
+        const desiredN = topNRef.current;
+        const desiredBy = rankByRef.current;
+        const isDefault = desiredN === null && desiredBy === 'cpu_avg';
+        if (!isDefault && ws && ws.readyState === ws.OPEN) {
+          ws.send(
+            JSON.stringify({
+              type: 'set-top-n',
+              n: desiredN,
+              by: desiredBy,
+            }),
+          );
         }
       };
       ws.onmessage = (ev) => {
@@ -421,6 +462,17 @@ export function useRemoteAggregateSeries(
         const filteredMsg = { ...msg, rows: newerRows } as AggregateWireMsg;
         setLatestPerHost((prev) => applyAggregateFrame(prev, filteredMsg));
         if (msg.type === 'aggregate-append') {
+          // Track the current frame's host set — drives faded-pill UI.
+          // Use the **un-filtered** msg.rows here, not newerRows — even
+          // on a reconnect-replay where every row is older than the
+          // tail (newerRows is empty), the original frame still
+          // describes "who's in the cut right now". `setLatestPerHost`
+          // skips applying old rows, which is correct; here we want
+          // the wire's stated host set regardless. Skip empty frames
+          // to keep the previous set across silent ticks.
+          if (msg.rows.length > 0) {
+            setCurrentTopHosts(new Set(msg.rows.map((r) => r.host)));
+          }
           // True per-frame raw-event delta from globals. Falls back
           // to 0 for pre-step-6 servers that don't ship `globals`
           // (the counters then just report "0 raw events per
@@ -499,6 +551,7 @@ export function useRemoteAggregateSeries(
   return {
     liveSeries,
     latestPerHost,
+    currentTopHosts,
     thresholds,
     status,
     counters,

@@ -74,11 +74,15 @@ header h1 {
 }
 
 /* ── Host toggle chips ────────────────────────────────── */
-.host-toggles {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem;
-  align-items: center;
+/* ── Host table ───────────────────────────────────────── */
+/*
+ * Replaces the chip row + slider combo (PR #36 first iteration).
+ * Layout: a compact controls row above ("Top [N ▼] hosts by [metric ▼]")
+ * + a small table showing the currently-shipped top-N rows. Rows
+ * animate to their new positions on rank change via FLIP in
+ * `HostTable.tsx`'s `useLayoutEffect`.
+ */
+.host-table-shell {
   margin-bottom: 1.5rem;
   padding: 0.5rem 0.75rem;
   border: 1px solid rgba(127, 127, 127, 0.18);
@@ -86,38 +90,119 @@ header h1 {
   background: rgba(127, 127, 127, 0.03);
 }
 
-.toggles-label {
+.host-table-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.control-label {
+  opacity: 0.7;
+}
+
+.top-n-select,
+.rank-by-select {
+  font-family: inherit;
+  font-size: 0.85rem;
+  padding: 0.15rem 0.4rem;
+  border: 1px solid rgba(127, 127, 127, 0.35);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.top-n-select:focus,
+.rank-by-select:focus {
+  outline: 2px solid #4c8bf5;
+  outline-offset: -1px;
+}
+
+.host-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.host-table th {
+  text-align: left;
+  font-weight: 500;
   font-size: 0.7rem;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   opacity: 0.55;
-  margin-right: 0.25rem;
+  padding: 0.25rem 0.5rem;
+  border-bottom: 1px solid rgba(127, 127, 127, 0.2);
 }
 
-.host-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  padding: 0.3rem 0.65rem;
-  border: 2px solid;
-  border-radius: 999px;
-  background: transparent;
-  font-size: 0.8rem;
-  font-weight: 500;
-  font-family: inherit;
-  cursor: pointer;
-  transition: opacity 0.15s, background 0.15s;
+.host-table td {
+  padding: 0.3rem 0.5rem;
+  border-bottom: 1px solid rgba(127, 127, 127, 0.08);
 }
 
-.host-chip.off {
-  border-color: rgba(127, 127, 127, 0.35) !important;
-  color: rgba(127, 127, 127, 0.6) !important;
-  opacity: 0.65;
+.host-table tr:last-child td {
+  border-bottom: none;
+}
+
+/*
+ * Row off (chart-disabled) — same row content but visually de-
+ * emphasised. Distinct from "out of cut" (which doesn't exist in
+ * this UI: the table only shows in-cut hosts). The user's intent
+ * here is "still in the wire's cut, but I don't want it on the
+ * chart"; we render it dimmed so they can re-enable it without
+ * losing track.
+ */
+.host-table tr.row-off {
+  opacity: 0.55;
+}
+.host-table tr.row-off .host-name {
   text-decoration: line-through;
 }
 
-.host-chip .dot {
-  border: 1px solid currentColor;
+.check-col {
+  width: 28px;
+  text-align: center;
+}
+
+.host-col {
+  white-space: nowrap;
+}
+
+.num-col {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  width: 70px;
+}
+
+.spark-col {
+  text-align: right;
+  width: 88px;
+  /*
+   * `transform-origin` matters for the FLIP animation — the
+   * default is the centre, which produces visually-correct vertical
+   * sliding. No need to override.
+   */
+}
+
+.host-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 0.5rem;
+  vertical-align: middle;
+}
+
+.host-name {
+  vertical-align: middle;
+}
+
+.spark {
+  vertical-align: middle;
+  display: inline-block;
 }
 
 /* ── Sections ─────────────────────────────────────────── */
