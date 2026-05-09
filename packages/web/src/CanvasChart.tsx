@@ -173,14 +173,52 @@ function CanvasChartImpl({
   // fine at the experiment's scales.
   const yTicks = useMemo(() => niceTicks(yMin, yMax, 5), [yMin, yMax]);
 
-  // X-axis tick stops — pick ~5-6 evenly-spaced timestamps over the
-  // visible window. Each gets a `toLocaleTimeString()` label.
+  // X-axis tick stops — anchored to **natural time boundaries**
+  // (minute / 30s / etc.) rather than evenly-spaced fractions of
+  // the window. The earlier fraction-based version had each tick
+  // sliding by ~200 ms per WS frame; since `toLocaleTimeString`
+  // rounds to seconds, the rendered labels barely changed and the
+  // axis appeared "static" while the data scrolled past it. With
+  // boundary anchoring, each tick is at a fixed wall-clock time
+  // (e.g. 7:28:00) and its rendered x-position slides left as the
+  // visible window advances — matching the standard time-series
+  // chart UX where the axis is rooted to the time, not the chart.
+  //
+  // Step picker: largest interval from {1s, 2s, 5s, 10s, 15s,
+  // 30s, 1m, 2m, 5m, 10m, 15m, 30m, 1h} that gives ~5-6 ticks in
+  // the visible window. The 5-minute dashboard window picks 1m;
+  // a 30-second window would pick 5s; etc.
   const xTicks = useMemo(() => {
     if (tStart == null || tEnd == null) return [];
+    const span = tEnd - tStart;
+    const target = 5;
+    const ideal = span / target;
+    const STEPS_MS = [
+      1_000, 2_000, 5_000, 10_000, 15_000, 30_000,
+      60_000, 2 * 60_000, 5 * 60_000, 10 * 60_000, 15 * 60_000, 30 * 60_000,
+      60 * 60_000, 2 * 60 * 60_000, 6 * 60 * 60_000, 12 * 60 * 60_000,
+      24 * 60 * 60_000,
+    ];
+    // Largest step <= ideal so the visible tick count stays around
+    // the target without overshooting. Falls back to the smallest
+    // step if `ideal` is sub-second (degenerate case for very
+    // narrow windows; the chart would barely show anything anyway).
+    let step = STEPS_MS[0];
+    for (const candidate of STEPS_MS) {
+      if (candidate <= ideal) step = candidate;
+    }
+    // Align to boundaries. For minute-and-below steps, UTC and
+    // local time agree (timezones don't have sub-hour offsets in
+    // any modern jurisdiction), so simple arithmetic works. For
+    // hour+ steps the local-vs-UTC difference would matter, but
+    // the dashboard's 5-min window never picks those.
     const ticks: number[] = [];
-    const N = 5;
-    for (let i = 0; i <= N; i++) {
-      ticks.push(tStart + ((tEnd - tStart) * i) / N);
+    const first = Math.ceil(tStart / step) * step;
+    // Cap iterations at 50 — defensive against pathological
+    // span / step ratios that could otherwise loop indefinitely
+    // due to floating-point edge.
+    for (let t = first; t <= tEnd && ticks.length < 50; t += step) {
+      ticks.push(t);
     }
     return ticks;
   }, [tStart, tEnd]);
