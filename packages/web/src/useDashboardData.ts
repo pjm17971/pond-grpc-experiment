@@ -493,6 +493,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     const perf =
       typeof window !== 'undefined' &&
       new URLSearchParams(window.location.search).get('perf') === '1';
+    // eslint-disable-next-line react-hooks/purity -- diagnostic-only, gated on `?perf=1`; the timestamp doesn't influence render output
     const t0 = perf ? performance.now() : 0;
 
     const series: ChartSeries[] = [];
@@ -538,6 +539,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       return { series, bands, dots, allAnomalies };
     }
     const partitioned = filtered.partitionBy('host');
+    // eslint-disable-next-line react-hooks/purity -- diagnostic-only, gated on `?perf=1`; see top of memo
     const tPart = perf ? performance.now() : 0;
 
     // Downsample for line/band rendering. Per-bucket reducers picked
@@ -575,6 +577,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
         current_sd: 'avg',
       })
       .toMap((g) => g.toPoints());
+    // eslint-disable-next-line react-hooks/purity -- diagnostic-only, gated on `?perf=1`; see top of memo
     const tDownsample = perf ? performance.now() : 0;
 
     // Full-res rows per host — only used for the per-tick anomaly
@@ -582,6 +585,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     // reducer if pond ever grows array-column folds; today this is
     // the cleanest split.
     const fullResPerHost = partitioned.toMap((g) => g.toPoints());
+    // eslint-disable-next-line react-hooks/purity -- diagnostic-only, gated on `?perf=1`; see top of memo
     const tFullRes = perf ? performance.now() : 0;
 
     // Threshold list comes from the snapshot frame's `thresholds`
@@ -839,12 +843,12 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     }
 
     if (perf) {
+      // eslint-disable-next-line react-hooks/purity -- diagnostic-only, gated on `?perf=1`; the timestamp doesn't influence render output
       const tEnd = performance.now();
       let dsRows = 0;
       let frRows = 0;
       for (const rs of downsampledPerHost.values()) dsRows += rs.length;
       for (const rs of fullResPerHost.values()) frRows += rs.length;
-      // eslint-disable-next-line no-console
       console.log(
         '[cpu memo]',
         `part ${(tPart - t0).toFixed(1)}ms`,

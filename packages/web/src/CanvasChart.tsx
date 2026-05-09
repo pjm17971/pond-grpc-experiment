@@ -86,25 +86,41 @@ function CanvasChartImpl({
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   // ResizeObserver on the container so percent widths work without
-  // forcing the parent to compute pixels. Also handles window resize.
-  // The canvas itself is sized in the draw effect using these
-  // measurements + DPR.
-  const [containerWidth, setContainerWidth] = useState<number>(
-    typeof width === 'number' ? width : 0,
-  );
+  // forcing the parent to compute pixels. The canvas is sized in
+  // the draw effect using this measurement + DPR.
+  //
+  // Two width regimes:
+  //
+  //   - **Number** (`width: 480`): the prop IS the width — no
+  //     measurement needed, no observer. Just use the prop directly.
+  //   - **Percent** (`width: '100%'`): need to measure the
+  //     container. State holds the measurement; the observer
+  //     updates it asynchronously.
+  //
+  // On the percent path, the **initial render** has
+  // `measuredWidth === 0` and the draw effect short-circuits
+  // (see `containerWidth <= 0` below). The observer fires once
+  // synchronously-ish after the first layout pass, state updates,
+  // a second render commits and the draw effect actually paints.
+  // One wasted-paint frame, but it's how the React-friendly
+  // version of "measure-then-render" plays out — and it avoids
+  // the setState-in-effect cascade-render anti-pattern that an
+  // earlier `setMeasuredWidth(el.getBoundingClientRect().width)`
+  // synchronous call would have triggered.
+  const [measuredWidth, setMeasuredWidth] = useState<number>(0);
+  const containerWidth = typeof width === 'number' ? width : measuredWidth;
   useLayoutEffect(() => {
+    if (typeof width === 'number') return;
     const el = containerRef.current;
     if (!el) return;
-    if (typeof width === 'number') {
-      setContainerWidth(width);
-      return;
-    }
-    // Initial measurement (ResizeObserver doesn't fire for the first paint).
-    setContainerWidth(el.getBoundingClientRect().width);
+    // ResizeObserver fires once after the first layout pass with
+    // the initial measurement, then on every subsequent size
+    // change. No need to read the width synchronously here; the
+    // observer's first delivery is the initial value.
     const ro = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const w = entry.contentRect.width;
-        setContainerWidth((prev) => (prev !== w ? w : prev));
+        setMeasuredWidth((prev) => (prev !== w ? w : prev));
       }
     });
     ro.observe(el);
