@@ -15,7 +15,9 @@ import {
 import {
   startServer,
   projectAppend,
+  projectSnapshotHistory,
   parseControlMessage,
+  parseConnectQuery,
   type RunningServer,
 } from './server.js';
 import { recordIngest, type MetricsSnapshot } from './metrics.js';
@@ -47,7 +49,7 @@ const mkRow = (host: string, cpu: number | null) => ({
 const prefs = (
   topN: number | null,
   lastTopHosts: ReadonlySet<string> | null = null,
-  rankBy: 'cpu_avg' | 'cpu_sd' | 'requests_avg' = 'cpu_avg',
+  rankBy: 'cpu_avg' | 'cpu_sd' | 'requests_sum' = 'cpu_avg',
 ) => ({ topN, rankBy, lastTopHosts });
 
 describe('projectAppend (per-subscriber wire projection)', () => {
@@ -302,11 +304,16 @@ describe('projectAppend rankBy (configurable sort key)', () => {
   const mkRankRow = (
     host: string,
     cpu_avg: number | null,
-    requests_avg: number | null,
+    requests_sum: number,
+    requests_avg: number | null = null,
     cpu_sd: number | null = 0.05,
   ) => ({
     ...mkRow(host, cpu_avg),
-    requests_avg,
+    requests_sum,
+    // Carry an explicit requests_avg too — the disagreement test
+    // below uses it to prove that ranking by `requests_sum` doesn't
+    // accidentally fall back to `requests_avg`.
+    requests_avg: requests_avg ?? requests_sum / 60,
     cpu_sd,
   });
 
@@ -316,9 +323,9 @@ describe('projectAppend rankBy (configurable sort key)', () => {
   const mixedMsg: AggregateAppendMsg = {
     type: 'aggregate-append',
     rows: [
-      mkRankRow('hot-cpu', 0.9, 100, 0.02),
-      mkRankRow('hot-req', 0.4, 500, 0.05),
-      mkRankRow('hot-vol', 0.5, 200, 0.2),
+      mkRankRow('hot-cpu', 0.9, 100, null, 0.02),
+      mkRankRow('hot-req', 0.4, 500, null, 0.05),
+      mkRankRow('hot-vol', 0.5, 200, null, 0.2),
     ],
   };
 
@@ -327,8 +334,8 @@ describe('projectAppend rankBy (configurable sort key)', () => {
     expect(out.msg.rows.map((r) => r.host)).toEqual(['hot-cpu', 'hot-vol']);
   });
 
-  it('rankBy: requests_avg ranks by 1m baseline req rate', () => {
-    const out = projectAppend(mixedMsg, prefs(2, null, 'requests_avg'));
+  it('rankBy: requests_sum ranks by 1m baseline total request count', () => {
+    const out = projectAppend(mixedMsg, prefs(2, null, 'requests_sum'));
     expect(out.msg.rows.map((r) => r.host)).toEqual(['hot-req', 'hot-vol']);
   });
 
@@ -337,30 +344,56 @@ describe('projectAppend rankBy (configurable sort key)', () => {
     expect(out.msg.rows.map((r) => r.host)).toEqual(['hot-vol', 'hot-req']);
   });
 
-  it('null values on the rank column sort to the bottom (cold-start hosts last)', () => {
-    // hot-req has null requests_avg; should fall behind both other
-    // hosts even though it has the highest cpu_avg.
+  it('rankBy: requests_sum is throughput, not mean — disagreement with requests_avg', () => {
+    // The PR-#37 review caught this: a "1m req/s" rank that uses
+    // pond's `requests_avg` (mean request count per event) produces
+    // a fundamentally wrong order. This test pins the fix:
+    //
+    //   - `whale`: 5 events × 200 requests each = sum 1000, avg 200
+    //   - `swarm`: 5000 events × 1 request each = sum 5000, avg 1
+    //
+    // `whale` has higher `requests_avg`. `swarm` has higher
+    // `requests_sum` (and is the genuinely busier host). Ranking by
+    // `requests_sum` puts `swarm` first; ranking by `requests_avg`
+    // would put `whale` first.
     const msg: AggregateAppendMsg = {
       type: 'aggregate-append',
       rows: [
-        mkRankRow('hot-req', 0.9, null),
-        mkRankRow('mid', 0.5, 200),
+        mkRankRow('whale', 0.5, 1_000, 200),
+        mkRankRow('swarm', 0.5, 5_000, 1),
+      ],
+    };
+    const out = projectAppend(msg, prefs(1, null, 'requests_sum'));
+    expect(out.msg.rows.map((r) => r.host)).toEqual(['swarm']);
+  });
+
+  it('null values on the rank column sort to the bottom (cold-start hosts last)', () => {
+    // `cpu_avg` is nullable per the HostTick schema (rolling-baseline
+    // reducer returns null for an empty 1m window). A host with
+    // null `cpu_avg` should rank below any host with a numeric
+    // value — the cold-start case where a host just connected and
+    // hasn't accumulated baseline samples yet.
+    const msg: AggregateAppendMsg = {
+      type: 'aggregate-append',
+      rows: [
+        mkRankRow('cold', null, 100),
+        mkRankRow('mid', 0.5, 100),
         mkRankRow('low', 0.4, 100),
       ],
     };
-    const out = projectAppend(msg, prefs(2, null, 'requests_avg'));
+    const out = projectAppend(msg, prefs(2, null, 'cpu_avg'));
     expect(out.msg.rows.map((r) => r.host)).toEqual(['mid', 'low']);
   });
 
   it('hysteresis carries across the same rank metric (not auto-reset)', () => {
-    // Stable cut by requests_avg; second call with the same metric
+    // Stable cut by requests_sum; second call with the same metric
     // and a populated lastTopHosts should preserve the carry-over
     // path. The set-top-n handler is responsible for resetting on
     // metric change — projectAppend itself is stateless about that.
-    const out1 = projectAppend(mixedMsg, prefs(2, null, 'requests_avg'));
+    const out1 = projectAppend(mixedMsg, prefs(2, null, 'requests_sum'));
     const out2 = projectAppend(
       mixedMsg,
-      prefs(2, out1.lastTopHosts, 'requests_avg'),
+      prefs(2, out1.lastTopHosts, 'requests_sum'),
     );
     expect(out2.msg.rows.map((r) => r.host)).toEqual(out1.msg.rows.map((r) => r.host));
   });
@@ -412,10 +445,10 @@ describe('parseControlMessage', () => {
     ).toEqual({ topN: 5, rankBy: 'cpu_avg' });
     expect(
       parseControlMessage(
-        JSON.stringify({ type: 'set-top-n', n: 5, by: 'requests_avg' }),
+        JSON.stringify({ type: 'set-top-n', n: 5, by: 'requests_sum' }),
         80,
       ),
-    ).toEqual({ topN: 5, rankBy: 'requests_avg' });
+    ).toEqual({ topN: 5, rankBy: 'requests_sum' });
     expect(
       parseControlMessage(
         JSON.stringify({ type: 'set-top-n', n: 5, by: 'cpu_sd' }),
@@ -445,10 +478,10 @@ describe('parseControlMessage', () => {
   it('accepts `by` together with `n: null` (clear filter + change metric in one msg)', () => {
     expect(
       parseControlMessage(
-        JSON.stringify({ type: 'set-top-n', n: null, by: 'requests_avg' }),
+        JSON.stringify({ type: 'set-top-n', n: null, by: 'requests_sum' }),
         80,
       ),
-    ).toEqual({ topN: null, rankBy: 'requests_avg' });
+    ).toEqual({ topN: null, rankBy: 'requests_sum' });
   });
 
   it('returns null on invalid input rather than throwing', () => {
@@ -464,6 +497,155 @@ describe('parseControlMessage', () => {
     // "clear filter," not invalid. That's the right semantic at
     // the wire layer; if a JS client wanted to send a real NaN to
     // signal an error, it'd need its own wrapper.
+  });
+});
+
+describe('parseConnectQuery (snapshot-time projection hint)', () => {
+  // The dashboard ships `?n=&by=` query params on the WS handshake
+  // URL so the server can apply the per-subscriber projection to
+  // the snapshot backfill. Defaults are the back-compat shape
+  // (`topN: null`, `rankBy: 'cpu_avg'`) for older clients that
+  // don't send them.
+
+  it('returns the no-filter default for an empty / missing URL', () => {
+    expect(parseConnectQuery(undefined)).toEqual({
+      topN: null,
+      rankBy: 'cpu_avg',
+    });
+    expect(parseConnectQuery('/live-agg')).toEqual({
+      topN: null,
+      rankBy: 'cpu_avg',
+    });
+  });
+
+  it('parses `?n=5&by=cpu_avg`', () => {
+    expect(parseConnectQuery('/live-agg?n=5&by=cpu_avg')).toEqual({
+      topN: 5,
+      rankBy: 'cpu_avg',
+    });
+  });
+
+  it('clamps n to [1, 1000]', () => {
+    expect(parseConnectQuery('/live-agg?n=0').topN).toBe(1);
+    expect(parseConnectQuery('/live-agg?n=-5').topN).toBe(1);
+    expect(parseConnectQuery('/live-agg?n=5000').topN).toBe(1000);
+    expect(parseConnectQuery('/live-agg?n=7.9').topN).toBe(7);
+  });
+
+  it('falls back to no-filter on non-finite n', () => {
+    expect(parseConnectQuery('/live-agg?n=NaN').topN).toBeNull();
+    expect(parseConnectQuery('/live-agg?n=foo').topN).toBeNull();
+    expect(parseConnectQuery('/live-agg?n=').topN).toBeNull();
+  });
+
+  it('accepts each known rank key', () => {
+    expect(parseConnectQuery('/live-agg?by=cpu_avg').rankBy).toBe('cpu_avg');
+    expect(parseConnectQuery('/live-agg?by=cpu_sd').rankBy).toBe('cpu_sd');
+    expect(parseConnectQuery('/live-agg?by=requests_sum').rankBy).toBe(
+      'requests_sum',
+    );
+  });
+
+  it('falls back to cpu_avg on unknown / missing rank key (no hard reject)', () => {
+    // Distinct from `parseControlMessage`'s hard reject — query
+    // strings come from URL bars and may be hand-edited; quietly
+    // defaulting is a better UX than refusing the connection.
+    expect(parseConnectQuery('/live-agg?by=cpu_argh').rankBy).toBe('cpu_avg');
+    expect(parseConnectQuery('/live-agg?by=').rankBy).toBe('cpu_avg');
+  });
+
+  it('combines params: `?n=3&by=requests_sum`', () => {
+    expect(parseConnectQuery('/live-agg?n=3&by=requests_sum')).toEqual({
+      topN: 3,
+      rankBy: 'requests_sum',
+    });
+  });
+});
+
+describe('projectSnapshotHistory', () => {
+  // The ts-grouped projection that closes the PR-#37 review
+  // finding: snapshot replay was being shipped unfiltered, so
+  // every connect/reconnect briefly delivered the full host
+  // history regardless of the client's top-N preference. With
+  // `parseConnectQuery` reading the prefs at handshake time and
+  // this helper projecting the snapshot rows per-tick, the cut
+  // is applied to history too.
+
+  const ts = (n: number): number => 1_000_000 + n * 200;
+
+  // Build a small flat history: 3 ticks × 4 hosts, ts-then-host
+  // ordered. cpu_avg picked so api-1 is always #1, api-2 is #2,
+  // etc. — strict top-N produces a predictable ordering.
+  const flatRows: ReturnType<typeof mkRow>[] = [];
+  for (let t = 0; t < 3; t++) {
+    flatRows.push({ ...mkRow('api-1', 0.9), ts: ts(t) });
+    flatRows.push({ ...mkRow('api-2', 0.8), ts: ts(t) });
+    flatRows.push({ ...mkRow('api-3', 0.7), ts: ts(t) });
+    flatRows.push({ ...mkRow('api-4', 0.6), ts: ts(t) });
+  }
+
+  it('passes through unchanged when topN is null (no filter)', () => {
+    const out = projectSnapshotHistory(flatRows, prefs(null));
+    expect(out.rows.length).toBe(flatRows.length);
+    expect(out.lastTopHosts).toBeNull();
+  });
+
+  it('cuts each tick to the top-N hosts (PR-#37 finding fix)', () => {
+    const out = projectSnapshotHistory(flatRows, prefs(2));
+    // 3 ticks × 2 hosts each = 6 rows out (vs 12 in).
+    expect(out.rows.length).toBe(6);
+    // Every tick keeps only api-1 and api-2.
+    const hostsByTs = new Map<number, Set<string>>();
+    for (const r of out.rows) {
+      let s = hostsByTs.get(r.ts);
+      if (!s) {
+        s = new Set();
+        hostsByTs.set(r.ts, s);
+      }
+      s.add(r.host);
+    }
+    for (const [, hosts] of hostsByTs) {
+      expect(hosts).toEqual(new Set(['api-1', 'api-2']));
+    }
+  });
+
+  it('returns final hysteresis state so live frames continue from snapshot tail', () => {
+    // After projecting the snapshot, the returned `lastTopHosts`
+    // should equal the host set the final tick shipped — which
+    // the caller writes back into `ClientPrefs` so the first
+    // live frame's hysteresis decides carry-overs against the
+    // snapshot's tail rather than against an empty set.
+    const out = projectSnapshotHistory(flatRows, prefs(2));
+    expect(out.lastTopHosts).toEqual(new Set(['api-1', 'api-2']));
+  });
+
+  it('threads hysteresis across snapshot ticks (boundary host carries over)', () => {
+    // Build a 2-tick history where api-3 leads at tick 0 but
+    // api-4 sneaks ahead at tick 1 (api-3's cpu_avg drops). With
+    // topN=3 and margin 1, api-3 should carry over at tick 1
+    // even though it's now rank-4.
+    const rows: ReturnType<typeof mkRow>[] = [
+      { ...mkRow('api-1', 0.9), ts: ts(0) },
+      { ...mkRow('api-2', 0.8), ts: ts(0) },
+      { ...mkRow('api-3', 0.7), ts: ts(0) },
+      { ...mkRow('api-4', 0.5), ts: ts(0) },
+      // tick 1 — api-3 drops to rank 4
+      { ...mkRow('api-1', 0.9), ts: ts(1) },
+      { ...mkRow('api-2', 0.8), ts: ts(1) },
+      { ...mkRow('api-4', 0.7), ts: ts(1) },
+      { ...mkRow('api-3', 0.6), ts: ts(1) },
+    ];
+    const out = projectSnapshotHistory(rows, prefs(3));
+    // tick 0: top-3 strict = api-1, api-2, api-3.
+    // tick 1: top-3 strict = api-1, api-2, api-4. api-3 was in
+    // last cut, new rank 4 ≤ 3 + 1 = within margin → carries.
+    // So tick 1 ships 4 rows.
+    const tick0 = out.rows.filter((r) => r.ts === ts(0)).map((r) => r.host);
+    const tick1 = out.rows.filter((r) => r.ts === ts(1)).map((r) => r.host);
+    expect(new Set(tick0)).toEqual(new Set(['api-1', 'api-2', 'api-3']));
+    expect(new Set(tick1)).toEqual(
+      new Set(['api-1', 'api-2', 'api-4', 'api-3']),
+    );
   });
 });
 

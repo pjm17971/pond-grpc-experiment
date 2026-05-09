@@ -48,9 +48,14 @@ const RANK_OPTIONS: ReadonlyArray<{
     format: (v) => `${(v * 100).toFixed(1)}%`,
   },
   {
-    key: 'requests_avg',
-    label: '1m req/s',
-    format: (v) => v.toFixed(1),
+    // Sum (NOT mean) — `requests_avg` in pond means "mean request
+    // count per event" which doesn't track throughput. `requests_sum`
+    // is total requests in the 1m window and ranks identically to
+    // req/sec at fixed window length. Display the sum directly
+    // (less surprising than a derived rate).
+    key: 'requests_sum',
+    label: '1m requests',
+    format: (v) => v.toLocaleString(),
   },
 ];
 
