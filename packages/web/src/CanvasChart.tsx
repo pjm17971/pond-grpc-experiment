@@ -111,28 +111,41 @@ function CanvasChartImpl({
     return () => ro.disconnect();
   }, [width]);
 
-  // Auto y-domain from the actual data unless overridden. Mirrors
-  // the SVG `Chart`'s logic: use real min/max + a 10% padding so
-  // the line doesn't kiss the edges. Memoised because `series` /
-  // `bands` are stable references between snapshot ticks.
+  // Auto y-domain from the actual data, optionally widened by the
+  // override props. Mirrors the SVG `Chart`'s effective behaviour
+  // — `yMin`/`yMax` are an *initial* domain to render against, but
+  // data that exceeds them extends the axis rather than clipping.
+  // (Recharts' SVG let overflowing pixels render outside the plot
+  // area; the canvas clips to its bounds, so we need to bake the
+  // extend-to-fit into the domain math here instead.)
+  //
+  // Defensive: `Number.isFinite` rejects null/undefined AND NaN/
+  // ±Infinity. Pond's reducers can produce NaN under degenerate
+  // bucket conditions; without this guard a single NaN slips into
+  // `lo`/`hi` and the entire chart's y-domain collapses to NaN,
+  // which then renders as a line drawn to (NaN, NaN) — visually
+  // a horizontal bar through the chart "joining" what should be
+  // gaps. Same check applied in the per-line + band-drawing
+  // loops below for the same reason.
   const { yMin, yMax } = useMemo(() => {
     let lo = Infinity;
     let hi = -Infinity;
     for (const s of series) {
       for (const p of s.points) {
-        if (p.value == null) continue;
-        if (p.value < lo) lo = p.value;
-        if (p.value > hi) hi = p.value;
+        if (!Number.isFinite(p.value)) continue;
+        const v = p.value as number;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
       }
     }
     for (const b of bands) {
       for (const p of b.upper) {
-        if (p.value == null) continue;
-        if (p.value > hi) hi = p.value;
+        if (!Number.isFinite(p.value)) continue;
+        if ((p.value as number) > hi) hi = p.value as number;
       }
       for (const p of b.lower) {
-        if (p.value == null) continue;
-        if (p.value < lo) lo = p.value;
+        if (!Number.isFinite(p.value)) continue;
+        if ((p.value as number) < lo) lo = p.value as number;
       }
     }
     if (!Number.isFinite(lo) || !Number.isFinite(hi)) {
@@ -140,9 +153,16 @@ function CanvasChartImpl({
       hi = 1;
     }
     const pad = (hi - lo) * 0.1 || Math.max(0.05, hi * 0.1);
+    // The override widens but never tightens. If `yMinOverride` is
+    // 0.2 and the data dips to 0.1, the rendered axis starts at
+    // 0.1 (with padding) so the dip stays visible. Same for the
+    // top edge — bursts above `yMaxOverride` extend the axis so
+    // the spike renders in-bounds rather than clipping off-canvas.
+    const dataMin = Math.max(0, lo - pad);
+    const dataMax = hi + pad;
     return {
-      yMin: yMinOverride ?? Math.max(0, lo - pad),
-      yMax: yMaxOverride ?? hi + pad,
+      yMin: yMinOverride != null ? Math.min(yMinOverride, dataMin) : dataMin,
+      yMax: yMaxOverride != null ? Math.max(yMaxOverride, dataMax) : dataMax,
     };
   }, [series, bands, yMinOverride, yMaxOverride]);
 
@@ -243,8 +263,8 @@ function CanvasChartImpl({
           const hasBoth =
             u != null &&
             l != null &&
-            u.value != null &&
-            l.value != null &&
+            Number.isFinite(u.value) &&
+            Number.isFinite(l.value) &&
             u.ts === l.ts;
           if (hasBoth && runStart < 0) {
             runStart = i;
@@ -259,31 +279,38 @@ function CanvasChartImpl({
         // the cpu memo always emits them in lockstep.
         const lowerByTs = new Map<number, number>();
         for (const p of b.lower) {
-          if (p.value != null) lowerByTs.set(p.ts, p.value);
+          if (Number.isFinite(p.value)) lowerByTs.set(p.ts, p.value as number);
         }
         let runStart = -1;
-        const aligned: ChartPoint[] = [];
+        const alignedUp: ChartPoint[] = [];
         const alignedLo: ChartPoint[] = [];
         for (const p of b.upper) {
-          if (p.value == null || !lowerByTs.has(p.ts)) {
+          if (!Number.isFinite(p.value) || !lowerByTs.has(p.ts)) {
             if (runStart >= 0) {
-              drawBandRun(ctx, aligned, alignedLo, runStart, aligned.length, xScale, yScale);
+              drawBandRun(ctx, alignedUp, alignedLo, runStart, alignedUp.length, xScale, yScale);
               runStart = -1;
             }
             continue;
           }
-          if (runStart < 0) runStart = aligned.length;
-          aligned.push(p);
+          if (runStart < 0) runStart = alignedUp.length;
+          alignedUp.push(p);
           alignedLo.push({ ts: p.ts, value: lowerByTs.get(p.ts)! });
         }
         if (runStart >= 0) {
-          drawBandRun(ctx, aligned, alignedLo, runStart, aligned.length, xScale, yScale);
+          drawBandRun(ctx, alignedUp, alignedLo, runStart, alignedUp.length, xScale, yScale);
         }
       }
     }
     ctx.globalAlpha = 1;
 
     // ── 3. Series (lines, on top of bands) ─────────────────────
+    // `Number.isFinite` (rather than `value != null`) rejects null,
+    // undefined, AND NaN/±Infinity. Pond's reducers can emit NaN
+    // for degenerate buckets; without this guard a single NaN in
+    // the series acts as a "rest the pen here" instruction in the
+    // canvas path, which renders visually as a horizontal line
+    // through the gap. The user-reported "gaps in the series are
+    // joined with a line" symptom traces to exactly this case.
     for (const s of series) {
       ctx.strokeStyle = s.color;
       ctx.lineWidth = s.width ?? 1.5;
@@ -293,12 +320,12 @@ function CanvasChartImpl({
       ctx.beginPath();
       let move = true;
       for (const p of s.points) {
-        if (p.value == null) {
+        if (!Number.isFinite(p.value)) {
           move = true;
           continue;
         }
         const x = xScale(p.ts);
-        const y = yScale(p.value);
+        const y = yScale(p.value as number);
         if (move) {
           ctx.moveTo(x, y);
           move = false;
@@ -322,9 +349,9 @@ function CanvasChartImpl({
       ctx.fillStyle = s.color;
       ctx.globalAlpha = s.opacity ?? 0.95;
       for (const p of s.points) {
-        if (p.value == null) continue;
+        if (!Number.isFinite(p.value)) continue;
         ctx.beginPath();
-        ctx.arc(xScale(p.ts), yScale(p.value), 1.5, 0, Math.PI * 2);
+        ctx.arc(xScale(p.ts), yScale(p.value as number), 1.5, 0, Math.PI * 2);
         ctx.fill();
       }
     }
@@ -336,9 +363,9 @@ function CanvasChartImpl({
       ctx.globalAlpha = 0.85;
       const r = d.radius ?? 2.5;
       for (const p of d.points) {
-        if (p.value == null) continue;
+        if (!Number.isFinite(p.value)) continue;
         ctx.beginPath();
-        ctx.arc(xScale(p.ts), yScale(p.value), r, 0, Math.PI * 2);
+        ctx.arc(xScale(p.ts), yScale(p.value as number), r, 0, Math.PI * 2);
         ctx.fill();
       }
     }
@@ -452,18 +479,24 @@ function drawBandRun(
 ): void {
   if (end - start < 2) return;
   ctx.beginPath();
+  // Walk the upper edge forward, then the lower edge backward, to
+  // close the band as a single fill region. The runStart/end were
+  // segmented on `Number.isFinite(value)`, so every index in
+  // `[start, end)` should be drawable; the explicit guards here
+  // are belt-and-braces against shape drift in the caller's
+  // segmentation.
   for (let i = start; i < end; i++) {
     const p = upper[i];
-    if (p.value == null) continue;
+    if (!Number.isFinite(p.value)) continue;
     const x = xScale(p.ts);
-    const y = yScale(p.value);
+    const y = yScale(p.value as number);
     if (i === start) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   }
   for (let i = end - 1; i >= start; i--) {
     const p = lower[i];
-    if (p.value == null) continue;
-    ctx.lineTo(xScale(p.ts), yScale(p.value));
+    if (!Number.isFinite(p.value)) continue;
+    ctx.lineTo(xScale(p.ts), yScale(p.value as number));
   }
   ctx.closePath();
   ctx.fill();
