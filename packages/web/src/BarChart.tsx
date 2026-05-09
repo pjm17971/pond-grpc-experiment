@@ -19,7 +19,14 @@ type Props = {
   bars: Bar[];
   tStart?: number;
   tEnd?: number;
-  width?: number;
+  /**
+   * Width — accepts a CSS px number or a percent template string
+   * matching Recharts' `ResponsiveContainer` signature. Defaults
+   * to `'100%'` so the bar chart aligns with the line chart above
+   * it (which also defaults to `'100%'`); pass a number for
+   * fixed-width testing.
+   */
+  width?: number | `${number}%`;
   height?: number;
 };
 
@@ -29,7 +36,7 @@ export function BarChart({
   bars,
   tStart,
   tEnd,
-  width = 420,
+  width = '100%',
   height = 110,
 }: Props) {
   if (tStart == null || tEnd == null || bars.length === 0) {
