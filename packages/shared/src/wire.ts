@@ -222,13 +222,22 @@ export type WireMsg = RawWireMsg | AggregateWireMsg;
  * `'cpu_avg'`; the dashboard sends the full `by` field on every
  * control message.
  *
+ * **Note on `requests_sum` (not `requests_avg`).** Pond's
+ * `requests_avg` reducer means "mean request count per event" —
+ * NOT throughput. A host with 5 huge events outranks a host with
+ * 5000 normal ones, which is the opposite of what a "busiest
+ * traffic" rank metric should do. `requests_sum` is the total
+ * request count over the 1m window and ranks identically to
+ * req/sec (the dashboard's headline). PR-#37 review caught this
+ * mislabel; the fix is to rank by sum.
+ *
  * Lives in `shared` so both server (`projectAppend` sort key) and
  * client (`useRemoteAggregateSeries` arg, `HostTable` dropdown)
  * reference one canonical list. Adding a metric is a one-line
  * change here + a one-line change in the server's `RANK_KEYS`
  * runtime list.
  */
-export type RankKey = 'cpu_avg' | 'cpu_sd' | 'requests_avg';
+export type RankKey = 'cpu_avg' | 'cpu_sd' | 'requests_sum';
 
 /** Default σ-threshold list emitted in `AggregateSnapshotMsg.thresholds`. */
 export const DEFAULT_AGGREGATE_THRESHOLDS: ReadonlyArray<number> = [

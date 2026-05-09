@@ -367,7 +367,38 @@ export function useRemoteAggregateSeries(
 
     const connect = () => {
       setStatus(isReconnect ? 'reconnecting' : 'connecting');
-      ws = new WebSocket(url);
+      // Build the WS URL with `?n=&by=` query params so the server
+      // can apply the per-subscriber projection to the snapshot
+      // backfill (PR #37 adversarial review). Without these
+      // params, every connect/reconnect ships the entire 5-min
+      // history unfiltered before our `set-top-n` control message
+      // even arrives — re-introducing the connect-time payload
+      // spike the projection was supposed to avoid.
+      //
+      // Read from the refs (latest values) so reconnects pick up
+      // any slider changes that happened mid-session, not the
+      // values the WS originally connected with. Default values
+      // (`null` + `cpu_avg`) are the back-compat path: send a
+      // bare URL with no query string for older servers.
+      const desiredN = topNRef.current;
+      const desiredBy = rankByRef.current;
+      const isDefault = desiredN === null && desiredBy === 'cpu_avg';
+      let connectUrl = url;
+      if (!isDefault) {
+        try {
+          const u = new URL(url);
+          if (desiredN !== null) u.searchParams.set('n', String(desiredN));
+          if (desiredBy !== 'cpu_avg') u.searchParams.set('by', desiredBy);
+          connectUrl = u.toString();
+        } catch {
+          // URL parse failed — fall back to the bare URL. The
+          // `set-top-n` message in `onopen` below will still
+          // configure the server post-connect (the snapshot just
+          // arrives unfiltered for this one connection).
+          connectUrl = url;
+        }
+      }
+      ws = new WebSocket(connectUrl);
       // Expose the socket to the topN-change effect so prop updates
       // can write to the live connection without bouncing through a
       // reconnect.

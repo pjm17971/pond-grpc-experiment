@@ -41,7 +41,7 @@ import { recordBytesSent, snapshot as metricsSnapshot } from './metrics.js';
  * `RankKey` type imported from `@pond-experiment/shared` — when
  * adding a metric, both lists need to grow.
  */
-const RANK_KEYS: ReadonlyArray<RankKey> = ['cpu_avg', 'cpu_sd', 'requests_avg'];
+const RANK_KEYS: ReadonlyArray<RankKey> = ['cpu_avg', 'cpu_sd', 'requests_sum'];
 
 type ClientPrefs = {
   /** `null` = no filter (ship all rows). Numeric = top-N by `rankBy`. */
@@ -219,7 +219,105 @@ function parseControlMessage(
   return { topN: clamped, rankBy };
 }
 
-export { projectAppend, parseControlMessage };
+/**
+ * Parse `?n=<int>&by=<RankKey>` query params from a WS handshake
+ * URL. Returns the connect-time `ClientPrefs` shape. Missing or
+ * invalid input falls back to the no-filter default — keeping the
+ * pre-PR-#37 wire compatible with clients that don't send the
+ * params yet.
+ *
+ * Why this exists: the dashboard sets its top-N via a `set-top-n`
+ * control message after WS open, but the server has already sent
+ * the entire snapshot-history backfill by then. Under firehose
+ * load that backfill is the heaviest connection-time payload
+ * (~12k rows × ~600 bytes), and shipping it unfiltered defeats
+ * the per-subscriber projection. URL-time params let the server
+ * apply the cut to the snapshot too — so a top-5 client never
+ * receives history rows for the other 75 hosts. See PR #37
+ * adversarial review for the full case.
+ *
+ * Defensive parsing — handles the same edge cases as
+ * `parseControlMessage`:
+ * - Non-finite `n` (`NaN`, `Infinity`) → null.
+ * - Out-of-range `n` → clamped to `[1, 1000]` (the parser's
+ *   conservative upper bound when host count isn't known yet).
+ * - Unknown `by` → cpu_avg fallback (no hard reject — query
+ *   strings come from URL bars and may be hand-edited; reject-
+ *   on-typo at connect would be a worse UX than the
+ *   control-channel one).
+ */
+function parseConnectQuery(rawUrl: string | undefined): {
+  topN: number | null;
+  rankBy: RankKey;
+} {
+  const fallback = { topN: null as number | null, rankBy: 'cpu_avg' as RankKey };
+  if (!rawUrl) return fallback;
+  const q = rawUrl.indexOf('?');
+  if (q === -1) return fallback;
+  const params = new URLSearchParams(rawUrl.slice(q + 1));
+  let topN: number | null = null;
+  const nStr = params.get('n');
+  if (nStr !== null && nStr !== '') {
+    const n = Number(nStr);
+    if (Number.isFinite(n)) {
+      topN = Math.max(1, Math.min(Math.floor(n), 1000));
+    }
+  }
+  let rankBy: RankKey = 'cpu_avg';
+  const byStr = params.get('by');
+  if (byStr !== null && RANK_KEYS.includes(byStr as RankKey)) {
+    rankBy = byStr as RankKey;
+  }
+  return { topN, rankBy };
+}
+
+/**
+ * Project the snapshot-history rows through `projectAppend` per-
+ * tick, threading hysteresis state across consecutive ticks. The
+ * result is the same shape as the input (flat `HostTick[]` in
+ * ts-ascending order) but trimmed to the client's `prefs.topN`
+ * cut at every tick — the snapshot replay looks consistent with
+ * the live frames that follow.
+ *
+ * Returns the final hysteresis state too so the caller can write
+ * it back into the client's `ClientPrefs`; live frames continue
+ * from where the snapshot left off rather than cold-starting.
+ */
+export function projectSnapshotHistory(
+  rows: ReadonlyArray<HostTick>,
+  prefs: ClientPrefs,
+): { rows: HostTick[]; lastTopHosts: ReadonlySet<string> | null } {
+  if (prefs.topN === null) {
+    return { rows: [...rows], lastTopHosts: null };
+  }
+  // Group by ts. Rows from the snapshot ring are typically already
+  // ordered ts-then-host (each emit-tick appends a contiguous run),
+  // but the Map below is robust to any input order.
+  const byTs = new Map<number, HostTick[]>();
+  for (const r of rows) {
+    let g = byTs.get(r.ts);
+    if (!g) {
+      g = [];
+      byTs.set(r.ts, g);
+    }
+    g.push(r);
+  }
+  const sortedTs = [...byTs.keys()].sort((a, b) => a - b);
+  const out: HostTick[] = [];
+  let runningPrefs: ClientPrefs = prefs;
+  for (const ts of sortedTs) {
+    const tickRows = byTs.get(ts)!;
+    const result = projectAppend(
+      { type: 'aggregate-append', rows: tickRows },
+      runningPrefs,
+    );
+    out.push(...result.msg.rows);
+    runningPrefs = { ...runningPrefs, lastTopHosts: result.lastTopHosts };
+  }
+  return { rows: out, lastTopHosts: runningPrefs.lastTopHosts };
+}
+
+export { projectAppend, parseControlMessage, parseConnectQuery };
 
 export type ServerOptions = {
   port: number;
@@ -342,31 +440,50 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     // Tolerate `?foo=1` in case a client appends query params later
     // for cache busting / debug. Path is the dispatch key.
     if (pathnameOf(req.url) === '/live-agg') {
-      // Initial prefs: no filter, no hysteresis state. Dashboard
-      // immediately follows up with a `{type:'set-top-n', n: 5}`
-      // control message after WS open; until that lands, the first
-      // few append frames carry all hosts. Snapshot frame on
-      // connect ships the full history regardless of `topN` —
-      // history backfill is a one-shot, not steady-state load.
-      // `lastTopHosts: null` is the hysteresis cold-start; the
-      // first projection collapses to strict top-N and the carry-
-      // over state warms up over the next frame.
-      aggClients.set(socket, {
-        topN: null,
-        rankBy: 'cpu_avg',
+      // Initial prefs from the WS handshake URL's `?n=&by=` query
+      // params. The dashboard ships these as connect-time hints so
+      // the server applies the per-subscriber projection to the
+      // snapshot backfill below — without that, every connect /
+      // reconnect ships the entire 5-min history unfiltered (~12k
+      // rows × ~600 bytes) and re-introduces the connect-time
+      // payload spike the projection was meant to avoid (PR #37
+      // adversarial review).
+      //
+      // Missing / invalid params → `topN: null`, `rankBy: cpu_avg`
+      // (the pre-PR-#37 wire shape, fully back-compat with older
+      // clients that don't know about the URL hints).
+      const initialPrefs: ClientPrefs = {
+        ...parseConnectQuery(req.url),
         lastTopHosts: null,
-      });
+      };
+      aggClients.set(socket, initialPrefs);
       // Step 8 — snapshot history. The aggregator maintains a ~5m
       // ring of recent `HostTick`s + `GlobalsTick`s; on connect we
       // ship that tail so the dashboard renders the full back-window
       // immediately rather than filling in over time. Empty arrays
       // for the very first client (aggregator just started, no
       // history yet); steady-state ships ~12k rows + ~1.5k globals.
+      //
+      // Project through the same `projectAppend` rules the live
+      // frames use — same top-N cut, same hysteresis (warmed up
+      // across the snapshot's own ticks). The dashboard sees a
+      // snapshot that's consistent with the live frames that
+      // follow rather than a wide history followed by a sudden
+      // narrow live cut.
       const history = getSnapshotHistory();
+      const projected = projectSnapshotHistory(history.rows, initialPrefs);
+      // Continue hysteresis from where the snapshot left off so
+      // the first live frame doesn't cold-start. The first live
+      // tick will see this state and decide carry-overs against
+      // the snapshot's tail rather than against an empty set.
+      aggClients.set(socket, {
+        ...initialPrefs,
+        lastTopHosts: projected.lastTopHosts,
+      });
       const snap: AggregateSnapshotMsg = {
         type: 'aggregate-snapshot',
         thresholds: DEFAULT_AGGREGATE_THRESHOLDS,
-        rows: history.rows,
+        rows: projected.rows,
         globals: history.globals,
       };
       socket.send(encode(snap));
