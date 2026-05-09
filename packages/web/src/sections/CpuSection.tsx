@@ -1,7 +1,28 @@
 import { BarChart } from '../BarChart';
+import { CanvasChart } from '../CanvasChart';
 import { Chart } from '../Chart';
 import { Stat } from '../Stat';
 import type { ChartOpts, DashboardData } from '../useDashboardData';
+
+/**
+ * Pick the chart implementation. Canvas is the default — Recharts'
+ * SVG accumulates DOM nodes proportional to point-count × series
+ * and at firehose × N-host loads pushes the renderer past the
+ * SVG-cliff (see M3.5 friction notes). The canvas primitive draws
+ * to a fixed-size `<canvas>` so DOM cost is constant regardless of
+ * data volume.
+ *
+ * `?canvas=0` (or `?recharts=1`) opts back into the SVG chart for
+ * comparison / debugging. Removed once the canvas path is proven
+ * out across the dashboard's chart surfaces.
+ */
+const USE_CANVAS_CHART = ((): boolean => {
+  if (typeof window === 'undefined') return true;
+  const p = new URLSearchParams(window.location.search);
+  if (p.get('canvas') === '0' || p.get('recharts') === '1') return false;
+  return true;
+})();
+const TimeChart = USE_CANVAS_CHART ? CanvasChart : Chart;
 
 type Props = {
   data: DashboardData;
@@ -60,7 +81,7 @@ export function CpuSection({ data, chartOpts, onChartOptsChange }: Props) {
         </div>
       </header>
       <div className="section-charts">
-        <Chart
+        <TimeChart
           title="CPU per host"
           series={data.cpuChartSeries}
           bands={data.cpuBands}

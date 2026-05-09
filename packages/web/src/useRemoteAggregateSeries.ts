@@ -343,6 +343,16 @@ export function useRemoteAggregateSeries(
     // the running totals — see `AggregateCounters` doc. Globals
     // come from the wire on every frame so we don't reset them
     // explicitly — the next aggregate-append will overwrite.
+    //
+    // The lint rule warns against synchronous `setState` in an
+    // effect because of the cascading-render cost; here the
+    // trade-off is intentional and bounded — URL changes are rare
+    // (user navigates to a different aggregator), the cascade is
+    // a single re-render with reset counters, and the alternative
+    // (parent-side `key={url}` remount) would force the LiveSeries
+    // and WS to tear down too. Keep the inline reset; suppress the
+    // rule with the rationale.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- URL-change reset; cascade is one-time, alternative would force a LiveSeries remount
     setCounters(ZERO_COUNTERS);
     // Per-effect-run anchors for the true-compression counter.
     // Reset alongside `setCounters(ZERO_COUNTERS)` because they
@@ -546,7 +556,10 @@ export function useRemoteAggregateSeries(
       wsRef.current = null;
       ws?.close();
     };
-  }, [url]);
+    // `liveSeries` is ref-stable for the component's lifetime per
+    // `@pond-ts/react`'s `useLiveSeries` contract — including it
+    // satisfies exhaustive-deps without triggering a re-run.
+  }, [url, liveSeries]);
 
   return {
     liveSeries,

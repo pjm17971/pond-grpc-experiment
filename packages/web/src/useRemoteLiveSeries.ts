@@ -100,6 +100,12 @@ export function useRemoteLiveSeries(
     if (!enabled) {
       // No WS, no fanout, no retention pressure. The `LiveSeries`
       // mounted above stays empty for the component's lifetime.
+      // `enabled` flipping mid-mount is the reset case: lint warns
+      // about setState in an effect for cascade reasons, but
+      // `enabled` rarely toggles (it's effectively a build-time
+      // flag), so the one-time cascade is the cleanest place to
+      // express "we're shutting down, reflect that in status."
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time reset on `enabled` flip; the alternative is a parent-side remount which would tear down the LiveSeries
       setStatus('closed');
       return;
     }

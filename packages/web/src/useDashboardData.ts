@@ -493,6 +493,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     const perf =
       typeof window !== 'undefined' &&
       new URLSearchParams(window.location.search).get('perf') === '1';
+    // eslint-disable-next-line react-hooks/purity -- diagnostic-only, gated on `?perf=1`; the timestamp doesn't influence render output
     const t0 = perf ? performance.now() : 0;
 
     const series: ChartSeries[] = [];
@@ -538,6 +539,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       return { series, bands, dots, allAnomalies };
     }
     const partitioned = filtered.partitionBy('host');
+    // eslint-disable-next-line react-hooks/purity -- diagnostic-only, gated on `?perf=1`; see top of memo
     const tPart = perf ? performance.now() : 0;
 
     // Downsample for line/band rendering. Per-bucket reducers picked
@@ -575,6 +577,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
         current_sd: 'avg',
       })
       .toMap((g) => g.toPoints());
+    // eslint-disable-next-line react-hooks/purity -- diagnostic-only, gated on `?perf=1`; see top of memo
     const tDownsample = perf ? performance.now() : 0;
 
     // Full-res rows per host — only used for the per-tick anomaly
@@ -582,6 +585,7 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     // reducer if pond ever grows array-column folds; today this is
     // the cleanest split.
     const fullResPerHost = partitioned.toMap((g) => g.toPoints());
+    // eslint-disable-next-line react-hooks/purity -- diagnostic-only, gated on `?perf=1`; see top of memo
     const tFullRes = perf ? performance.now() : 0;
 
     // Threshold list comes from the snapshot frame's `thresholds`
@@ -675,7 +679,34 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       //     center line still plots.
       const MIN_SAMPLES = 30;
       const aggRows = downsampledPerHost.get(host) ?? [];
+      // Gap detection: pond's `aggregate(Sequence.every(${aggBucketMs}ms))`
+      // only emits buckets where the source had events, so a host
+      // that fell out of the top-N filter for a stretch leaves a
+      // hole in `aggRows` rather than null markers. The chart can't
+      // tell "data is sparse on purpose" from "data is missing"
+      // without a domain hint, so we inject explicit `value:
+      // undefined` markers between rows whose ts-delta exceeds the
+      // expected bucket cadence — once per gap is enough to break
+      // the chart's line and band fills.
+      const GAP_FACTOR = 1.5;
+      let prevTs: number | undefined;
       for (const r of aggRows) {
+        if (prevTs !== undefined && r.ts - prevTs > aggBucketMs * GAP_FACTOR) {
+          // One gap marker mid-gap is enough — the chart treats any
+          // undefined entry as "lift the pen" so a single sentinel
+          // breaks both line and band rendering across the hole.
+          // Emit on every output array so the per-host loop's six
+          // overlay layers all see the gap.
+          const gapTs = prevTs + aggBucketMs;
+          smoothPoints.push({ ts: gapTs, value: undefined });
+          sigmaUpper.push({ ts: gapTs, value: undefined });
+          sigmaLower.push({ ts: gapTs, value: undefined });
+          distInnerUpper.push({ ts: gapTs, value: undefined });
+          distInnerLower.push({ ts: gapTs, value: undefined });
+          distOuterUpper.push({ ts: gapTs, value: undefined });
+          distOuterLower.push({ ts: gapTs, value: undefined });
+        }
+        prevTs = r.ts;
         const liveGate = (r.n_current ?? 0) >= 1;
         const baselineGate = (r.cpu_n ?? 0) >= MIN_SAMPLES;
         // Center line — `current_avg` per 200ms slice. Plots whenever
@@ -812,12 +843,12 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     }
 
     if (perf) {
+      // eslint-disable-next-line react-hooks/purity -- diagnostic-only, gated on `?perf=1`; the timestamp doesn't influence render output
       const tEnd = performance.now();
       let dsRows = 0;
       let frRows = 0;
       for (const rs of downsampledPerHost.values()) dsRows += rs.length;
       for (const rs of fullResPerHost.values()) frRows += rs.length;
-      // eslint-disable-next-line no-console
       console.log(
         '[cpu memo]',
         `part ${(tPart - t0).toFixed(1)}ms`,
@@ -1034,12 +1065,33 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       const rows = perHostRows.get(host) ?? [];
       const points: ChartPoint[] = [];
       let latestRate: number | undefined;
+      // Same gap-detection pattern as the cpu memo above. Pond
+      // emits no rows for buckets where the host had no events
+      // (e.g. the host was outside the server-side top-N for a
+      // stretch); we inject `value: undefined` markers when
+      // consecutive rows are more than 1.5× the expected bucket
+      // cadence apart, so the chart breaks its lines through the
+      // hole rather than connecting the surrounding points.
+      const GAP_FACTOR = 1.5;
+      let prevTs: number | undefined;
       for (const r of rows) {
-        if (typeof r.requests_sum !== 'number') continue;
-        // Need at least one event so requests_sum reflects real
-        // data and we don't paint extrapolated rates from an empty
-        // rolling window.
-        if ((r.requests_n ?? 0) < 1) continue;
+        if (prevTs !== undefined && r.ts - prevTs > aggBucketMs * GAP_FACTOR) {
+          points.push({ ts: prevTs + aggBucketMs, value: undefined });
+        }
+        prevTs = r.ts;
+        // Push **one point per bucket-row** including gate-failed
+        // ones, with `value: undefined` for the empty buckets so
+        // the chart sees a real gap and doesn't paint extrapolated
+        // rates. (Distinct from the time-gap-marker above: that's
+        // for missing rows; this is for rows present but
+        // gate-failed.)
+        if (
+          typeof r.requests_sum !== 'number' ||
+          (r.requests_n ?? 0) < 1
+        ) {
+          points.push({ ts: r.ts, value: undefined });
+          continue;
+        }
         const ageSec =
           typeof r.window_age_seconds === 'number'
             ? r.window_age_seconds
