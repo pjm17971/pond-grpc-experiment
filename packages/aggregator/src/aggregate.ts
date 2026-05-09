@@ -12,7 +12,6 @@ import {
   type GlobalsTick,
   type HostTick,
   type Schema,
-  encode,
 } from '@pond-experiment/shared';
 
 /**
@@ -111,11 +110,26 @@ type BaselineParts = {
   window_age_seconds: number;
   cpu_min: number | null;
   cpu_max: number | null;
+  current_avg: number | null;
+  current_sd: number | null;
 };
 
 export function startAggregate(
   live: LiveSeries<Schema>,
-  broadcast: (frame: string) => void,
+  /**
+   * Per-tick callback. Receives the structured `AggregateAppendMsg`
+   * (not pre-encoded) so the broadcast layer can apply per-subscriber
+   * projections (e.g. top-N row filtering) before encoding. The
+   * caller in `server.ts` iterates connected clients, projects per
+   * each client's `ClientPrefs`, and encodes once per client.
+   *
+   * Pre-step-9.1 this took an already-encoded `string` and the
+   * broadcast was a single `JSON.stringify`-shared payload across
+   * all clients. The wire-projection rework moved the encode step
+   * out so per-client projections work without round-tripping
+   * encoded JSON.
+   */
+  broadcast: (msg: AggregateAppendMsg) => void,
   opts: AggregateOptions = {},
 ): {
   stop: () => void;
@@ -160,12 +174,22 @@ export function startAggregate(
         },
         [`${tickMs}ms`]: {
           cpu_samples: { from: 'cpu', using: 'samples' },
-          // Step 7 — per-tick CPU extrema for the dashboard's "show
-          // min/max envelope" overlay. Same window as `cpu_samples`,
-          // built-in min/max reducers; both emit undefined for an
-          // empty slice (defensively coerced to null in `assembleTick`).
+          // Step 7 — per-tick CPU extrema for the dashboard's "Show
+          // raw points" outer (min/max) band. Same window as
+          // `cpu_samples`, built-in min/max reducers; both emit
+          // undefined for an empty slice (defensively coerced to
+          // null in `assembleTick`).
           cpu_min: { from: 'cpu', using: 'min' },
           cpu_max: { from: 'cpu', using: 'max' },
+          // Per-tick distribution: avg + stddev over the **200ms
+          // slice** (distinct from the 1m baseline `cpu_avg` /
+          // `cpu_sd` above). Drives the dashboard's "Show raw
+          // points" inner band — visualises the per-tick spread
+          // without the 1m smoothing the baseline bands carry.
+          // `'stdev'` returns undefined for n < 2; `assembleTick`
+          // coerces to null.
+          current_avg: { from: 'cpu', using: 'avg' },
+          current_sd: { from: 'cpu', using: 'stdev' },
         },
       },
       { trigger },
@@ -326,7 +350,7 @@ export function startAggregate(
         rows,
         globals,
       };
-      broadcast(encode(msg));
+      broadcast(msg);
       pendingByTs.delete(ts);
 
       // Mirror into the snapshot-history ring. Append-then-evict
@@ -354,6 +378,8 @@ export function startAggregate(
       const cpu_n = e.get('cpu_n');
       const cpu_min = e.get('cpu_min');
       const cpu_max = e.get('cpu_max');
+      const current_avg = e.get('current_avg');
+      const current_sd = e.get('current_sd');
       const requests_avg = e.get('requests_avg');
       const requests_sum = e.get('requests_sum');
       const requests_n = e.get('requests_n');
@@ -395,6 +421,9 @@ export function startAggregate(
           window_age_seconds: windowAgeSec,
           cpu_min: typeof cpu_min === 'number' ? cpu_min : null,
           cpu_max: typeof cpu_max === 'number' ? cpu_max : null,
+          current_avg:
+            typeof current_avg === 'number' ? current_avg : null,
+          current_sd: typeof current_sd === 'number' ? current_sd : null,
         },
         samples,
         thresholds,
@@ -481,6 +510,8 @@ function assembleTick(
     window_age_seconds: baseline.window_age_seconds,
     cpu_min: baseline.cpu_min,
     cpu_max: baseline.cpu_max,
+    current_avg: baseline.current_avg,
+    current_sd: baseline.current_sd,
   };
 }
 

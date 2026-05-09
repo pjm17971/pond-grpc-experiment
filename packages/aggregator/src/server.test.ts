@@ -12,8 +12,144 @@ import {
   type AggregateSnapshotMsg,
   DEFAULT_AGGREGATE_THRESHOLDS,
 } from '@pond-experiment/shared';
-import { startServer, type RunningServer } from './server.js';
+import {
+  startServer,
+  projectAppend,
+  parseControlMessage,
+  type RunningServer,
+} from './server.js';
 import { recordIngest, type MetricsSnapshot } from './metrics.js';
+
+const mkRow = (host: string, cpu: number | null) => ({
+  ts: 1_000,
+  host,
+  cpu_avg: cpu,
+  cpu_sd: 0.05,
+  cpu_n: 100,
+  n_current: 5,
+  anomalies_above: [0, 0, 0, 0, 0],
+  anomalies_below: [0, 0, 0, 0, 0],
+  requests_avg: 100,
+  requests_sum: 6_000,
+  requests_n: 100,
+  window_age_seconds: 60,
+  cpu_min: cpu != null ? cpu - 0.05 : null,
+  cpu_max: cpu != null ? cpu + 0.05 : null,
+  current_avg: cpu,
+  current_sd: cpu != null ? 0.04 : null,
+});
+
+describe('projectAppend (per-subscriber wire projection)', () => {
+  const baseMsg: AggregateAppendMsg = {
+    type: 'aggregate-append',
+    rows: [
+      mkRow('api-1', 0.3),
+      mkRow('api-2', 0.9),
+      mkRow('api-3', 0.5),
+      mkRow('api-4', 0.7),
+      mkRow('api-5', 0.1),
+    ],
+    globals: {
+      ts: 1_000,
+      events_ingested_total: 1000,
+      events_per_sec: 50,
+      evicted_total: 0,
+    },
+  };
+
+  it('passes through unchanged when prefs.topN is null', () => {
+    expect(projectAppend(baseMsg, { topN: null })).toBe(baseMsg);
+  });
+
+  it('passes through unchanged when topN >= row count', () => {
+    expect(projectAppend(baseMsg, { topN: 5 })).toBe(baseMsg);
+    expect(projectAppend(baseMsg, { topN: 10 })).toBe(baseMsg);
+  });
+
+  it('keeps top-N hosts ranked by cpu_avg, descending', () => {
+    const out = projectAppend(baseMsg, { topN: 2 });
+    expect(out.rows.map((r) => r.host)).toEqual(['api-2', 'api-4']);
+  });
+
+  it('preserves the rest of the message envelope (globals, type)', () => {
+    const out = projectAppend(baseMsg, { topN: 3 });
+    expect(out.type).toBe('aggregate-append');
+    expect(out.globals).toBe(baseMsg.globals);
+  });
+
+  it('sorts hosts with null cpu_avg to the bottom (would otherwise outrank live hosts)', () => {
+    const msg: AggregateAppendMsg = {
+      type: 'aggregate-append',
+      rows: [
+        mkRow('api-1', null),
+        mkRow('api-2', 0.4),
+        mkRow('api-3', null),
+        mkRow('api-4', 0.6),
+      ],
+    };
+    const out = projectAppend(msg, { topN: 2 });
+    expect(out.rows.map((r) => r.host)).toEqual(['api-4', 'api-2']);
+  });
+
+  it('returns an empty rows array when topN is 0 (degenerate edge — clamped at parse, but defensive)', () => {
+    const out = projectAppend(baseMsg, { topN: 0 });
+    expect(out.rows).toEqual([]);
+  });
+});
+
+describe('parseControlMessage', () => {
+  it('parses a valid set-top-n message', () => {
+    expect(parseControlMessage(JSON.stringify({ type: 'set-top-n', n: 5 }), 80)).toEqual(
+      { topN: 5 },
+    );
+  });
+
+  it('accepts n: null as "clear filter"', () => {
+    expect(parseControlMessage(JSON.stringify({ type: 'set-top-n', n: null }), 80)).toEqual(
+      { topN: null },
+    );
+  });
+
+  it('clamps below 1 to 1', () => {
+    expect(parseControlMessage(JSON.stringify({ type: 'set-top-n', n: 0 }), 80)).toEqual(
+      { topN: 1 },
+    );
+    expect(parseControlMessage(JSON.stringify({ type: 'set-top-n', n: -5 }), 80)).toEqual(
+      { topN: 1 },
+    );
+  });
+
+  it('clamps above max(hostCount, 1000) to that ceiling', () => {
+    expect(
+      parseControlMessage(JSON.stringify({ type: 'set-top-n', n: 5000 }), 80),
+    ).toEqual({ topN: 1000 });
+    expect(
+      parseControlMessage(JSON.stringify({ type: 'set-top-n', n: 5000 }), 2000),
+    ).toEqual({ topN: 2000 });
+  });
+
+  it('floors fractional n', () => {
+    expect(parseControlMessage(JSON.stringify({ type: 'set-top-n', n: 7.9 }), 80)).toEqual(
+      { topN: 7 },
+    );
+  });
+
+  it('returns null on invalid input rather than throwing', () => {
+    expect(parseControlMessage('not json', 80)).toBeNull();
+    expect(parseControlMessage(JSON.stringify({ type: 'other' }), 80)).toBeNull();
+    expect(parseControlMessage(JSON.stringify({ type: 'set-top-n' }), 80)).toBeNull();
+    expect(parseControlMessage(JSON.stringify({ type: 'set-top-n', n: 'five' }), 80)).toBeNull();
+    expect(parseControlMessage(JSON.stringify(null), 80)).toBeNull();
+    expect(parseControlMessage(42, 80)).toBeNull();
+    // Note: `JSON.stringify({n: NaN})` serialises NaN as `null` —
+    // a quirk of the JSON spec — so the message arrives equivalent
+    // to `{type:'set-top-n', n: null}` and is treated as
+    // "clear filter," not invalid. That's the right semantic at
+    // the wire layer; if a JS client wanted to send a real NaN to
+    // signal an error, it'd need its own wrapper.
+  });
+});
+
 
 describe('wire codec', () => {
   it('roundtrips a snapshot frame', () => {

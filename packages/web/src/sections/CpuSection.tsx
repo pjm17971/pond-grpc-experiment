@@ -10,15 +10,25 @@ type Props = {
 };
 
 /**
- * The CPU section: header stats, the per-host line chart with bands
- * and anomaly dots, the band toggles + σ slider, and the bucket bar
- * chart underneath.
+ * The CPU section: header stats, the per-host line chart, two
+ * independent overlay toggles, the σ slider, and the anomaly bucket
+ * bar chart underneath.
  *
- * Two display modes:
- *   - threshold mode (showBands off) — flat 70% reference line on the
- *     line chart, alert count = events above 70%, bars = alert counts
- *   - anomaly mode (showBands on)    — per-host ±σ bands + outlier
- *     dots, anomaly count = points outside the band, bars = anomaly counts
+ * Two overlays the chart can carry, controlled by two toggles:
+ *
+ * - **Show ±σ bands** (`showBands`): dashed-line edges per host at
+ *   `cpu_avg ± σ × cpu_sd` over the **1m baseline** window — the
+ *   anomaly threshold visualisation. Comes with red anomaly dots
+ *   placed at the per-tick `cpu_max` / `cpu_min` (the actual
+ *   sample that broke through the band). The σ slider only does
+ *   anything when this is on.
+ *
+ * - **Show raw points** (`showRaw`): two stacked filled bands per
+ *   host visualising the **per-tick (200 ms slice)** distribution
+ *   of the underlying samples — inner `current_avg ± current_sd`
+ *   at 30% opacity, outer `cpu_min … cpu_max` at 10%. No dots.
+ *   Distinct from the bands toggle: this is sample-distribution,
+ *   not anomaly-threshold.
  */
 export function CpuSection({ data, chartOpts, onChartOptsChange }: Props) {
   const { showBands, showRaw, sigma } = chartOpts;
@@ -46,10 +56,7 @@ export function CpuSection({ data, chartOpts, onChartOptsChange }: Props) {
                 : '—'
             }
           />
-          <Stat
-            label={showBands ? 'Anomalies' : 'Alerts'}
-            value={showBands ? data.cpuAnomalyCount : data.cpuAlertCount}
-          />
+          <Stat label="Anomalies" value={data.cpuAnomalyCount} />
         </div>
       </header>
       <div className="section-charts">
@@ -60,12 +67,14 @@ export function CpuSection({ data, chartOpts, onChartOptsChange }: Props) {
           dots={data.cpuDots}
           tStart={data.tStart}
           tEnd={data.tEnd}
-          width={720}
           yMin={0.2}
           yMax={0.9}
         />
         <div className="chart-toggles">
-          <label className="toggle">
+          <label
+            className="toggle"
+            title="Render dashed-line edges at cpu_avg ± σ·cpu_sd over the 1m baseline plus anomaly dots at the per-tick extreme value (cpu_max / cpu_min)."
+          >
             <input
               type="checkbox"
               checked={showBands}
@@ -86,27 +95,22 @@ export function CpuSection({ data, chartOpts, onChartOptsChange }: Props) {
           />
           <label
             className="toggle"
-            title="Per-tick CPU min/max envelope from the /live-agg wire's cpu_min and cpu_max columns. Adds two thin dashed lines per host tracing the 200ms-slice extrema — visible texture when the 1m smoothed line is flat (high event rates) and a finer-resolution view of within-tick variation."
+            title="Render two filled bands per host visualising the per-tick (200ms slice) distribution of samples: inner current_avg ± current_sd at 30% opacity, outer cpu_min … cpu_max at 10%. No dots."
           >
             <input
               type="checkbox"
               checked={showRaw}
               onChange={(e) => update({ showRaw: e.target.checked })}
             />
-            Show min/max envelope
+            Show raw points
           </label>
         </div>
         <BarChart
-          title={
-            showBands
-              ? 'Anomalies — 15s buckets'
-              : 'High CPU alerts — 15s buckets'
-          }
-          emptyLabel={showBands ? 'no anomalies yet' : 'no alerts yet'}
+          title="Anomalies — 15s buckets"
+          emptyLabel="no anomalies yet"
           bars={data.bars}
           tStart={data.tStart}
           tEnd={data.tEnd}
-          width={720}
           height={100}
         />
       </div>

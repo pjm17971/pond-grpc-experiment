@@ -314,6 +314,13 @@ header h1 {
   opacity: 0.5;
 }
 
+.toggle-static {
+  display: inline-flex;
+  align-items: center;
+  user-select: none;
+  opacity: 0.85;
+}
+
 .toggle-note {
   font-size: 0.7rem;
   opacity: 0.7;
@@ -385,39 +392,53 @@ th {
   font-weight: 500;
 }
 
-/* ── Aggregate probe (M3.5 diagnostic panel) ─────────── */
+/* ── Aggregate probe — "behind the curtain" wire-meta panel ─────── */
 .aggregate-probe {
-  border: 1px dashed rgba(127, 127, 127, 0.3);
+  /* Solid border replaces the previous dashed-border-debug-panel
+     look. The section is a first-class part of the dashboard now,
+     not a diagnostic side-channel. */
+  border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 0.75rem 1rem;
-  background: rgba(76, 139, 245, 0.03);
+  padding: 0.9rem 1.1rem;
 }
 
-.aggregate-probe-counts {
+.wire-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.9rem 1.5rem;
+  margin: 0.7rem 0 0.2rem;
+  padding: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.wire-stats > div {
   display: flex;
-  flex-wrap: wrap;
-  gap: 1.25rem;
-  margin: 0.4rem 0 0.2rem;
-  font-size: 0.8rem;
-  font-variant-numeric: tabular-nums;
-  opacity: 0.8;
+  flex-direction: column;
+  gap: 0.15rem;
 }
 
-.aggregate-probe-counts strong {
-  color: rgba(76, 139, 245, 0.95);
-  font-weight: 600;
-}
-
-.aggregate-probe-table {
-  width: auto;
-  margin-top: 0.5rem;
-  font-variant-numeric: tabular-nums;
-}
-
-.aggregate-probe-table td {
-  padding: 0.25rem 0.9rem 0.25rem 0;
-}
-
-.aggregate-probe-table td:first-child {
+.wire-stats dt {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.55;
   font-weight: 500;
+}
+
+.wire-stats dd {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.wire-stats strong {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.wire-stats-sub {
+  font-size: 0.72rem;
+  opacity: 0.65;
 }

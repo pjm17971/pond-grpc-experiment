@@ -18,18 +18,27 @@
  *  11. roll-up scalars
  */
 import { useMemo } from 'react';
-import { useTimeSeries, useWindow } from '@pond-ts/react';
+import { useWindow } from '@pond-ts/react';
 import { Sequence, TimeSeries, type SeriesSchema } from 'pond-ts';
 
 /**
  * Target points per chart series. The CPU/Requests charts are ~420px
  * wide; rendering more than ~1 point per pixel is wasted SVG-node
  * churn that React+Recharts has to diff every frame. With a 5-min
- * window of 5 fps/host ticks (1500 raw rows), TARGET_CHART_POINTS=500
- * gives ~3× downsample with no visible loss. See M3.5 friction note
- * "Recharts as the dashboard's render bottleneck".
+ * window of 5 fps/host ticks (1500 raw rows), TARGET_CHART_POINTS=250
+ * gives ~6× downsample with no visible loss (one point every ~1.7 px
+ * at chart scale).
+ *
+ * History: 1500 (none) → 500 (M3.5 perf follow-ups) → 250 (this
+ * commit). At firehose × 10 hosts the 500-point version still
+ * produced ~25k SVG nodes per render and the main thread stayed
+ * starved across 200ms throttle ticks; halving the per-series count
+ * + suppressing the per-Line `<Scatter>` overlay at high point
+ * densities (see Chart.tsx `SCATTER_DOT_THRESHOLD`) is the cheap
+ * mitigation that bridges us to a canvas-based chart (the M5
+ * `@pond-ts/charts` extraction).
  */
-const TARGET_CHART_POINTS = 500;
+const TARGET_CHART_POINTS = 250;
 import {
   type ChartBand,
   type ChartDots,
@@ -40,15 +49,10 @@ import { type Bar } from './BarChart';
 import {
   DEFAULT_AGGREGATE_THRESHOLDS,
   HOSTS,
-  baselineSchema,
   type HostTick,
 } from '@pond-experiment/shared';
 import { countAtSigma } from './anomalyInterpolation';
-import {
-  HIGH_CPU_THRESHOLD,
-  PALETTE,
-  WINDOW_MS,
-} from './dashboardSchema';
+import { PALETTE, WINDOW_MS } from './dashboardSchema';
 import { type ConnectionStatus } from './useRemoteLiveSeries';
 import {
   useRemoteAggregateSeries,
@@ -83,11 +87,29 @@ function deriveAggregateUrl(rawUrl: string): string {
 }
 
 export type ChartOpts = {
-  /** Toggle between threshold mode (off) and anomaly mode (on). */
+  /**
+   * "Show ±σ bands" toggle — when on, the CPU chart renders dashed
+   * line edges at `cpu_avg ± σ·cpu_sd` (the **1m baseline** stats)
+   * per host plus the per-tick anomaly dots. When off, both the
+   * dashed edges and the dots are hidden. The σ slider is only
+   * meaningful with this on.
+   */
   showBands: boolean;
-  /** Overlay the unsmoothed per-host samples behind the smoothed line. */
+  /**
+   * "Show raw points" toggle — when on, the CPU chart renders two
+   * stacked filled bands per host visualising the **per-tick (200
+   * ms slice)** distribution of underlying samples:
+   *   - inner band: `current_avg ± current_sd` (30% opacity)
+   *   - outer band: `cpu_min … cpu_max` (10% opacity)
+   * No dots on these bands; off-by-default to keep the first-time
+   * render path light.
+   */
   showRaw: boolean;
-  /** Band width in standard deviations. */
+  /**
+   * Width of the bands toggle's ±σ edges, in standard deviations.
+   * Drives `cpu_avg ± σ·cpu_sd` over the 1m baseline. Only
+   * meaningful when `showBands` is true.
+   */
   sigma: number;
 };
 
@@ -194,7 +216,6 @@ export type DashboardData = {
   cpuBands: ChartBand[];
   cpuDots: ChartDots[];
   cpuAnomalyCount: number;
-  cpuAlertCount: number;
   bars: Bar[];
 
   // Requests section
@@ -224,11 +245,13 @@ export type DashboardData = {
 
 export function useDashboardData(args: DashboardArgs): DashboardData {
   const { disabledHosts, chartOpts } = args;
-  // `showRaw` controls the per-tick min/max envelope overlay on the
-  // CPU chart (step 7's repurpose of the legacy raw-samples toggle —
-  // WIRE.md "show min/max" pattern, sourced from `cpu_min`/`cpu_max`
-  // on the aggregate stream). When on, each enabled host's chart gets
-  // two extra thin lines tracing the per-tick CPU extrema.
+  // Two independent overlay toggles + the σ slider.
+  // - `showBands`: dashed-edges anomaly bands at `cpu_avg ± σ·cpu_sd`
+  //   over the 1m baseline, plus anomaly dots.
+  // - `showRaw`: filled distribution bands over the 200ms slice
+  //   (inner `current_avg ± current_sd`, outer `cpu_min … cpu_max`).
+  // - `sigma`: tunes the inner ±σ multiplier; only relevant when
+  //   `showBands` is on.
   const { showBands, showRaw, sigma } = chartOpts;
 
   // 1. Aggregate stream — `/live-agg` mirror with the wire's per-host
@@ -245,8 +268,29 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //    The aggregate stream's `ConnectionStatus` drives the page-
   //    summary indicator — that's the only WS the dashboard depends
   //    on for any visible content.
-  const aggregate = useRemoteAggregateSeries(AGG_WS_URL);
-  const aggSnapshot = useWindow(aggregate.liveSeries, '5m', { throttle: 200 });
+  //
+  //    `topN: 5` ships a `{type:'set-top-n', n: 5}` control message
+  //    on WS open so the **server** drops everything outside the
+  //    busiest 5 hosts before broadcasting. Replaces the older
+  //    client-side `topHosts.filter(...)` step that ran inside the
+  //    chart memos: now the wire only ships ~5 host-rows per frame
+  //    and the dashboard's chart pipeline doesn't have to re-derive
+  //    a top-N cut on every render. Keep the constant in lockstep
+  //    with the chart-section's expected legend size; a slider PR
+  //    will replace it with state.
+  const TOP_N_HOSTS = 5;
+  const aggregate = useRemoteAggregateSeries(AGG_WS_URL, TOP_N_HOSTS);
+  // Snapshot throttle. The wire delivers per-tick aggregate frames
+  // every 200 ms, but the chart renders at the snapshot's cadence —
+  // one redraw per throttle period across ~30 series + bands + dots.
+  // At 200 ms (5 fps) the browser's render-engine GC fell behind the
+  // SVG-subtree allocation rate at firehose × 10 hosts (renderer
+  // killed at ~5-6 min). At 500 ms (2 fps) we halve the render-tree
+  // allocation rate while staying visually-live for a demo
+  // dashboard. The wire-meta panel below this still updates at
+  // 5 fps because it reads from `aggregate.counters` directly, not
+  // from the windowed snapshot.
+  const aggSnapshot = useWindow(aggregate.liveSeries, '5m', { throttle: 500 });
   // The σ-threshold list the snapshot frame's `thresholds` field
   // delivers. Step-4 anomaly-density interpolation keys off this —
   // see `anomalyInterpolation.ts`. Falls back to the default while
@@ -304,9 +348,39 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     return map;
   }, []);
 
+  // 4b. Visible-hosts notes (no derivation needed). Server-side top-N
+  //     (see `useRemoteAggregateSeries(url, TOP_N_HOSTS)` above + the
+  //     aggregator's `projectAppend`) already trims each broadcast
+  //     frame to the top-N busiest by 1m baseline `cpu_avg`, so
+  //     `latestPerHost` and `aggSnapshot` only carry rows for hosts
+  //     that have been in the cut at some point. The CPU + Requests
+  //     charts iterate `hosts` (HOSTS-declaration order, intersected
+  //     with the wire's actual contents) and gate on `enabledHosts`
+  //     for the user-toggle filter — no separate top-N memo runs
+  //     client-side anymore.
+  //
+  //     Hosts that fall out of the cut keep their last-known tick in
+  //     `latestPerHost` (the wire just stops shipping rows; the map
+  //     doesn't drop them) and stay visible on the chart until they
+  //     scroll off the 5min back-window. That's a visual quirk of
+  //     the no-hysteresis cut — boundary hosts can pop in and out
+  //     across ticks. A future hysteresis pass on the server
+  //     (deferred, `friction-notes/M3.5.md`) will smooth this out.
+  //
+  //     The HostToggles UI still excludes hosts from the chart's
+  //     `enabledHosts`, but the server can't see those toggles — a
+  //     "disabled" host that's in the server-side top-N still ships
+  //     its rows; the chart memos drop them via the `enabledHosts`
+  //     gate below. Net effect: server sends ~5 hosts; the chart
+  //     shows ≤5 (anything the user toggled off is hidden).
+
   // 5. Rolling 1m CPU avg across enabled hosts, sourced from the
   //    aggregate stream's `latestPerHost` map. See
-  //    `computeWeightedRollingCpu` for the weighting math.
+  //    `computeWeightedRollingCpu` for the weighting math. Note:
+  //    this rolls up across **all enabled hosts**, not just the
+  //    top-5 plotted on the chart — the headline reflects the
+  //    cluster a user has selected, even when the chart can only
+  //    show the busiest few of those.
   const rollingCpu = useMemo(
     () => computeWeightedRollingCpu(aggregate.latestPerHost, enabledHosts),
     [aggregate.latestPerHost, enabledHosts],
@@ -318,20 +392,24 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   const tEnd = aggSnapshot?.last()?.key().timestampMs();
   const tStart = tEnd != null ? tEnd - WINDOW_MS : undefined;
 
-  // 7. CPU section — fully aggregate-driven now. Bands + smoothed
-  //    line + anomaly dots all source from `/live-agg`'s tick rows;
-  //    the raw `timeSeries.baseline(...)` pipeline this section used
-  //    to run is gone (step 4 retires it).
+  // 7. CPU section — fully aggregate-driven. Per host:
   //
-  //    Anomaly dots are now per-tick density dots on the band edges
-  //    (per WIRE.md), not per-event red dots on raw values. For each
-  //    enabled host's rows in the aggregate windowed snapshot:
-  //      - render smoothed line + ±σ band from cpu_avg/cpu_sd (gated
-  //        on cpu_n >= 30, equivalent to the previous minSamples)
-  //      - interpolate the σ-bucketed `anomalies_above[]` /
-  //        `anomalies_below[]` arrays at the user's slider value, and
-  //        render a dot at the band edge when the interpolated count
-  //        is ≥ 1.
+  //    - smoothed line (`cpu_avg`) at full host colour
+  //    - inner band: cpu_avg ± σ × cpu_sd, host colour at 30%
+  //      opacity, dashed edges
+  //    - outer band: cpu_min … cpu_max (per-tick extrema), host
+  //      colour at 10% opacity, dashed edges
+  //    - anomaly dots placed at cpu_max (above-band) or cpu_min
+  //      (below-band) — i.e., on the actual extreme value, not the
+  //      smoothed band edge — when the σ-interpolated anomaly
+  //      count crosses 1 at the user's slider value
+  //
+  //    Top-N filter: at firehose × 10-host wire the chart caps at
+  //    the 5 enabled hosts with the highest current `cpu_avg`. The
+  //    HostToggles UI still lets the user exclude hosts; the chart
+  //    picks the N busiest of whatever's left. Keeps the visual
+  //    legible without forcing the user to manually disable
+  //    quieter hosts.
   const cpu = useMemo(() => {
     // Lightweight per-render diagnostic. `?perf=1` query param turns
     // it on; off in normal use because `console` lookups churn dev
@@ -357,14 +435,17 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       return { series, bands, dots, allAnomalies };
     }
 
-    // **Filter to enabled hosts before partitioning** — at 80-host
-    // firehose loads the full partition would allocate ~120k row
-    // objects per render to use ~1.5k of them. Filtering first scopes
-    // the allocation to the hosts we'll actually iterate. The
-    // partitioned series is then reused for both the full-res
-    // anomaly scan (sparse signals, must see every tick) and the
-    // downsampled line/band data — `partitionBy` returns a structural
-    // wrapper, so the second consumer is cheap.
+    if (enabledHosts.size === 0) {
+      return { series, bands, dots, allAnomalies };
+    }
+
+    // **Filter to enabled hosts before partitioning** — server-side
+    // top-N has already capped the wire to ~5 host-rows per frame,
+    // so the snapshot is small to begin with; this drops anything
+    // the user has explicitly toggled off via HostToggles. Pond's
+    // `filter` + `partitionBy` walk the snapshot once each; the
+    // expensive step (`toPoints` row materialisation) sees only
+    // what we'll draw.
     const filtered = aggSnapshot.filter((e) => {
       const h = e.get('host');
       return typeof h === 'string' && enabledHosts.has(h);
@@ -401,6 +482,13 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
         n_current: 'last',
         cpu_min: 'min',
         cpu_max: 'max',
+        // 200ms-slice distribution stats — averaged across the
+        // downsample bucket. The "raw points" toggle plots
+        // current_avg ± current_sd as the inner distribution band.
+        // Bucket-averaging slightly blurs the per-tick spread but
+        // that's fine for visualisation at chart scale.
+        current_avg: 'avg',
+        current_sd: 'avg',
       })
       .toMap((g) => g.toPoints());
     const tDownsample = perf ? performance.now() : 0;
@@ -430,89 +518,148 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       //    bucket boundaries would smear them and risk dropping them
       //    inside an all-zero bucket. Iterate every tick and emit a
       //    dot whenever the σ-bucketed count crosses 1.
+      //
+      //    Dots placed at the per-tick extreme value (`cpu_max` for
+      //    above-band anomalies, `cpu_min` for below-band) rather
+      //    than the band edge. The reading: the dot marks the
+      //    actual high/low sample that broke through the band, so
+      //    it sits where that sample is on the y-axis. Skip when
+      //    the extreme isn't available (empty 200ms slice → null).
       const anomalyDots: ChartPoint[] = [];
       const fullRows = fullResPerHost.get(host) ?? [];
       for (const r of fullRows) {
         if (r.cpu_avg == null || r.cpu_sd == null) continue;
-        const upperEdge = r.cpu_avg + sigma * r.cpu_sd;
-        const lowerEdge = r.cpu_avg - sigma * r.cpu_sd;
         // `kind: 'array'` columns are typed `ReadonlyArray<ScalarValue>`
         // (number|string|boolean) at the schema level; the wire contract
         // guarantees number arrays, so the cast is safe.
         const aAbove = (r.anomalies_above as ReadonlyArray<number>) ?? [];
-        if (countAtSigma(aAbove, sigma, thresholds) >= 1) {
-          anomalyDots.push({ ts: r.ts, value: upperEdge });
+        if (
+          countAtSigma(aAbove, sigma, thresholds) >= 1 &&
+          typeof r.cpu_max === 'number'
+        ) {
+          anomalyDots.push({ ts: r.ts, value: r.cpu_max });
         }
         const aBelow = (r.anomalies_below as ReadonlyArray<number>) ?? [];
-        if (countAtSigma(aBelow, sigma, thresholds) >= 1) {
-          anomalyDots.push({ ts: r.ts, value: lowerEdge });
+        if (
+          countAtSigma(aBelow, sigma, thresholds) >= 1 &&
+          typeof r.cpu_min === 'number'
+        ) {
+          anomalyDots.push({ ts: r.ts, value: r.cpu_min });
         }
       }
 
-      // ── Pass 2: line/band points from the downsampled bucket rows.
-      const upper: ChartPoint[] = [];
-      const lower: ChartPoint[] = [];
+      // ── Pass 2: line + band points from the downsampled bucket
+      //    rows. Up to four overlay layers per host depending on
+      //    toggles:
+      //      - smoothed line: always (cpu_avg, gated on cpu_n >= 30)
+      //      - showBands: dashed-line edges at cpu_avg ± σ·cpu_sd
+      //        (1m baseline) — emitted as two `hideFromLegend`
+      //        ChartSeries with `dashed: true`, NOT a filled band
+      //      - showRaw inner: filled band at current_avg ±
+      //        current_sd (200ms slice), 30% opacity, no edges
+      //      - showRaw outer: filled band at cpu_min … cpu_max
+      //        (200ms slice), 10% opacity, no edges
+      const sigmaUpper: ChartPoint[] = [];
+      const sigmaLower: ChartPoint[] = [];
+      const distInnerUpper: ChartPoint[] = [];
+      const distInnerLower: ChartPoint[] = [];
+      const distOuterUpper: ChartPoint[] = [];
+      const distOuterLower: ChartPoint[] = [];
       const smoothPoints: ChartPoint[] = [];
-      // Step 7 — per-tick CPU min/max envelope (the toggle's
-      // semantic). Pond's `min`/`max` reducers preserve the bucket's
-      // extremum so a single-tick spike survives the downsample.
-      const minPoints: ChartPoint[] = [];
-      const maxPoints: ChartPoint[] = [];
       let lastAvg: number | undefined;
 
-      // `cpu_n >= MIN_SAMPLES` is the gate-on-render mask, equivalent
-      // to the raw side's `baseline(..., { minSamples: 30 })`. Under
-      // bucket-count `cpu_n` semantics (the library agent's correction
-      // during the 0.13 review), `cpu_n` is already the rolling-1m
-      // sample count for that bucket — so the gate is just a per-row
-      // check, no client-side sum across rows needed. Kills the
-      // staircase artefact when the producer pauses and the rolling
-      // window has too few samples to trust mean/sd.
+      // Two independent gates per row:
+      //
+      //   - `liveGate`: `n_current >= 1` — the 200ms slice has at
+      //     least one sample. Drives the smoothed center line, which
+      //     plots `current_avg` (the 200ms-slice mean). Trades a
+      //     little visual jitter for *responsiveness* — the line
+      //     tracks bursts as soon as samples land in the slice,
+      //     instead of lagging the 1m baseline mean by tens of
+      //     seconds. (Pre-this commit the line plotted `cpu_avg`
+      //     over the 1m baseline, which was very smooth but
+      //     surprising next to the band edges: `cpu_sd` is far more
+      //     responsive to outliers than `cpu_avg`, so the band
+      //     widened around a burst while the center line just sat
+      //     there.)
+      //
+      //   - `baselineGate`: `cpu_n >= MIN_SAMPLES` — the 1m baseline
+      //     is warmed up enough that mean / sd are trustworthy.
+      //     Drives the ±σ band edges (`cpu_avg ± σ·cpu_sd`). Pre-
+      //     baseline-warmup the bands hold off; the responsive
+      //     center line still plots.
       const MIN_SAMPLES = 30;
       const aggRows = downsampledPerHost.get(host) ?? [];
       for (const r of aggRows) {
-        const gated = (r.cpu_n ?? 0) >= MIN_SAMPLES;
-        if (gated && r.cpu_avg != null) {
-          smoothPoints.push({ ts: r.ts, value: r.cpu_avg });
-          lastAvg = r.cpu_avg;
-          if (r.cpu_sd != null) {
-            upper.push({ ts: r.ts, value: r.cpu_avg + sigma * r.cpu_sd });
-            lower.push({ ts: r.ts, value: r.cpu_avg - sigma * r.cpu_sd });
-          } else {
-            upper.push({ ts: r.ts, value: undefined });
-            lower.push({ ts: r.ts, value: undefined });
-          }
+        const liveGate = (r.n_current ?? 0) >= 1;
+        const baselineGate = (r.cpu_n ?? 0) >= MIN_SAMPLES;
+        // Center line — `current_avg` per 200ms slice. Plots whenever
+        // the slice has data, even before the baseline warms up.
+        if (liveGate && typeof r.current_avg === 'number') {
+          smoothPoints.push({ ts: r.ts, value: r.current_avg });
+          lastAvg = r.current_avg;
         } else {
-          // Below the gate or stats absent — render a gap (the
-          // dashboard agent's render-gap convention from WIRE.md).
           smoothPoints.push({ ts: r.ts, value: undefined });
-          upper.push({ ts: r.ts, value: undefined });
-          lower.push({ ts: r.ts, value: undefined });
         }
-        // Min/max envelope tracks cpu_min/cpu_max on every row,
-        // independent of the cpu_n MIN_SAMPLES gate. The envelope is
-        // a direct readout of the bucket's spike extrema (pond's
-        // `min`/`max` reducers — see the aggregate call above). Gate
-        // only on slice content (`n_current >= 1`); empty slices
-        // produce null on the wire and the `'min'`/`'max'` reducer
-        // falls back to undefined, which renders as a gap.
-        if (showRaw) {
-          const sliceFilled = (r.n_current ?? 0) >= 1;
-          minPoints.push({
+        // Baseline σ band edges. Independent of `liveGate` — the band
+        // is the threshold reference, not the current value, so it
+        // can render even when the current slice is empty (as long
+        // as the baseline is warm).
+        if (baselineGate && r.cpu_avg != null && r.cpu_sd != null) {
+          sigmaUpper.push({
             ts: r.ts,
-            value:
-              sliceFilled && typeof r.cpu_min === 'number'
-                ? r.cpu_min
-                : undefined,
+            value: r.cpu_avg + sigma * r.cpu_sd,
           });
-          maxPoints.push({
+          sigmaLower.push({
             ts: r.ts,
-            value:
-              sliceFilled && typeof r.cpu_max === 'number'
-                ? r.cpu_max
-                : undefined,
+            value: r.cpu_avg - sigma * r.cpu_sd,
           });
+        } else {
+          sigmaUpper.push({ ts: r.ts, value: undefined });
+          sigmaLower.push({ ts: r.ts, value: undefined });
         }
+        // Distribution bands (showRaw toggle). Independent of the
+        // cpu_n MIN_SAMPLES gate — they describe the per-tick
+        // 200ms slice, not the 1m baseline. Gate on slice content
+        // (`n_current >= 1`); empty slices ship null and render
+        // as a gap.
+        const sliceFilled = (r.n_current ?? 0) >= 1;
+        // Inner distribution band: current_avg ± current_sd.
+        // current_sd is null when n_current < 2 (variance
+        // undefined); fall back to a zero-width band at
+        // current_avg in that case so the band degenerates to
+        // a line at the single observed value.
+        const innerCenter =
+          sliceFilled && typeof r.current_avg === 'number'
+            ? r.current_avg
+            : undefined;
+        const innerSd =
+          sliceFilled && typeof r.current_sd === 'number'
+            ? r.current_sd
+            : 0;
+        distInnerUpper.push({
+          ts: r.ts,
+          value: innerCenter != null ? innerCenter + innerSd : undefined,
+        });
+        distInnerLower.push({
+          ts: r.ts,
+          value: innerCenter != null ? innerCenter - innerSd : undefined,
+        });
+        // Outer distribution band: cpu_min … cpu_max.
+        distOuterUpper.push({
+          ts: r.ts,
+          value:
+            sliceFilled && typeof r.cpu_max === 'number'
+              ? r.cpu_max
+              : undefined,
+        });
+        distOuterLower.push({
+          ts: r.ts,
+          value:
+            sliceFilled && typeof r.cpu_min === 'number'
+              ? r.cpu_min
+              : undefined,
+        });
       }
 
       series.push({
@@ -522,37 +669,60 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
           lastAvg != null ? `${(lastAvg * 100).toFixed(0)}%` : undefined,
         points: smoothPoints,
       });
-      if (showBands && upper.length >= 2) {
-        bands.push({ name: host, color, upper, lower });
-        if (anomalyDots.length > 0) {
-          dots.push({ name: host, color: '#e23b3b', points: anomalyDots });
-          allAnomalies.push(...anomalyDots);
-        }
+
+      // showRaw distribution bands: outer first (renders behind),
+      // inner on top. Filled, no dashed edges, no dots.
+      if (showRaw && distOuterUpper.length >= 2) {
+        bands.push({
+          name: `${host}-dist-outer`,
+          color,
+          upper: distOuterUpper,
+          lower: distOuterLower,
+          opacity: 0.1,
+        });
       }
-      if (showRaw && (minPoints.length >= 2 || maxPoints.length >= 2)) {
-        // Two thin host-coloured lines tracing the 200ms-slice
-        // extrema. Hidden from the legend (the host's smoothed line
-        // already represents it; this is overlay context). Slightly
-        // transparent + dashed so the smoothed line stays the
-        // primary visual.
-        series.push({
-          name: `${host} max`,
+      if (showRaw && distInnerUpper.length >= 2) {
+        bands.push({
+          name: `${host}-dist-inner`,
           color,
-          points: maxPoints,
+          upper: distInnerUpper,
+          lower: distInnerLower,
+          opacity: 0.3,
+        });
+      }
+
+      // showBands ±σ edges — two dashed `hideFromLegend` series
+      // (NOT a filled band). The legend already lists the host
+      // via the smoothed line; the dashed edges are visual
+      // context, not separate entries.
+      if (showBands && sigmaUpper.length >= 2) {
+        series.push({
+          name: `${host}-sigma-upper`,
+          color,
+          points: sigmaUpper,
           dashed: true,
           width: 1,
-          opacity: 0.55,
+          opacity: 0.7,
           hideFromLegend: true,
         });
         series.push({
-          name: `${host} min`,
+          name: `${host}-sigma-lower`,
           color,
-          points: minPoints,
+          points: sigmaLower,
           dashed: true,
           width: 1,
-          opacity: 0.55,
+          opacity: 0.7,
           hideFromLegend: true,
         });
+      }
+
+      // Anomaly dots only emitted when bands toggle is on (they're
+      // the "look here, this broke through the band" cue). Without
+      // bands the dots have no reference frame; the distribution
+      // band shows the spread but not the threshold.
+      if (showBands && anomalyDots.length > 0) {
+        dots.push({ name: host, color: '#e23b3b', points: anomalyDots });
+        allAnomalies.push(...anomalyDots);
       }
     }
 
@@ -585,9 +755,9 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     hosts,
     enabledHosts,
     hostColors,
+    sigma,
     showBands,
     showRaw,
-    sigma,
   ]);
 
   // 8. EMA-smoothed CPU trend across all enabled hosts (summary stat
@@ -639,141 +809,61 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     return ema;
   }, [aggSnapshot, enabledHosts]);
 
-  // 9. Static 70%-threshold line, mounted via `useTimeSeries`. Two rows
-  //    spanning ±1h around mount; the chart clips it to the visible
-  //    window. Demonstrates the static-data path.
-  const baselineInput = useMemo(() => {
-    const now = Date.now();
-    const rows: [number, number][] = [
-      [now - 3_600_000, HIGH_CPU_THRESHOLD],
-      [now + 3_600_000, HIGH_CPU_THRESHOLD],
-    ];
-    return { name: 'threshold', schema: baselineSchema, rows };
-  }, []);
-  const baselineTs = useTimeSeries(baselineInput);
-  const thresholdValue = baselineTs?.first()?.get('cpu') as
-    | number
-    | undefined;
-  const thresholdPoints =
-    thresholdValue != null && tStart != null && tEnd != null
-      ? [
-          { ts: tStart, value: thresholdValue },
-          { ts: tEnd, value: thresholdValue },
-        ]
-      : [];
-
-  // 10. Final chart series. In threshold mode we append the dashed red
-  //     reference line; in anomaly mode the bands + dots speak for it.
-  const cpuChartSeries: ChartSeries[] = showBands
-    ? cpu.series
-    : [
-        ...cpu.series,
-        {
-          name: 'threshold',
-          color: '#e23b3b',
-          points: thresholdPoints,
-          dashed: true,
-        },
-      ];
-
-  // 11. High-CPU filter: aggregate-stream rows from enabled hosts where
-  //     `cpu_avg` exceeds the static 70% threshold. Used for the
-  //     "Alerts" stat AND as the source for the threshold-mode bar
-  //     chart bucketing. Pre-step 9 this filtered raw events over the
-  //     `/live` snapshot; post-retirement it filters per-tick host
-  //     aggregates. The unit changes — pre-step 9 each match was one
-  //     raw event over threshold, now each match is one (host, tick)
-  //     pair where the host's 1m baseline is over threshold — so the
-  //     count semantics shift from "how many over-threshold events"
-  //     to "how many over-threshold host-ticks." Same shape, denser
-  //     data: 80 hosts × 5 fps = 400 potential alerts/sec on the
-  //     aggregate stream regardless of underlying event rate. The
-  //     dashboard label stays "Alerts" because the visual story
-  //     ("how often is something hot?") is unchanged.
-  const highCpuFiltered = useMemo(() => {
-    if (!aggSnapshot) return null;
-    return aggSnapshot.filter((e) => {
-      const h = e.get('host');
-      const cpu = e.get('cpu_avg');
-      return (
-        typeof h === 'string' &&
-        enabledHosts.has(h) &&
-        typeof cpu === 'number' &&
-        cpu > HIGH_CPU_THRESHOLD
-      );
-    });
-  }, [aggSnapshot, enabledHosts]);
-
-  // 12. Bar chart buckets: 15-second bins of either anomalies (band mode)
-  //     or alerts (threshold mode). Both paths end in `aggregate(...)
-  //     → iterate buckets → push Bar`.
+  // 9. Bar chart buckets: 15-second bins of anomaly dots. Round-trip
+  //    the flat anomaly points back into a tiny TimeSeries via
+  //    `fromPoints` so we can use pond's bucketing.
+  //
+  //    **Sort first.** `cpu.allAnomalies` is built by appending each
+  //    host's dots in chronological order, but across hosts the
+  //    concatenated array isn't sorted — host A's dots at ts T1, T2
+  //    come before host B's at T1', T2' even when T1' < T2.
+  //    `TimeSeries.fromPoints` requires non-decreasing timestamps
+  //    and throws "row N is out of order" otherwise. Step 6's burst
+  //    dynamics make this common (an active burst on host A and
+  //    host B at the same tick produces interleaved timestamps
+  //    after concatenation).
+  //
+  //    **Cap first.** Natural ceiling is 5m × 5 fps × N_hosts × 2
+  //    dots ≈ 24k entries even at max anomaly density. If we're
+  //    handed an array meaningfully larger, something upstream is
+  //    broken; refuse rather than feed megabytes into `fromPoints`.
+  //    Slice to the most recent `MAX_ANOMALIES` — the bar chart
+  //    only shows the visible time-axis window anyway.
+  //
+  //    Threshold-mode (high-CPU alerts) was retired alongside the
+  //    showBands toggle: with both ±σ and min/max bands always
+  //    visible, the band overlay carries the "is anything hot?"
+  //    signal directly and the static 70% reference line stopped
+  //    pulling its weight.
   const bars: Bar[] = useMemo(() => {
     if (tStart == null || tEnd == null) return [];
-
-    if (showBands) {
-      // Band mode: round-trip the flat anomaly points back into a tiny
-      // TimeSeries via `fromPoints` so we can use pond's bucketing.
-      //
-      // **Sort first.** `cpu.allAnomalies` is built by appending each
-      // host's dots in chronological order, but across hosts the
-      // concatenated array isn't sorted — host A's dots at ts T1, T2
-      // come before host B's at T1', T2' even when T1' < T2.
-      // `TimeSeries.fromPoints` requires non-decreasing timestamps
-      // and throws "row N is out of order" otherwise. Pre-step-6 the
-      // simulator's IID noise rarely produced anomalies on multiple
-      // hosts in the same window, so the cross-host overlap was
-      // exotic; step 6's burst dynamics make it common (an active
-      // burst on host A and host B at the same tick produces
-      // interleaved timestamps after concatenation).
-      //
-      // **Cap first.** The natural ceiling on `cpu.allAnomalies` is
-      // 5m × 5 fps × N_hosts × 2 dots ≈ 24k entries even at maximum
-      // anomaly density. If we're handed an array meaningfully
-      // larger than that, something upstream is broken (LiveSeries
-      // not enforcing retention because React is in a render-error
-      // retry loop, etc.) and we should refuse rather than feed
-      // megabytes into `fromPoints` and OOM the tab. Slice to the
-      // most recent `MAX_ANOMALIES` entries — the bar chart only
-      // shows the visible-time-axis window anyway.
-      if (cpu.allAnomalies.length === 0) return [];
-      const MAX_ANOMALIES = 50_000;
-      const trimmed =
-        cpu.allAnomalies.length > MAX_ANOMALIES
-          ? cpu.allAnomalies.slice(-MAX_ANOMALIES)
-          : cpu.allAnomalies;
-      if (cpu.allAnomalies.length > MAX_ANOMALIES) {
-        // Loud signal in dev — if this fires we want to know.
-        console.warn(
-          `[dashboard] cpu.allAnomalies has ${cpu.allAnomalies.length} entries; trimming to last ${MAX_ANOMALIES}`,
-        );
-      }
-      const sortedAnomalies = [...trimmed].sort((a, b) => a.ts - b.ts);
-      const anomalyTs = TimeSeries.fromPoints(sortedAnomalies, {
-        name: 'anomalies',
-        schema: [
-          { name: 'time', kind: 'time' },
-          { name: 'value', kind: 'number' },
-        ] as const,
-      });
-      return aggregateToBars(
-        anomalyTs.aggregate(Sequence.every('15s'), { value: 'count' }),
-        'value',
-        tStart,
-        tEnd,
+    if (cpu.allAnomalies.length === 0) return [];
+    const MAX_ANOMALIES = 50_000;
+    const trimmed =
+      cpu.allAnomalies.length > MAX_ANOMALIES
+        ? cpu.allAnomalies.slice(-MAX_ANOMALIES)
+        : cpu.allAnomalies;
+    if (cpu.allAnomalies.length > MAX_ANOMALIES) {
+      // Loud signal in dev — if this fires we want to know.
+      console.warn(
+        `[dashboard] cpu.allAnomalies has ${cpu.allAnomalies.length} entries; trimming to last ${MAX_ANOMALIES}`,
       );
     }
-
-    // Threshold mode: aggregate the live filter directly. Counts
-    // (host, tick) pairs over threshold per 15s bucket — see the
-    // semantic note on `highCpuFiltered` above.
-    if (!highCpuFiltered || highCpuFiltered.length === 0) return [];
+    const sortedAnomalies = [...trimmed].sort((a, b) => a.ts - b.ts);
+    const anomalyTs = TimeSeries.fromPoints(sortedAnomalies, {
+      name: 'anomalies',
+      schema: [
+        { name: 'time', kind: 'time' },
+        { name: 'value', kind: 'number' },
+      ] as const,
+    });
     return aggregateToBars(
-      highCpuFiltered.aggregate(Sequence.every('15s'), { cpu_avg: 'count' }),
-      'cpu_avg',
+      anomalyTs.aggregate(Sequence.every('15s'), { value: 'count' }),
+      'value',
       tStart,
       tEnd,
     );
-  }, [showBands, cpu.allAnomalies, highCpuFiltered, tStart, tEnd]);
+  }, [cpu.allAnomalies, tStart, tEnd]);
 
   // 13. Requests: per-host rolling rate line + 1-min rolling rate as
   //     legend stat. Sources off `/live-agg`'s `requests_sum` /
@@ -801,12 +891,19 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
   //     smoothing's added lag.
   const reqSeries = useMemo<ChartSeries[]>(() => {
     if (!aggSnapshot || aggSnapshot.length === 0) return [];
+    if (enabledHosts.size === 0) return [];
     // Same filter-before-partition + downsample pattern as the CPU
     // section. `requests_sum` is already a 1-min rolling sum, so
     // averaging it across the bucket gives the natural plot value;
     // `requests_n` and `window_age_seconds` are gates / divisors,
     // sample at the bucket's terminal tick. No spike-preserving
     // signal here so all reducers are smooth-friendly.
+    //
+    // Server-side top-N already caps the wire to the same hosts
+    // that drive the CPU chart, so cross-section visual coherence
+    // (a host visible in one is visible in the other) holds without
+    // a client-side re-derivation. The only client filter left
+    // here is the user's HostToggles (`enabledHosts`).
     const aggBucketMs = Math.max(
       200,
       Math.ceil(WINDOW_MS / TARGET_CHART_POINTS),
@@ -911,6 +1008,8 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
         window_age_seconds: e.get('window_age_seconds'),
         cpu_min: (e.get('cpu_min') as number | null) ?? null,
         cpu_max: (e.get('cpu_max') as number | null) ?? null,
+        current_avg: (e.get('current_avg') as number | null) ?? null,
+        current_sd: (e.get('current_sd') as number | null) ?? null,
       });
     }
     return out;
@@ -927,11 +1026,10 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
     hostColors,
     rollingCpu,
     trendCpu,
-    cpuChartSeries,
+    cpuChartSeries: cpu.series,
     cpuBands: cpu.bands,
     cpuDots: cpu.dots,
     cpuAnomalyCount: cpu.allAnomalies.length,
-    cpuAlertCount: highCpuFiltered?.length ?? 0,
     bars,
     reqSeries,
     totalReqPerSec,

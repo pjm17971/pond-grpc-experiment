@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useLiveSeries } from '@pond-ts/react';
 import type { LiveSeries } from 'pond-ts';
 import type { JsonRowForSchema } from 'pond-ts/types';
@@ -21,8 +21,9 @@ type AggregateRow = JsonRowForSchema<AggregateSchema>;
  * accepts. Tuple order matches `aggregateSchema`'s column order:
  * `[time, host, cpu_avg, cpu_sd, cpu_n, n_current, anomalies_above,
  * anomalies_below, requests_avg, requests_sum, requests_n,
- * window_age_seconds, cpu_min, cpu_max]`. Stays close to the rest
- * of the experiment's "convert at the boundary" pattern.
+ * window_age_seconds, cpu_min, cpu_max, current_avg, current_sd]`.
+ * Stays close to the rest of the experiment's "convert at the
+ * boundary" pattern.
  */
 export function tickToRow(tick: HostTick): AggregateRow {
   return [
@@ -40,6 +41,8 @@ export function tickToRow(tick: HostTick): AggregateRow {
     tick.window_age_seconds,
     tick.cpu_min,
     tick.cpu_max,
+    tick.current_avg,
+    tick.current_sd,
   ];
 }
 
@@ -150,6 +153,26 @@ export type AggregateCounters = {
    * frame, the true wire compression ratio).
    */
   totalEvents: number;
+  /**
+   * Bytes received in the latest aggregate-append frame (the
+   * decoded WS message size). Drives the wire-meta panel's
+   * "what's actually arriving on the socket" readout.
+   */
+  latestFrameBytes: number;
+  /**
+   * Cumulative bytes received since this dashboard's first frame.
+   * Snapshot frames count too — the panel shows total wire pressure
+   * the dashboard absorbed, not just append frames.
+   */
+  totalBytes: number;
+  /**
+   * Wall-clock ms of the most recent frame (snapshot or append),
+   * captured at WS message receive time. The panel uses
+   * `Date.now() - lastFrameAt` to display a freshness indicator;
+   * stale readings flag a slow / disconnected feed visibly even
+   * before the connection-status state catches up.
+   */
+  lastFrameAt: number | null;
 };
 
 export type RemoteAggregateState = {
@@ -192,6 +215,9 @@ const ZERO_COUNTERS: AggregateCounters = {
   latestFrameEvents: 0,
   totalFrames: 0,
   totalEvents: 0,
+  latestFrameBytes: 0,
+  totalBytes: 0,
+  lastFrameAt: null,
 };
 
 /**
@@ -210,8 +236,24 @@ const ZERO_COUNTERS: AggregateCounters = {
  * raw events. The `latestPerHost` map kept its place — it's the
  * cheapest way to drive the diagnostic probe and (in step 4+) the
  * "current cell" anomaly readout.
+ *
+ * **`topN` (per-connection top-N filter)**: optional integer that the
+ * hook ships to the server as a `{type:'set-top-n', n}` control
+ * message right after WS open and again whenever the prop changes
+ * (without reconnecting). The server clamps + applies per-tick at
+ * broadcast time so this client only receives the top-N rows by 1m
+ * baseline `cpu_avg` per frame — see `server.ts.projectAppend`.
+ *
+ * `null` (the default) is "no filter, ship every host's row" —
+ * matches the pre-control-channel server behaviour for
+ * back-compat. Reconnects re-send the current preference in the
+ * fresh WS's onopen, so the user's selection survives a flap
+ * without needing the server to remember anything across the gap.
  */
-export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
+export function useRemoteAggregateSeries(
+  url: string,
+  topN: number | null = null,
+): RemoteAggregateState {
   // `useLiveSeries` from `@pond-ts/react` owns the LiveSeries
   // lifecycle for the component's lifetime — created once on mount,
   // stable ref afterwards. URL changes don't reconstruct it (the
@@ -236,6 +278,33 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
   const [counters, setCounters] = useState<AggregateCounters>(ZERO_COUNTERS);
   const [latestGlobals, setLatestGlobals] = useState<GlobalsTick | null>(null);
 
+  // Refs that the WS lifecycle effect reaches into so it can react to
+  // `topN` changes *without* re-running (a re-run would tear down the
+  // socket and slam through a reconnect on every slider tick — bad
+  // UX). The flow is:
+  //
+  //   - `topNRef` mirrors the latest prop value; the WS `onopen`
+  //     handler reads it and ships an immediate `set-top-n` so the
+  //     server's per-client filter starts at the user's preference.
+  //   - `wsRef` exposes the current socket to the change-effect
+  //     below so a prop update can send a fresh `set-top-n` over
+  //     the live connection. Cleared on cleanup / close so the
+  //     check `readyState === OPEN` reliably gates writes.
+  const topNRef = useRef(topN);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // Send `set-top-n` immediately when the prop changes, without
+  // tearing the socket. If the WS isn't open yet (initial mount, or
+  // mid-reconnect), the next `onopen` will read `topNRef.current`
+  // and ship the right value — no message is dropped.
+  useEffect(() => {
+    topNRef.current = topN;
+    const ws = wsRef.current;
+    if (ws && ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: 'set-top-n', n: topN }));
+    }
+  }, [topN]);
+
   useEffect(() => {
     // Reset compression-ratio counters when the URL changes (treated
     // as a fresh subscription). Reconnect to the same URL preserves
@@ -257,9 +326,23 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
     const connect = () => {
       setStatus(isReconnect ? 'reconnecting' : 'connecting');
       ws = new WebSocket(url);
+      // Expose the socket to the topN-change effect so prop updates
+      // can write to the live connection without bouncing through a
+      // reconnect.
+      wsRef.current = ws;
       ws.onopen = () => {
         if (!cancelled) setStatus('connected');
         attempt = 0;
+        // Restore (or set) the per-connection top-N preference on
+        // every open. The server forgets it across disconnects; this
+        // re-arms the filter on reconnect so the user's selection
+        // survives WS flaps. `null` is the server-side default
+        // ("no filter") so we skip the message in that case rather
+        // than send a redundant clear.
+        const desired = topNRef.current;
+        if (desired !== null && ws && ws.readyState === ws.OPEN) {
+          ws.send(JSON.stringify({ type: 'set-top-n', n: desired }));
+        }
       };
       ws.onmessage = (ev) => {
         // Cleanup may have run between this frame being queued and us
@@ -268,6 +351,18 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
         // frame from the old subscription would briefly write into
         // the new view.
         if (cancelled) return;
+        // Capture the raw payload size before decode so byte counters
+        // reflect what actually crossed the WS — wire-meta panel reads
+        // bytes/sec from these. Strings are JSON; pre-binary cutover
+        // this matches the over-the-wire UTF-8 length closely enough
+        // for the dashboard's "what's actually arriving" readout.
+        const frameBytes =
+          typeof ev.data === 'string'
+            ? ev.data.length
+            : ev.data instanceof ArrayBuffer
+              ? ev.data.byteLength
+              : 0;
+        const frameAt = Date.now();
         const msg = decode(ev.data as string);
         if (msg.type !== 'aggregate-snapshot' && msg.type !== 'aggregate-append') {
           // Misconfigured server sending raw frames on this socket —
@@ -283,6 +378,17 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
           if (msg.globals && msg.globals.length > 0) {
             setLatestGlobals(msg.globals[msg.globals.length - 1]);
           }
+          // Snapshot bytes count toward `totalBytes` so the wire-meta
+          // panel reflects everything that crossed the socket. Frame
+          // count and per-event delta belong to the append path
+          // (snapshots are reconnect backfill, not steady-state
+          // ticks); keep those in the append branch below.
+          setCounters((prev) => ({
+            ...prev,
+            latestFrameBytes: frameBytes,
+            totalBytes: prev.totalBytes + frameBytes,
+            lastFrameAt: frameAt,
+          }));
         }
         // Push every row into the mounted LiveSeries so windowed
         // queries (`useWindow`, `partitionBy`) work over the wire.
@@ -344,6 +450,9 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
               latestFrameEvents: frameEvents,
               totalFrames: prev.totalFrames + 1,
               totalEvents: eventsThisSession,
+              latestFrameBytes: frameBytes,
+              totalBytes: prev.totalBytes + frameBytes,
+              lastFrameAt: frameAt,
             }));
           } else {
             // No globals on the wire — count frames only, leave
@@ -353,6 +462,9 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
               latestFrameEvents: 0,
               totalFrames: prev.totalFrames + 1,
               totalEvents: prev.totalEvents,
+              latestFrameBytes: frameBytes,
+              totalBytes: prev.totalBytes + frameBytes,
+              lastFrameAt: frameAt,
             }));
           }
           if (msg.globals) {
@@ -361,6 +473,10 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
         }
       };
       ws.onclose = () => {
+        // Drop the ref before any reconnect so the topN-change effect
+        // can't fire a `send()` against a CLOSING/CLOSED socket. The
+        // next successful `connect()` re-anchors `wsRef.current`.
+        if (wsRef.current === ws) wsRef.current = null;
         if (cancelled) return;
         setStatus('reconnecting');
         isReconnect = true;
@@ -375,6 +491,7 @@ export function useRemoteAggregateSeries(url: string): RemoteAggregateState {
       cancelled = true;
       setStatus('closed');
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      wsRef.current = null;
       ws?.close();
     };
   }, [url]);

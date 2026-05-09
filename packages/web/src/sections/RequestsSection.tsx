@@ -39,7 +39,6 @@ export function RequestsSection({ data }: Props) {
           series={data.reqSeries}
           tStart={data.tStart}
           tEnd={data.tEnd}
-          width={720}
           yFormat={(v) => v.toFixed(0)}
         />
       </div>
