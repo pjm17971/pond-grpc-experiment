@@ -1,11 +1,12 @@
 # RFC: Bounded-memory rolling via sampling — `live.partitionBy(...).sample({ stride: N })`
 
-**Status:** draft, awaiting library-agent review
+**Status: CLOSED — shipped in pond-ts 0.17.0.** See ["Resolution"](#resolution) at the bottom.
 **Author:** the gRPC experiment agent (Claude)
 **First raised:** PR #32's M3.5 finish-line work (the firehose-rate dashboard surfaced a pond rolling-state ceiling that's not addressable via retention)
-**Origin friction note:** [`friction-notes/M3.5.md`](../M3.5.md) — "Bounded-memory rolling via sampling"
+**Origin friction note:** [`friction-notes/M3.5.md`](../M3.5.md) — "Bounded-memory rolling via sampling — RESOLVED in pond 0.17.0"
 **Prototype:** [PR #33](https://github.com/pjm17971/pond-grpc-experiment/pull/33) — user-space stride filter at the gRPC ingest path, with measured numbers
-**Proposed pond surface:** new chainable `sample` operator on `LiveSeries`, `LivePartitionedSeries`, `LiveView`, plus snapshot-side parity on `TimeSeries`
+**Library implementation:** [pond-ts#129](https://github.com/pjm17971/pond-ts/pull/129) — shipped in pond-ts 0.17.0
+**Experiment integration:** this branch — replaces the prototype with `live.partitionBy('host').sample({ stride })` in the aggregate pipeline
 
 ## TL;DR
 
@@ -203,3 +204,33 @@ Per-event cost: O(1) — increment one counter (per partition for partitioned va
 - Streaming-roadmap RFC (library-side, ack'd by experiment user 2026-05-08): the buffer-as-window persona work in pond 0.16 sets the design pattern this RFC follows (chainable, additive, identity-on-schema where possible).
 - Statistical-equivalence numbers measured at firehose: 70k events/s × 80 partitions × 1m baseline, stride=10 — see [`friction-notes/M3.5.md`](../M3.5.md) and PR #33's body.
 - Per-partition memory floor analysis: 80 partitions × ~5 reducers each ≈ 400 fixed objects regardless of stride. Per-event vs per-partition memory ratio is the single number that determines a given workload's effective heap reduction under sampling.
+
+## Resolution
+
+**Closed in pond-ts 0.17.0** ([PR #129](https://github.com/pjm17971/pond-ts/pull/129) / [release](https://www.npmjs.com/package/pond-ts/v/0.17.0), 2026-05-08). The library-side work shipped the API shape this RFC proposed, with the same chained-after-`partitionBy` placement and the same per-stream-thinning semantics. The 0.17.0 changelog cites this RFC by URL.
+
+**What shipped (mapping back to this RFC's TL;DR):**
+
+| RFC asked for                                                          | 0.17.0 shipped                                                                           | Notes                                                                                                                                                                                                                                                                          |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `live.partitionBy('host').sample({ stride: N }).rolling(...)`          | exactly that                                                                             | The keyed-form fused rolling from 0.15.0 composes cleanly downstream.                                                                                                                                                                                                          |
+| Identity-on-schema typing                                              | `LiveView<S>` returned                                                                   | Chainable surface (`filter`, `rolling`, `reduce`, `select`, `map`, `diff`, `rate`, `cumulative`, `fill`) immediately available downstream.                                                                                                                                     |
+| Per-partition state implicit when chained after `partitionBy`          | yes — closure-captured counter inside the `LiveView<S>`                                  | The bias-trap worked example from this RFC is now in pond's JSDoc on `LiveSeries.sample` / `LiveView.sample` with the `partitionBy(...).sample(...)` recommendation.                                                                                                           |
+| Counters + listeners upstream of the sample                            | yes — `live.stats().ingested` and `live.on('batch', cb)` see true throughput             | Resolves the prototype's "counts post-sample" caveat without any wire-format change. The aggregator's globals tick now reports the actual gRPC firehose under any stride.                                                                                                      |
+| Reservoir variant                                                      | snapshot side only (`TimeSeries`, `PartitionedTimeSeries`); live side queued for v0.18.0 | Algorithm R's random-slot replacement produces non-prefix evictions, which the existing live-eviction protocol can't model. The RFC's `'evict' \| 'replace'` proposal landed in 0.17.0's deferred section pretty much verbatim, blocked on Phase 4.5 milestone A's `LiveChange` channel. |
+| Sample-rate metadata in reducer outputs (Option A / B / C)             | Option A                                                                                 | "User-space scaling": the consumer multiplies `count` / `sum` outputs by `stride` if they want true firehose totals from the rolling. The aggregator does this for nothing right now (it doesn't surface count/sum from the per-host rolling on the wire), but the design decision matches the RFC's recommendation. |
+| Pre-partition `sample` allowed but warning-attached                    | allowed; multi-entity bias trap documented in JSDoc                                      | An earlier iteration of #129 shipped a type-level `unsafeGlobal: true` token; pulled during review for consistency with how every other stateful live operator handles the same multi-entity consideration. JSDoc warning is the same answer the other operators already give. |
+
+**What this RFC proposed that didn't ship (yet):**
+
+- **Live-side reservoir.** Deferred to v0.18.0+ behind Phase 4.5 milestone A's `LiveChange` channel. The library agent's reasoning matches this RFC's open question #3: random-slot replacement needs an exact-removal eviction channel that doesn't exist yet. Workaround per the 0.17.0 docs: `live.toTimeSeries().sample({ reservoir })` for the visualization-shaped case.
+
+**What changed during the round-trip that this RFC didn't anticipate:**
+
+- The `unsafeGlobal: true` strategy field (open question #1) was originally accepted into #129 then pulled during review. Reasoning: every other stateful live operator (`rolling`, `aggregate`, `fill`, `diff`, `rate`, `cumulative`, `pctChange`, `reduce`) gates the same multi-entity bias trap with a JSDoc warning rather than a type-level token, so a special token here would have been inconsistent. The JSDoc warning is now the consistent shape across the surface.
+
+**The integration on the experiment side** (this branch):
+
+- Replaced the prototype's per-host stride sampler at the gRPC ingest hop (`Map<string, number>` counters in `ingest.ts`) with `live.partitionBy('host').sample({ stride })` in the aggregate pipeline. Bench numbers will land alongside the integration PR.
+
+The friction → prototype → RFC → library → integration loop took two library releases (0.16.x for the supporting infrastructure — `partitionBy` auto-injection, `stats()` accessor — and 0.17.0 for the operator itself) and produced a piece of pond surface that closes a class of workloads the experiment couldn't otherwise sustain.
