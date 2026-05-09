@@ -39,11 +39,16 @@ const mkRow = (host: string, cpu: number | null) => ({
   current_sd: cpu != null ? 0.04 : null,
 });
 
-/** Tiny prefs helper — defaults `lastTopHosts: null` so most cases read clean. */
+/**
+ * Tiny prefs helper. Defaults to `cpu_avg` rank metric and `null`
+ * hysteresis state so most cases read clean — pass overrides as
+ * positional args.
+ */
 const prefs = (
   topN: number | null,
   lastTopHosts: ReadonlySet<string> | null = null,
-) => ({ topN, lastTopHosts });
+  rankBy: 'cpu_avg' | 'cpu_sd' | 'requests_avg' = 'cpu_avg',
+) => ({ topN, rankBy, lastTopHosts });
 
 describe('projectAppend (per-subscriber wire projection)', () => {
   const baseMsg: AggregateAppendMsg = {
@@ -291,41 +296,159 @@ describe('projectAppend hysteresis', () => {
   });
 });
 
+describe('projectAppend rankBy (configurable sort key)', () => {
+  // Mix CPU vs requests so the two metrics produce different rank
+  // orders — the test fails loudly if `rankBy` is ignored.
+  const mkRankRow = (
+    host: string,
+    cpu_avg: number | null,
+    requests_avg: number | null,
+    cpu_sd: number | null = 0.05,
+  ) => ({
+    ...mkRow(host, cpu_avg),
+    requests_avg,
+    cpu_sd,
+  });
+
+  // Three hosts where CPU rank and requests rank disagree, so any of
+  // the three rank metrics produces a different ordering. cpu_sd is
+  // also varied so it produces yet a third rank order.
+  const mixedMsg: AggregateAppendMsg = {
+    type: 'aggregate-append',
+    rows: [
+      mkRankRow('hot-cpu', 0.9, 100, 0.02),
+      mkRankRow('hot-req', 0.4, 500, 0.05),
+      mkRankRow('hot-vol', 0.5, 200, 0.2),
+    ],
+  };
+
+  it('rankBy: cpu_avg (default) ranks by 1m baseline CPU', () => {
+    const out = projectAppend(mixedMsg, prefs(2, null, 'cpu_avg'));
+    expect(out.msg.rows.map((r) => r.host)).toEqual(['hot-cpu', 'hot-vol']);
+  });
+
+  it('rankBy: requests_avg ranks by 1m baseline req rate', () => {
+    const out = projectAppend(mixedMsg, prefs(2, null, 'requests_avg'));
+    expect(out.msg.rows.map((r) => r.host)).toEqual(['hot-req', 'hot-vol']);
+  });
+
+  it('rankBy: cpu_sd ranks by 1m baseline volatility', () => {
+    const out = projectAppend(mixedMsg, prefs(2, null, 'cpu_sd'));
+    expect(out.msg.rows.map((r) => r.host)).toEqual(['hot-vol', 'hot-req']);
+  });
+
+  it('null values on the rank column sort to the bottom (cold-start hosts last)', () => {
+    // hot-req has null requests_avg; should fall behind both other
+    // hosts even though it has the highest cpu_avg.
+    const msg: AggregateAppendMsg = {
+      type: 'aggregate-append',
+      rows: [
+        mkRankRow('hot-req', 0.9, null),
+        mkRankRow('mid', 0.5, 200),
+        mkRankRow('low', 0.4, 100),
+      ],
+    };
+    const out = projectAppend(msg, prefs(2, null, 'requests_avg'));
+    expect(out.msg.rows.map((r) => r.host)).toEqual(['mid', 'low']);
+  });
+
+  it('hysteresis carries across the same rank metric (not auto-reset)', () => {
+    // Stable cut by requests_avg; second call with the same metric
+    // and a populated lastTopHosts should preserve the carry-over
+    // path. The set-top-n handler is responsible for resetting on
+    // metric change — projectAppend itself is stateless about that.
+    const out1 = projectAppend(mixedMsg, prefs(2, null, 'requests_avg'));
+    const out2 = projectAppend(
+      mixedMsg,
+      prefs(2, out1.lastTopHosts, 'requests_avg'),
+    );
+    expect(out2.msg.rows.map((r) => r.host)).toEqual(out1.msg.rows.map((r) => r.host));
+  });
+});
+
 describe('parseControlMessage', () => {
-  it('parses a valid set-top-n message', () => {
+  it('parses a valid set-top-n message (no `by` field → rankBy undefined for caller-side merge)', () => {
     expect(parseControlMessage(JSON.stringify({ type: 'set-top-n', n: 5 }), 80)).toEqual(
-      { topN: 5 },
+      { topN: 5, rankBy: undefined },
     );
   });
 
   it('accepts n: null as "clear filter"', () => {
     expect(parseControlMessage(JSON.stringify({ type: 'set-top-n', n: null }), 80)).toEqual(
-      { topN: null },
+      { topN: null, rankBy: undefined },
     );
   });
 
   it('clamps below 1 to 1', () => {
     expect(parseControlMessage(JSON.stringify({ type: 'set-top-n', n: 0 }), 80)).toEqual(
-      { topN: 1 },
+      { topN: 1, rankBy: undefined },
     );
     expect(parseControlMessage(JSON.stringify({ type: 'set-top-n', n: -5 }), 80)).toEqual(
-      { topN: 1 },
+      { topN: 1, rankBy: undefined },
     );
   });
 
   it('clamps above max(hostCount, 1000) to that ceiling', () => {
     expect(
       parseControlMessage(JSON.stringify({ type: 'set-top-n', n: 5000 }), 80),
-    ).toEqual({ topN: 1000 });
+    ).toEqual({ topN: 1000, rankBy: undefined });
     expect(
       parseControlMessage(JSON.stringify({ type: 'set-top-n', n: 5000 }), 2000),
-    ).toEqual({ topN: 2000 });
+    ).toEqual({ topN: 2000, rankBy: undefined });
   });
 
   it('floors fractional n', () => {
     expect(parseControlMessage(JSON.stringify({ type: 'set-top-n', n: 7.9 }), 80)).toEqual(
-      { topN: 7 },
+      { topN: 7, rankBy: undefined },
     );
+  });
+
+  it('accepts and validates the `by` field', () => {
+    expect(
+      parseControlMessage(
+        JSON.stringify({ type: 'set-top-n', n: 5, by: 'cpu_avg' }),
+        80,
+      ),
+    ).toEqual({ topN: 5, rankBy: 'cpu_avg' });
+    expect(
+      parseControlMessage(
+        JSON.stringify({ type: 'set-top-n', n: 5, by: 'requests_avg' }),
+        80,
+      ),
+    ).toEqual({ topN: 5, rankBy: 'requests_avg' });
+    expect(
+      parseControlMessage(
+        JSON.stringify({ type: 'set-top-n', n: 5, by: 'cpu_sd' }),
+        80,
+      ),
+    ).toEqual({ topN: 5, rankBy: 'cpu_sd' });
+  });
+
+  it('rejects an unknown `by` value (rather than silently ignoring it)', () => {
+    // Hard reject so a client typo surfaces. The alternative — drop
+    // the `by` field and accept the message — would let a typo
+    // silently leave the cut on whatever metric was previously set.
+    expect(
+      parseControlMessage(
+        JSON.stringify({ type: 'set-top-n', n: 5, by: 'cpu_argh' }),
+        80,
+      ),
+    ).toBeNull();
+    expect(
+      parseControlMessage(
+        JSON.stringify({ type: 'set-top-n', n: 5, by: 42 }),
+        80,
+      ),
+    ).toBeNull();
+  });
+
+  it('accepts `by` together with `n: null` (clear filter + change metric in one msg)', () => {
+    expect(
+      parseControlMessage(
+        JSON.stringify({ type: 'set-top-n', n: null, by: 'requests_avg' }),
+        80,
+      ),
+    ).toEqual({ topN: null, rankBy: 'requests_avg' });
   });
 
   it('returns null on invalid input rather than throwing', () => {

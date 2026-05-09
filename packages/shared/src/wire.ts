@@ -210,6 +210,26 @@ export type AggregateWireMsg = AggregateSnapshotMsg | AggregateAppendMsg;
 
 export type WireMsg = RawWireMsg | AggregateWireMsg;
 
+/**
+ * Allowed rank-by keys for the `/live-agg` per-connection top-N
+ * cut. Restricted to **1m baseline** scalar columns because the
+ * rank metric is meant to be the "settled" view (per-tick `current_avg`
+ * / `cpu_min` / `cpu_max` would make the cut thrash even harder than
+ * the boundary jitter hysteresis is designed to fight).
+ *
+ * Wire shape on the control channel: `{ type: 'set-top-n', n, by? }`
+ * where `by` is one of these literals. Server-side default
+ * `'cpu_avg'`; the dashboard sends the full `by` field on every
+ * control message.
+ *
+ * Lives in `shared` so both server (`projectAppend` sort key) and
+ * client (`useRemoteAggregateSeries` arg, `HostTable` dropdown)
+ * reference one canonical list. Adding a metric is a one-line
+ * change here + a one-line change in the server's `RANK_KEYS`
+ * runtime list.
+ */
+export type RankKey = 'cpu_avg' | 'cpu_sd' | 'requests_avg';
+
 /** Default σ-threshold list emitted in `AggregateSnapshotMsg.thresholds`. */
 export const DEFAULT_AGGREGATE_THRESHOLDS: ReadonlyArray<number> = [
   1, 1.5, 2, 2.5, 3,

@@ -5,6 +5,7 @@ import {
   type AggregateAppendMsg,
   type AggregateSnapshotMsg,
   type HostTick,
+  type RankKey,
   type Schema,
   DEFAULT_AGGREGATE_THRESHOLDS,
   encode,
@@ -34,13 +35,29 @@ import { recordBytesSent, snapshot as metricsSnapshot } from './metrics.js';
  * (every config change starts a fresh cut, see the control-channel
  * handler below).
  */
+/**
+ * Runtime list of allowed rank-by keys. Used by `parseControlMessage`
+ * to validate the wire's `by` field. Stays in lockstep with the
+ * `RankKey` type imported from `@pond-experiment/shared` — when
+ * adding a metric, both lists need to grow.
+ */
+const RANK_KEYS: ReadonlyArray<RankKey> = ['cpu_avg', 'cpu_sd', 'requests_avg'];
+
 type ClientPrefs = {
-  /** `null` = no filter (ship all rows). Numeric = top-N by 1m baseline cpu_avg. */
+  /** `null` = no filter (ship all rows). Numeric = top-N by `rankBy`. */
   topN: number | null;
+  /**
+   * Sort key for the top-N cut. Server-side default `cpu_avg`, also
+   * the value the dashboard sends explicitly on connect. Switching
+   * via `set-top-n` resets `lastTopHosts: null` so hysteresis on
+   * the new metric warms up from cold rather than carrying entries
+   * sized for the old metric's rank order.
+   */
+  rankBy: RankKey;
   /**
    * Hysteresis state — the host set the previous frame's projection
    * shipped. `null` for first frame, or after a `set-top-n` that
-   * changed the cut depth.
+   * changed the cut depth or metric.
    */
   lastTopHosts: ReadonlySet<string> | null;
 };
@@ -73,8 +90,9 @@ type ProjectionResult = {
 
 /**
  * Project an `aggregate-append` frame to a single client's view —
- * top-N rows by `cpu_avg`, descending, with rank-based hysteresis
- * so boundary jitter doesn't flicker the cut at 5 Hz.
+ * top-N rows by `prefs.rankBy` (a 1m baseline metric), descending,
+ * with rank-based hysteresis so boundary jitter doesn't flicker the
+ * cut at 5 Hz.
  *
  * Algorithm (per `friction-notes/M3.5.md`'s "Per-subscriber wire
  * projection — hysteresis" section):
@@ -113,10 +131,15 @@ function projectAppend(
     for (const r of msg.rows) hosts.add(r.host);
     return { msg, lastTopHosts: hosts };
   }
-  // Descending by cpu_avg; nulls/undefineds last.
+  // Descending by `rankBy`; nulls/undefineds last. The HostTick
+  // schema declares the three RankKey columns as `number | null`
+  // (rolling window may not be warm yet), so the value extractor
+  // coerces null → -Infinity so cold-start hosts sort to the bottom
+  // rather than spuriously landing at the top via NaN.
+  const key = prefs.rankBy;
   const sorted = [...msg.rows].sort((a, b) => {
-    const av = typeof a.cpu_avg === 'number' ? a.cpu_avg : -Infinity;
-    const bv = typeof b.cpu_avg === 'number' ? b.cpu_avg : -Infinity;
+    const av = typeof a[key] === 'number' ? (a[key] as number) : -Infinity;
+    const bv = typeof b[key] === 'number' ? (b[key] as number) : -Infinity;
     return bv - av;
   });
   // Strict top-N: always include (no hysteresis on admission).
@@ -142,11 +165,25 @@ function projectAppend(
   return { msg: { ...msg, rows }, lastTopHosts: keep };
 }
 
-/** Parse + validate a client control message. Returns null on bad input. */
+/**
+ * Parse + validate a client control message. Returns `null` on bad
+ * input. Wire shape:
+ *
+ *   { type: 'set-top-n', n: number | null, by?: RankKey }
+ *
+ * `by` is optional for back-compat with clients that only send
+ * `{ type, n }`; the parser leaves `rankBy` at the previous value
+ * by returning `undefined` for the field (the caller merges with
+ * existing prefs). An explicit invalid `by` value is rejected
+ * (returns `null` for the whole message), not silently ignored —
+ * so a client typo in the metric name surfaces rather than hides.
+ */
 function parseControlMessage(
   raw: unknown,
   hostCount: number,
-): { topN: number | null } | null {
+):
+  | { topN: number | null; rankBy: RankKey | undefined }
+  | null {
   if (typeof raw !== 'string') return null;
   let parsed: unknown;
   try {
@@ -155,10 +192,22 @@ function parseControlMessage(
     return null;
   }
   if (typeof parsed !== 'object' || parsed === null) return null;
-  const obj = parsed as { type?: unknown; n?: unknown };
+  const obj = parsed as { type?: unknown; n?: unknown; by?: unknown };
   if (obj.type !== 'set-top-n') return null;
+
+  // `by` validation up front so a typo'd metric is rejected before
+  // we accept the rest of the message. `undefined` (field omitted)
+  // means "leave the existing rankBy unchanged"; explicit-invalid
+  // (`'cpu_argh'` etc.) is a hard reject.
+  let rankBy: RankKey | undefined;
+  if (obj.by !== undefined) {
+    if (typeof obj.by !== 'string') return null;
+    if (!RANK_KEYS.includes(obj.by as RankKey)) return null;
+    rankBy = obj.by as RankKey;
+  }
+
   // `n: null` clears the filter (ship all rows).
-  if (obj.n === null) return { topN: null };
+  if (obj.n === null) return { topN: null, rankBy };
   if (typeof obj.n !== 'number' || !Number.isFinite(obj.n)) return null;
   // Clamp to a sane range. Lower bound 1 (zero hosts is a useless
   // chart); upper bound is the active host count or 1000 to allow
@@ -167,7 +216,7 @@ function parseControlMessage(
     1,
     Math.min(Math.floor(obj.n), Math.max(hostCount, 1000)),
   );
-  return { topN: clamped };
+  return { topN: clamped, rankBy };
 }
 
 export { projectAppend, parseControlMessage };
@@ -302,7 +351,11 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       // `lastTopHosts: null` is the hysteresis cold-start; the
       // first projection collapses to strict top-N and the carry-
       // over state warms up over the next frame.
-      aggClients.set(socket, { topN: null, lastTopHosts: null });
+      aggClients.set(socket, {
+        topN: null,
+        rankBy: 'cpu_avg',
+        lastTopHosts: null,
+      });
       // Step 8 — snapshot history. The aggregator maintains a ~5m
       // ring of recent `HostTick`s + `GlobalsTick`s; on connect we
       // ship that tail so the dashboard renders the full back-window
@@ -338,15 +391,17 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         if (result === null) return;
         const prev = aggClients.get(socket);
         if (!prev) return; // socket already removed
-        // Reset hysteresis state when the cut depth changes — the
-        // old `lastTopHosts` was sized for the previous topN and
-        // would carry stale boundary entries through the new
-        // projection's first few frames. Letting the new cut warm
-        // up from null is cleaner than trying to map an N=5 carry
-        // set onto an N=10 cut.
+        // Reset hysteresis state on any prefs change — the old
+        // `lastTopHosts` was sized for the previous N + metric and
+        // would carry stale entries through the new projection's
+        // first few frames. Letting the new cut warm up from null
+        // is cleaner than mapping carry entries across configs.
+        // `rankBy` defaults to the previous value when the message
+        // didn't include `by` (parser returns `undefined`).
         aggClients.set(socket, {
           ...prev,
           topN: result.topN,
+          rankBy: result.rankBy ?? prev.rankBy,
           lastTopHosts: null,
         });
       });
