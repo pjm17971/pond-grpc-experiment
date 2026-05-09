@@ -98,6 +98,15 @@ export type AggregateOptions = {
    * (`events_ingested_total`, `requests_ingested_total`,
    * `events_per_sec`) reflect actual gRPC throughput regardless of
    * how aggressively the per-host baseline is thinned.
+   *
+   * **Invalid input handling.** `Math.max(1, Math.floor(value ?? 1))`
+   * silently treats `NaN`, negative numbers, fractions, and undefined
+   * as `stride: 1` (no-op). Pond-ts's `.sample({stride: -1})` would
+   * throw at construction; the clamp here pre-empts that with a
+   * "best-effort, continue with no sample" fallback. `index.ts`
+   * already clamps env-var input via `Math.max(1, Number(env))`,
+   * so this is defense-in-depth for callers that bypass the env
+   * (programmatic `startServer({...})` from tests etc.).
    */
   sampleStride?: number;
 };
