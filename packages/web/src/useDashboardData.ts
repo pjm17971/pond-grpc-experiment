@@ -1035,11 +1035,25 @@ export function useDashboardData(args: DashboardArgs): DashboardData {
       const points: ChartPoint[] = [];
       let latestRate: number | undefined;
       for (const r of rows) {
-        if (typeof r.requests_sum !== 'number') continue;
-        // Need at least one event so requests_sum reflects real
-        // data and we don't paint extrapolated rates from an empty
-        // rolling window.
-        if ((r.requests_n ?? 0) < 1) continue;
+        // Push **one point per bucket-row** including gaps, with
+        // `value: undefined` for the gate-failed rows. Pond's
+        // `aggregate(Sequence.every(...))` emits one event per
+        // bucket boundary regardless of bucket contents, so this
+        // loop sees every visible-window bucket; pushing undefined
+        // for the empty ones lets the canvas chart's gap detection
+        // see real gaps instead of bridging two distant defined
+        // points with a straight line. (Same pattern the cpu memo
+        // uses for `smoothPoints` above.)
+        if (
+          typeof r.requests_sum !== 'number' ||
+          (r.requests_n ?? 0) < 1
+        ) {
+          // requests_n < 1: the rolling window is empty for this
+          // bucket — paint nothing rather than extrapolate a rate
+          // from zero events.
+          points.push({ ts: r.ts, value: undefined });
+          continue;
+        }
         const ageSec =
           typeof r.window_age_seconds === 'number'
             ? r.window_age_seconds
