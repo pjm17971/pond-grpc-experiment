@@ -436,6 +436,115 @@ describe('startAggregate', () => {
       stop();
     }
   });
+
+  // ── sampleStride ────────────────────────────────────────────────
+  // pond 0.17.0 added `live.partitionBy(...).sample({ stride })`;
+  // `startAggregate` exposes it as `AggregateOptions.sampleStride`
+  // and inserts the call between `partitionBy('host')` and the
+  // fused rolling. The tests here pin the wire-visible behaviour
+  // the friction-note RFC argued for: the rolling sees ~1/N
+  // events, but `events_ingested_total` (and friends, sourced
+  // upstream of the sample) still report the **true firehose**.
+  // Closes the prototype's "counts post-sample" caveat.
+
+  it('sampleStride: rolling sees ~1/N events; counters see full firehose', async () => {
+    // One test, two pipelines side-by-side: same input, one with
+    // `sampleStride: 1` (no-op) and one with `sampleStride: 4`.
+    // Both consume the same `live` so timing edges + push order
+    // are identical, and the comparison cancels any per-tick slop
+    // a single-pipeline test would have to slop-tolerate.
+    //
+    // Asserts:
+    //   - sampled `cpu_n` is materially smaller than unsampled
+    //     (~1/4) — the per-host rolling really is thinning
+    //   - globals counters (events_ingested_total,
+    //     requests_ingested_total) match input on **both** pipelines
+    //     — the sample is downstream of `live.on('batch')` so
+    //     upstream counters see the true firehose. Resolves the
+    //     pre-0.17 prototype's "counts post-sample" caveat.
+    const N = 200;
+    const liveUnsampled = new LiveSeries({
+      name: 'metrics-u',
+      schema,
+      retention: { maxAge: '6m' },
+    });
+    const liveSampled = new LiveSeries({
+      name: 'metrics-s',
+      schema,
+      retention: { maxAge: '6m' },
+    });
+    const framesU: string[] = [];
+    const framesS: string[] = [];
+    const { stop: stopU } = startAggregate(
+      liveUnsampled,
+      (f) => framesU.push(f),
+      { tickMs: 50 },
+    );
+    const { stop: stopS } = startAggregate(
+      liveSampled,
+      (f) => framesS.push(f),
+      { tickMs: 50, sampleStride: 4 },
+    );
+    try {
+      // Push with synthetic timestamps in the past so every event is
+      // already inside the 1m baseline window at the next tick
+      // boundary — sidesteps the edge where events with ts after
+      // the most-recently-fired boundary land in the next bucket
+      // and aren't reflected in `last`. Spread tightly (200 events
+      // × 1ms apart = 200ms span, well inside the trailing window).
+      const tBase = Date.now() - 30_000;
+      for (let i = 0; i < N; i++) {
+        const ev: [Date, number, number, string] = [
+          new Date(tBase + i),
+          0.5,
+          100,
+          'api-1',
+        ];
+        liveUnsampled.push(ev);
+        liveSampled.push(ev);
+      }
+      await new Promise((res) => setTimeout(res, 300));
+
+      const lastU = decodedFrames(framesU)
+        .flatMap((f) => f.rows)
+        .filter((r) => r.host === 'api-1')
+        .at(-1);
+      const lastS = decodedFrames(framesS)
+        .flatMap((f) => f.rows)
+        .filter((r) => r.host === 'api-1')
+        .at(-1);
+      expect(lastU).toBeDefined();
+      expect(lastS).toBeDefined();
+
+      // Sanity: unsampled saw substantially all events. Allow a
+      // tick of slop for events landing past the last boundary.
+      expect(lastU!.cpu_n).toBeGreaterThan(N - 20);
+      expect(lastU!.cpu_n).toBeLessThanOrEqual(N);
+
+      // The headline: sampled `cpu_n` is approximately 1/4 of
+      // unsampled. The exact ratio drifts with timing edges; pin
+      // a band that's tight enough to fail a regression where
+      // sampling silently became a no-op (or doubled).
+      const ratio = lastS!.cpu_n / lastU!.cpu_n;
+      expect(ratio).toBeGreaterThan(0.15);
+      expect(ratio).toBeLessThan(0.4);
+
+      // Counters upstream of the sample see the true firehose on
+      // both pipelines. Pre-0.17 the prototype dropped events at
+      // ingest, so `events_ingested_total` on the sampled
+      // pipeline would have read ~50 (= 200/4); the post-0.17
+      // contract is exactly N regardless of stride.
+      const lastFrameU = decodedFrames(framesU).at(-1);
+      const lastFrameS = decodedFrames(framesS).at(-1);
+      expect(lastFrameU!.globals!.events_ingested_total).toBe(N);
+      expect(lastFrameS!.globals!.events_ingested_total).toBe(N);
+      expect(lastFrameU!.globals!.requests_ingested_total).toBe(N * 100);
+      expect(lastFrameS!.globals!.requests_ingested_total).toBe(N * 100);
+    } finally {
+      stopU();
+      stopS();
+    }
+  });
 });
 
 describe('assembleTick', () => {

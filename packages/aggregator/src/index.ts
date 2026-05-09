@@ -11,16 +11,23 @@ const PORT = Number(process.env.AGGREGATOR_PORT ?? '8080');
 const PRODUCER_URL = process.env.PRODUCER_URL ?? '127.0.0.1:50051';
 
 /**
- * Stride-sampling factor — the experiment's user-space prototype
- * for the proposed `live.partitionBy(...).sample({ stride: N })`
- * library primitive. `SAMPLE_STRIDE=1` is the default (no
- * sampling, full firehose); `SAMPLE_STRIDE=10` keeps every 10th
- * event before pushing to the LiveSeries, cutting rolling-state
- * memory ~10× while leaving rolling stats statistically
- * equivalent. See M3.5 friction note "Bounded-memory rolling via
- * sampling" for the math + caveats. Counts post-sample under
- * stride > 1 (prototype limitation; real implementation would
- * track true ingest separately at the gRPC layer).
+ * Per-host stride-sampling factor for the aggregate pipeline's
+ * baseline rolling. `SAMPLE_STRIDE=1` is the default (no sampling,
+ * full firehose into the rolling); `SAMPLE_STRIDE=10` keeps every
+ * 10th event per host going into the rolling, cutting per-partition
+ * deque size ~10× while leaving rolling stats statistically
+ * equivalent (`sd / sqrt(N)` grows √10 but stays orders of
+ * magnitude below per-event noise at firehose). See
+ * `friction-notes/rfcs/bounded-memory-sampling.md` for the math.
+ *
+ * Plumbed into `startAggregate` (not `startIngest`) so the
+ * `LiveSeries` itself, `live.on('batch', cb)`, and the
+ * non-partitioned globals rolling all see the **true firehose** —
+ * the dashboard's `events_ingested_total` / `events_per_sec` /
+ * `requests_ingested_total` reflect actual gRPC throughput
+ * regardless of stride. Pre-0.17 the experiment's stride sampler
+ * sat at the gRPC ingest hop and undercounted these by the
+ * stride factor.
  */
 const SAMPLE_STRIDE = Math.max(1, Number(process.env.SAMPLE_STRIDE ?? '1'));
 
@@ -47,9 +54,16 @@ const live = new LiveSeries({
 
 const stopIngest = startIngest(live, {
   producerUrl: PRODUCER_URL,
-  sampleStride: SAMPLE_STRIDE,
 });
-const server = await startServer({ port: PORT, live });
+const server = await startServer({
+  port: PORT,
+  live,
+  // Route SAMPLE_STRIDE to the aggregate pipeline's per-host sample
+  // op — see `startAggregate.AggregateOptions.sampleStride` for the
+  // wiring and the `index.ts` comment block above for why this
+  // moved out of `startIngest`.
+  aggregateSampleStride: SAMPLE_STRIDE,
+});
 
 console.log(
   `aggregator listening on :${PORT} (producer=${PRODUCER_URL}, sampleStride=${SAMPLE_STRIDE})`,

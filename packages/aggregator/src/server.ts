@@ -18,6 +18,14 @@ export type ServerOptions = {
   live: LiveSeries<Schema>;
   /** Override the M3.5 aggregate-stream tick cadence. */
   aggregateTickMs?: number;
+  /**
+   * Per-host stride-sampling factor for the aggregate pipeline's
+   * baseline rolling — passed through as
+   * `AggregateOptions.sampleStride`. `1` (the default) is no
+   * sampling. See `startAggregate` for the integration with
+   * `live.partitionBy(...).sample({ stride })` (pond 0.17.0).
+   */
+  aggregateSampleStride?: number;
 };
 
 export type RunningServer = {
@@ -106,7 +114,10 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       }
       if (openCount > 0) recordBytesSent(frame.length * openCount);
     },
-    { tickMs: opts.aggregateTickMs },
+    {
+      tickMs: opts.aggregateTickMs,
+      sampleStride: opts.aggregateSampleStride,
+    },
   );
 
   wss.on('connection', (socket, req) => {

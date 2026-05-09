@@ -79,6 +79,27 @@ export type AggregateOptions = {
    * `globals`, the pre-step-8 behaviour).
    */
   historyMaxAgeMs?: number;
+  /**
+   * Per-host stride sample applied **between** `partitionBy('host')`
+   * and the fused rolling — `live.partitionBy('host').sample({ stride
+   * }).rolling(...)`. `1` (the default) is the no-op pass-through;
+   * `N > 1` keeps every Nth event per host so the rolling baseline
+   * sees N× fewer samples. The math works for `avg`/`stdev`/`count`
+   * (standard error grows √N, stays well below per-event noise at
+   * firehose); see `friction-notes/rfcs/bounded-memory-sampling.md`.
+   *
+   * Pre-0.17.0 the experiment ran a hand-rolled per-host stride
+   * sampler at the gRPC ingest hop (in `ingest.ts`); 0.17.0 ships
+   * the real `live.partitionBy(...).sample({ stride })` operator,
+   * so the sampling lives in the pipeline now. The big wire-visible
+   * difference: `live.on('batch', cb)` and the non-partitioned
+   * globals rolling (`events_per_sec`) sit **upstream** of the
+   * sample — they see the true firehose, so cumulative counters
+   * (`events_ingested_total`, `requests_ingested_total`,
+   * `events_per_sec`) reflect actual gRPC throughput regardless of
+   * how aggressively the per-host baseline is thinned.
+   */
+  sampleStride?: number;
 };
 
 const DEFAULT_HISTORY_MAX_AGE_MS = 5 * 60 * 1000;
@@ -131,6 +152,7 @@ export function startAggregate(
   const tickMs = opts.tickMs ?? 200;
   const thresholds = opts.thresholds ?? DEFAULT_AGGREGATE_THRESHOLDS;
   const historyMaxAgeMs = opts.historyMaxAgeMs ?? DEFAULT_HISTORY_MAX_AGE_MS;
+  const sampleStride = Math.max(1, Math.floor(opts.sampleStride ?? 1));
   const seq = Sequence.every(`${tickMs}ms`);
   const trigger = Trigger.clock(seq);
 
@@ -146,9 +168,22 @@ export function startAggregate(
   // argument, so the fused-rolling output schema's partition
   // column types as `ColumnDef<'host', 'string'>` without an
   // explicit type argument. (Pre-0.15.1 needed `partitionBy<'host'>(...)`.)
-  const fused: LiveSource<SeriesSchema> = live
-    .partitionBy('host')
-    .rolling(
+  //
+  // **Sampling insertion (pond 0.17.0).** When `sampleStride > 1`,
+  // a `.sample({ stride })` op sits between `partitionBy('host')`
+  // and `.rolling(...)` so each host's stream is thinned 1-in-N
+  // before flowing into the per-host rolling state. Counts +
+  // listeners on `live` itself are unaffected (they're upstream of
+  // the sample); only the rolling's per-partition deque sees the
+  // thinned stream. `stride === 1` is the no-op pass-through —
+  // skip the call so the hot path stays identical to pre-0.17 for
+  // the unsampled deployment.
+  const partitioned = live.partitionBy('host');
+  const sampled =
+    sampleStride > 1
+      ? partitioned.sample({ stride: sampleStride })
+      : partitioned;
+  const fused: LiveSource<SeriesSchema> = sampled.rolling(
       {
         '1m': {
           cpu_avg: { from: 'cpu', using: 'avg' },
