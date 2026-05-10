@@ -11,7 +11,8 @@
     "test": "vitest run",
     "bench:dev": "tsx scripts/bench.ts",
     "bench:full": "tsx scripts/bench.ts --full",
-    "bench:agg": "tsx scripts/bench-agg.ts"
+    "bench:agg": "tsx scripts/bench-agg.ts",
+    "drift:late-data": "tsx scripts/drift-late-data.ts"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.12.0",

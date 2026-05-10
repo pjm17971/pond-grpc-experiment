@@ -333,6 +333,18 @@ export type ServerOptions = {
    * `live.partitionBy(...).sample({ stride })` (pond 0.17.0).
    */
   aggregateSampleStride?: number;
+  /**
+   * Per-partition ordering mode for the fused rolling's
+   * `partitionBy('host', { ordering })` call. Defaults to
+   * `'strict'`; pass `'reorder'` (with `aggregatePartitionGraceWindow
+   * Ms`) when the source `LiveSeries` is also `'reorder'` so late
+   * events flow through to the fused rolling without throwing in
+   * the partition router. See `aggregate.ts → AggregateOptions.
+   * partitionOrdering` for the full rationale.
+   */
+  aggregatePartitionOrdering?: 'strict' | 'reorder' | 'drop';
+  /** Per-partition graceWindow (ms). Only valid with `aggregatePartitionOrdering === 'reorder'`. */
+  aggregatePartitionGraceWindowMs?: number;
 };
 
 export type RunningServer = {
@@ -370,6 +382,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     return metricsSnapshot({
       liveSeriesLength: opts.live.length,
       wsClientBufferedAmounts: bufferedAmount,
+      liveStats: opts.live.stats(),
     });
   });
 
@@ -444,6 +457,8 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     {
       tickMs: opts.aggregateTickMs,
       sampleStride: opts.aggregateSampleStride,
+      partitionOrdering: opts.aggregatePartitionOrdering,
+      partitionGraceWindowMs: opts.aggregatePartitionGraceWindowMs,
     },
   );
 

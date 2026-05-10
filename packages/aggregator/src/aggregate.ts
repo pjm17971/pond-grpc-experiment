@@ -108,6 +108,20 @@ export type AggregateOptions = {
    * (programmatic `startServer({...})` from tests etc.).
    */
   sampleStride?: number;
+  /**
+   * Per-partition ordering mode passed to `live.partitionBy(...)`.
+   * Pond's `partitionBy` default is `'strict'` regardless of the
+   * source `LiveSeries`'s ordering — i.e. a `'reorder'` source +
+   * default partition would still throw inside the partition router
+   * when a late event from the source's reorder is forwarded into
+   * the per-host sub-series. Drives the milestone-B late-data
+   * driver: pass `'reorder'` here whenever the source uses
+   * `'reorder'` so the late events flow end-to-end through the
+   * fused rolling rather than crashing the listener mid-batch.
+   */
+  partitionOrdering?: 'strict' | 'reorder' | 'drop';
+  /** Per-partition graceWindow (only valid when `partitionOrdering === 'reorder'`). */
+  partitionGraceWindowMs?: number;
 };
 
 const DEFAULT_HISTORY_MAX_AGE_MS = 5 * 60 * 1000;
@@ -176,6 +190,8 @@ export function startAggregate(
   const thresholds = opts.thresholds ?? DEFAULT_AGGREGATE_THRESHOLDS;
   const historyMaxAgeMs = opts.historyMaxAgeMs ?? DEFAULT_HISTORY_MAX_AGE_MS;
   const sampleStride = Math.max(1, Math.floor(opts.sampleStride ?? 1));
+  const partitionOrdering = opts.partitionOrdering ?? 'strict';
+  const partitionGraceWindowMs = opts.partitionGraceWindowMs;
   const seq = Sequence.every(`${tickMs}ms`);
   const trigger = Trigger.clock(seq);
 
@@ -201,7 +217,18 @@ export function startAggregate(
   // thinned stream. `stride === 1` is the no-op pass-through —
   // skip the call so the hot path stays identical to pre-0.17 for
   // the unsampled deployment.
-  const partitioned = live.partitionBy('host');
+  // Plumb ordering + graceWindow into the per-partition sub-series.
+  // Pond's `partitionBy` defaults each partition to `'strict'`, so a
+  // `'reorder'` source surfaces late events that then throw inside
+  // the partition router. Match the source mode to keep the late-
+  // event flow end-to-end consistent. See `AggregateOptions.partition
+  // Ordering` for the full rationale.
+  const partitioned = live.partitionBy('host', {
+    ordering: partitionOrdering,
+    ...(partitionOrdering === 'reorder' && partitionGraceWindowMs !== undefined
+      ? { graceWindow: partitionGraceWindowMs }
+      : {}),
+  });
   const sampled =
     sampleStride > 1
       ? partitioned.sample({ stride: sampleStride })

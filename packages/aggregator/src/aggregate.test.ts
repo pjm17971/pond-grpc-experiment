@@ -478,8 +478,8 @@ describe('startAggregate', () => {
       schema,
       retention: { maxAge: '6m' },
     });
-    const framesU: string[] = [];
-    const framesS: string[] = [];
+    const framesU: AggregateAppendMsg[] = [];
+    const framesS: AggregateAppendMsg[] = [];
     const { stop: stopU } = startAggregate(
       liveUnsampled,
       (f) => framesU.push(f),
@@ -591,7 +591,7 @@ describe('startAggregate', () => {
       schema,
       retention: { maxAge: '6m' },
     });
-    const frames: string[] = [];
+    const frames: AggregateAppendMsg[] = [];
     const { stop } = startAggregate(live, (f) => frames.push(f), {
       tickMs: 50,
       sampleStride: 2,
