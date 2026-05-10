@@ -86,12 +86,22 @@ async function spawnReady(opts: SpawnOptions): Promise<{
         resolveReady();
       }
     };
+    // When SPAWN_VERBOSE=1, mirror child stdio to the parent's so
+     // diagnostic logs (e.g. the aggregator's `LATE_DEBUG=1` warns)
+     // are visible during harness runs. Off by default — bench /
+     // drift scripts produce their own structured reports and the
+     // child noise would clutter them.
+    const verbose = process.env.SPAWN_VERBOSE === '1';
     child.stdout?.on('data', (chunk: Buffer) => {
-      stdoutBuf += chunk.toString();
+      const s = chunk.toString();
+      stdoutBuf += s;
+      if (verbose) process.stdout.write(`[child:${child.pid}] ${s}`);
       checkBuffer('stdout');
     });
     child.stderr?.on('data', (chunk: Buffer) => {
-      stderrBuf += chunk.toString();
+      const s = chunk.toString();
+      stderrBuf += s;
+      if (verbose) process.stderr.write(`[child:${child.pid}] ${s}`);
       checkBuffer('stderr');
     });
     child.once('exit', (code) => {
@@ -133,6 +143,21 @@ export type ProducerOptions = {
   eventsPerSec?: number;
   hostCount?: number;
   variability?: number;
+  /**
+   * Late-event injection knobs — drives the milestone-B late-data
+   * driver. Default is a no-op (`fraction=0`); the drift-comparison
+   * harness flips `fraction` to a non-zero value for the
+   * "late-loaded" leg of an A/B run. See
+   * `packages/producer/src/lateInjector.ts` for the math.
+   */
+  lateEventFraction?: number;
+  lateEventDelayMs?: number;
+  lateEventDelayTailMs?: number;
+  /** `host:fraction,host:fraction` env-string format. */
+  lateEventHostBias?: string;
+  lateEventSeed?: number;
+  /** Producer's HTTP /metrics port (only listens when injection is on). */
+  metricsPort?: number;
 };
 
 export async function spawnProducer(
@@ -144,6 +169,24 @@ export async function spawnProducer(
     HOST_COUNT: String(opts.hostCount ?? 4),
     VARIABILITY: String(opts.variability ?? 0.4),
   };
+  if (opts.lateEventFraction !== undefined) {
+    env.LATE_EVENT_FRACTION = String(opts.lateEventFraction);
+  }
+  if (opts.lateEventDelayMs !== undefined) {
+    env.LATE_EVENT_DELAY_MS = String(opts.lateEventDelayMs);
+  }
+  if (opts.lateEventDelayTailMs !== undefined) {
+    env.LATE_EVENT_DELAY_TAIL_MS = String(opts.lateEventDelayTailMs);
+  }
+  if (opts.lateEventHostBias !== undefined) {
+    env.LATE_EVENT_HOST_BIAS = opts.lateEventHostBias;
+  }
+  if (opts.lateEventSeed !== undefined) {
+    env.LATE_EVENT_SEED = String(opts.lateEventSeed);
+  }
+  if (opts.metricsPort !== undefined) {
+    env.METRICS_PORT = String(opts.metricsPort);
+  }
   const { child, pid } = await spawnReady({
     cwd: resolvePath(repoRoot, 'packages/producer'),
     env,
@@ -155,6 +198,17 @@ export async function spawnProducer(
 export type AggregatorOptions = {
   httpPort: number;
   producerUrl: string;
+  /**
+   * Pond `LiveSeries` ordering mode. Drives milestone-B's late-data
+   * driver: `'reorder'` accepts late events within `graceWindow`,
+   * `'drop'` silently rejects them, `'strict'` (default) throws on
+   * any out-of-order arrival.
+   */
+  ordering?: 'strict' | 'reorder' | 'drop';
+  /** Grace window for `'reorder'` mode (ms). Defaults to 30000 (= retention). */
+  graceWindowMs?: number;
+  /** Per-host stride sample factor (passed via env). */
+  sampleStride?: number;
 };
 
 export async function spawnAggregator(
@@ -164,6 +218,15 @@ export async function spawnAggregator(
     AGGREGATOR_PORT: String(opts.httpPort),
     PRODUCER_URL: opts.producerUrl,
   };
+  if (opts.ordering !== undefined) {
+    env.ORDERING = opts.ordering;
+  }
+  if (opts.graceWindowMs !== undefined) {
+    env.GRACE_WINDOW_MS = String(opts.graceWindowMs);
+  }
+  if (opts.sampleStride !== undefined) {
+    env.SAMPLE_STRIDE = String(opts.sampleStride);
+  }
   const { child, pid } = await spawnReady({
     cwd: resolvePath(repoRoot, 'packages/aggregator'),
     env,
