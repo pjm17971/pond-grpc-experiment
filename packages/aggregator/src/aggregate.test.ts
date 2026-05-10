@@ -633,6 +633,72 @@ describe('startAggregate', () => {
       stop();
     }
   });
+
+  it('partitionOrdering: late events flow through partitions under reorder', async () => {
+    // Pinned in response to the M4 library-agent review: the
+    // `partitionOrdering` option threads the source `LiveSeries`'s
+    // ordering down to per-partition sub-series so a late event the
+    // source accepts under `'reorder'` doesn't crash the partition
+    // router. Without the option (the pre-fix default), pond would
+    // throw `"out-of-order event"` from inside `_pushTrustedEvents`
+    // and the source's listener fan-out propagates the throw to
+    // `live.push()`, killing the rest of the batch. This test
+    // pins the wire so a future regression that drops the
+    // `{ ordering, graceWindow }` arg from `partitionBy` fails
+    // loudly (push throws) rather than silently (the drift harness
+    // is heavyweight CI scaffolding).
+    //
+    // Scope of the assertion: push() must not throw, AND the late
+    // event must land in the source's buffer. Whether the fused
+    // rolling INCLUDES the late event in subsequent emits is the
+    // milestone-B rolling-no-repair gap — out of scope here, and
+    // observed during the harness run. Asserting cpu_n=4 would
+    // conflate the propagation fix (this PR) with the repair
+    // capability (milestone B).
+    const live = new LiveSeries({
+      name: 'metrics-reorder',
+      schema,
+      retention: { maxAge: '60s' },
+      ordering: 'reorder',
+      graceWindow: '30s',
+    });
+    const frames: AggregateAppendMsg[] = [];
+    const { stop } = startAggregate(live, (f) => frames.push(f), {
+      tickMs: 50,
+      partitionOrdering: 'reorder',
+      partitionGraceWindowMs: 30_000,
+    });
+    try {
+      const tBase = Date.now() - 30_000;
+      live.push([new Date(tBase), 0.4, 100, 'api-1']);
+      live.push([new Date(tBase + 5_000), 0.5, 100, 'api-1']);
+      live.push([new Date(tBase + 10_000), 0.6, 100, 'api-1']);
+      // The headline assertion: with partitionOrdering wired
+      // correctly, this late push does NOT throw. Pre-fix this
+      // call kills the partition router.
+      expect(() => {
+        live.push([new Date(tBase + 7_000), 0.55, 100, 'api-1']);
+      }).not.toThrow();
+
+      // Source accepted the late event into its reorder buffer.
+      // (`length === 4` confirms partition propagation didn't crash
+      // — a partition throw would propagate up through the source's
+      // listener fan-out and stop the source's `#insert` from
+      // committing.)
+      expect(live.length).toBe(4);
+
+      // Wait for tick + microtask drain so at least one fused frame
+      // emits — pinned to confirm the pipeline survives after the
+      // late event (no orphaned listeners, no stuck microtask).
+      await new Promise((res) => setTimeout(res, 200));
+      const apiRows = frames
+        .flatMap((f) => f.rows)
+        .filter((r) => r.host === 'api-1');
+      expect(apiRows.length).toBeGreaterThan(0);
+    } finally {
+      stop();
+    }
+  });
 });
 
 describe('assembleTick', () => {

@@ -76,7 +76,7 @@ const stopGc = startGcObserver();
 // drift-comparison harness — see `friction-notes/M3.5.md`'s late-
 // data section. No-op at default `LATE_EVENT_FRACTION=0`.
 configureLateness({
-  baselineWindowMs: 60_000,
+  rollingWindowMs: 60_000,
   graceWindowMs: GRACE_WINDOW_MS,
 });
 

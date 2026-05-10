@@ -341,9 +341,18 @@ export type ServerOptions = {
    * events flow through to the fused rolling without throwing in
    * the partition router. See `aggregate.ts → AggregateOptions.
    * partitionOrdering` for the full rationale.
+   *
+   * Removal-on-library-fix: when pond ships partition-ordering
+   * inheritance (per the M4 friction note's recommendation), this
+   * option drops out of the wire and `index.ts` reverts to the
+   * single-knob ORDERING env var.
    */
   aggregatePartitionOrdering?: 'strict' | 'reorder' | 'drop';
-  /** Per-partition graceWindow (ms). Only valid with `aggregatePartitionOrdering === 'reorder'`. */
+  /**
+   * Per-partition graceWindow (ms). Only valid with
+   * `aggregatePartitionOrdering === 'reorder'`. Same removal-
+   * on-library-fix lifecycle as `aggregatePartitionOrdering`.
+   */
   aggregatePartitionGraceWindowMs?: number;
 };
 

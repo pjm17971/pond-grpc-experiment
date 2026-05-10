@@ -175,6 +175,85 @@ describe('startLateInjector', () => {
     injector.stop();
   });
 
+  it('hostBias produces the expected ratio under a 1000-event statistical workload', () => {
+    // Library-agent review asked for the bias factor to be pinned
+    // statistically, not just qualitatively. The drift harness's
+    // observed `~5×` ratio (api-1:0.5 bias vs no-bias hosts) wasn't
+    // backed by a unit test — a future regression that silently
+    // halves the bias multiplier (or doubles it) would slip past
+    // the lighter-touch presence test above.
+    //
+    // Setup: base fraction 0.1 (10% of any host late), bias api-1
+    // by +0.4 so api-1's effective rate is 0.5 (5× the unbiased
+    // rate). 1000 events split evenly across 4 hosts → 250 events
+    // per host. Expected late counts: api-1 ≈ 125, others ≈ 25
+    // each. Tolerances are ±25% to absorb mulberry32's per-seed
+    // variance at this N (a reasonably tight band for a single
+    // seed; widening would mask a regression that halves the bias).
+    vi.useFakeTimers();
+    const downstream = vi.fn();
+    const injector = startLateInjector(downstream, {
+      fraction: 0.1,
+      delayMeanMs: 1_000,
+      delayTailMs: 5_000,
+      hostBias: { 'api-1': 0.4 },
+      seed: 7,
+    });
+
+    const N_PER_HOST = 250;
+    const hosts = ['api-1', 'api-2', 'api-3', 'api-4'];
+    const events: Event[] = [];
+    for (let i = 0; i < N_PER_HOST; i++) {
+      for (const h of hosts) events.push(mkEvent(h, 1_000 + i));
+    }
+    injector.wrappedOnBatch({ events });
+
+    // Drain held events so we can read the per-host late counts via
+    // their downstream emit. Late events emit as single-event batches.
+    vi.advanceTimersByTime(60_000);
+    const lateByHost: Record<string, number> = {
+      'api-1': 0, 'api-2': 0, 'api-3': 0, 'api-4': 0,
+    };
+    // Each downstream call is either a multi-event "on-time" batch
+    // (all on the first call) or a single-event "late release". We
+    // use the injector's own emitted-late counter as ground truth
+    // for the total, then attribute per-host from the single-event
+    // batches.
+    for (const call of downstream.mock.calls) {
+      const batch = call[0] as { events: Event[] };
+      // On-time batches are all in the synchronous first call —
+      // multiple events; late releases are always single-event.
+      if (batch.events.length === 1) {
+        lateByHost[batch.events[0].host] += 1;
+      }
+    }
+    const m = injector.metrics();
+    const totalLate =
+      lateByHost['api-1'] + lateByHost['api-2'] +
+      lateByHost['api-3'] + lateByHost['api-4'];
+    expect(totalLate).toBe(m.events_emitted_late_total);
+
+    // Pin the ratio. api-1:0.5 effective ÷ others:0.1 = 5×.
+    const unbiasedAvg =
+      (lateByHost['api-2'] + lateByHost['api-3'] + lateByHost['api-4']) / 3;
+    const biasedRatio = lateByHost['api-1'] / unbiasedAvg;
+    // Expected ratio = 5; tolerance ±25% (3.75 to 6.25). Tightens
+    // a future regression that halves the bias (~2.5×) or removes
+    // the bias entirely (~1×) — both would fail loudly here.
+    expect(biasedRatio).toBeGreaterThan(3.75);
+    expect(biasedRatio).toBeLessThan(6.25);
+
+    // Absolute counts in the right ballpark too.
+    expect(lateByHost['api-1']).toBeGreaterThan(N_PER_HOST * 0.4); // expect ~125 = 0.5
+    expect(lateByHost['api-1']).toBeLessThan(N_PER_HOST * 0.6);
+    for (const h of ['api-2', 'api-3', 'api-4'] as const) {
+      expect(lateByHost[h]).toBeGreaterThan(N_PER_HOST * 0.05); // expect ~25 = 0.1
+      expect(lateByHost[h]).toBeLessThan(N_PER_HOST * 0.18);
+    }
+
+    injector.stop();
+  });
+
   it('lateness reservoir tracks p50/p99 sensibly', () => {
     vi.useFakeTimers();
     const downstream = vi.fn();
@@ -217,6 +296,62 @@ describe('startLateInjector', () => {
     vi.advanceTimersByTime(30_000);
     // No emissions — all timers cleared.
     expect(downstream).not.toHaveBeenCalled();
+  });
+
+  it('drain() forces every pending late event out synchronously', () => {
+    // Pinned in response to the M4 review: the drift harness's
+    // conservation check showed 1.11% drift from events still in
+    // the setTimeout queue at SIGTERM. `drain()` lets the producer's
+    // shutdown handler force the queue out before exit so the
+    // check closes exactly. Verify (a) every held event reaches
+    // downstream, (b) the late-counter ticks per event, and (c)
+    // the original `timeMs` is preserved (drain is just a forced
+    // emit, not a "fast-forward to now" — the events are still
+    // semantically late, just emitted earlier than their natural
+    // delay).
+    vi.useFakeTimers();
+    const downstream = vi.fn();
+    const injector = startLateInjector(downstream, {
+      fraction: 1, // every event late
+      delayMeanMs: 5_000,
+      delayTailMs: 30_000,
+      seed: 1,
+    });
+    const events = [
+      mkEvent('api-1', 100_000),
+      mkEvent('api-2', 100_001),
+      mkEvent('api-3', 100_002),
+    ];
+    injector.wrappedOnBatch({ events });
+
+    // Nothing emitted yet — every event is held.
+    expect(downstream).not.toHaveBeenCalled();
+    expect(injector.metrics().events_emitted_total).toBe(0);
+
+    // Drain WITHOUT advancing fake timers (the whole point: don't
+    // wait for the natural delay, just force everything out now).
+    injector.drain();
+
+    // All three held events emitted; counters reflect that they
+    // were late (`drain` is a forced setTimeout fire, not a
+    // bypass).
+    expect(downstream).toHaveBeenCalledTimes(3);
+    const m = injector.metrics();
+    expect(m.events_emitted_total).toBe(3);
+    expect(m.events_emitted_late_total).toBe(3);
+
+    // Original timeMs preserved across the drain — semantic
+    // lateness is untouched.
+    const released = downstream.mock.calls.map((c) => c[0].events[0]);
+    expect(released.map((e: Event) => e.timeMs).sort()).toEqual([
+      100_000, 100_001, 100_002,
+    ]);
+
+    // After drain, no further timers should fire.
+    vi.advanceTimersByTime(60_000);
+    expect(downstream).toHaveBeenCalledTimes(3);
+
+    injector.stop();
   });
 });
 

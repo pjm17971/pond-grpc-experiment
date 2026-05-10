@@ -118,9 +118,26 @@ export type AggregateOptions = {
    * driver: pass `'reorder'` here whenever the source uses
    * `'reorder'` so the late events flow end-to-end through the
    * fused rolling rather than crashing the listener mid-batch.
+   *
+   * **Marked for removal once pond ships partition-ordering
+   * inheritance.** The friction note at `friction-notes/M4.md`
+   * recommends pond either default-inherit the source's ordering
+   * onto `LivePartitionedOptions.ordering` (option A) or throw at
+   * construction when a `'reorder'` source meets a default
+   * partitionBy (option B). When either lands library-side, this
+   * option (and its sibling `partitionGraceWindowMs`) becomes
+   * dead code in the experiment — drop both, simplify
+   * `aggregate.ts`'s `partitionBy` call back to the no-options
+   * form, and tighten the M4 friction note's "experiment
+   * workaround" section to past-tense.
    */
   partitionOrdering?: 'strict' | 'reorder' | 'drop';
-  /** Per-partition graceWindow (only valid when `partitionOrdering === 'reorder'`). */
+  /**
+   * Per-partition graceWindow (only valid when
+   * `partitionOrdering === 'reorder'`). Same removal-on-library-
+   * fix lifecycle as `partitionOrdering` above — see the JSDoc
+   * there for the full rationale.
+   */
   partitionGraceWindowMs?: number;
 };
 

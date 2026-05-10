@@ -127,9 +127,30 @@ export type LateInjector = {
   metrics: () => LateInjectorMetrics;
   /**
    * Cancel any pending late-event timers. Call on shutdown so the
-   * process can exit cleanly.
+   * process can exit cleanly. Does NOT emit pending events — they
+   * are dropped silently. For "drain-then-stop" semantics that
+   * tighten the conservation check (every emitted late event makes
+   * it onto the wire before the process exits), use `drain()` first.
    */
   stop: () => void;
+  /**
+   * Force every pending late event onto the wire **right now** by
+   * synchronously firing all pending timers. Used by the bench /
+   * drift harness on shutdown so the conservation check closes
+   * exactly (`pond.ingested + throws + rejected == producer.emitted`)
+   * rather than approximately. Without this, events whose
+   * setTimeout hasn't fired at SIGTERM are silently dropped, and
+   * the conservation check shows a few-percent drift purely from
+   * the timer queue depth.
+   *
+   * After `drain()` returns, the timer queue is empty and the
+   * `events_emitted_late_total` counter reflects every event that
+   * was ever held. Safe to call concurrently with new pushes (the
+   * inflight events still go through the normal late path); not
+   * idempotent in the sense that pending timers are processed once
+   * and only once.
+   */
+  drain: () => void;
 };
 
 /**
@@ -160,7 +181,18 @@ export function startLateInjector(
   let reservoirCount = 0;
   let eventsEmittedTotal = 0;
   let eventsEmittedLateTotal = 0;
-  const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+  /**
+   * Each pending late-event entry: the timer handle (so `stop()` /
+   * `drain()` can find it) plus the event payload (so `drain()` can
+   * emit it without waiting for the timer to fire). Pre-drain this
+   * was a `Set<Timeout>` — the payload was captured in the
+   * setTimeout closure, opaque to drain().
+   */
+  type PendingEntry = {
+    timer: ReturnType<typeof setTimeout>;
+    event: Event;
+  };
+  const pendingEntries = new Set<PendingEntry>();
   let stopped = false;
 
   const recordLateness = (delayMs: number): void => {
@@ -193,11 +225,19 @@ export function startLateInjector(
           sampleLogNormal(rng, opts.delayMeanMs, opts.delayTailMs),
         );
         recordLateness(delay);
-        const timer = setTimeout(() => {
-          pendingTimers.delete(timer);
+        const entry: PendingEntry = {
+          // Placeholder — overwritten on the next line. Avoids a
+          // TDZ on `entry.timer` inside the setTimeout callback's
+          // closure (which fires synchronously at delay=0 in some
+          // test setups before the setTimeout return value lands).
+          timer: undefined as unknown as ReturnType<typeof setTimeout>,
+          event,
+        };
+        entry.timer = setTimeout(() => {
+          pendingEntries.delete(entry);
           emitLateEvent(event);
         }, delay);
-        pendingTimers.add(timer);
+        pendingEntries.add(entry);
       } else {
         onTime.push(event);
       }
@@ -222,11 +262,33 @@ export function startLateInjector(
 
   const stop = (): void => {
     stopped = true;
-    for (const t of pendingTimers) clearTimeout(t);
-    pendingTimers.clear();
+    for (const entry of pendingEntries) clearTimeout(entry.timer);
+    pendingEntries.clear();
   };
 
-  return { wrappedOnBatch, metrics, stop };
+  /**
+   * Synchronously fire every pending late event right now. Cancels
+   * the underlying setTimeout (so it doesn't fire a second time),
+   * then emits the event through the `emitLateEvent` path so the
+   * counters tick exactly as they would have if the timer had
+   * elapsed naturally.
+   *
+   * Snapshot the entries before iterating because `emitLateEvent`
+   * is observable to the downstream — a downstream that calls
+   * `drain()` recursively would mutate the set under iteration.
+   * Today's downstream doesn't, but the snapshot is cheap defense.
+   */
+  const drain = (): void => {
+    if (stopped) return;
+    const snapshot = [...pendingEntries];
+    pendingEntries.clear();
+    for (const entry of snapshot) {
+      clearTimeout(entry.timer);
+      emitLateEvent(entry.event);
+    }
+  };
+
+  return { wrappedOnBatch, metrics, stop, drain };
 }
 
 /**

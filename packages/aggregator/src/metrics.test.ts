@@ -14,7 +14,7 @@ import {
  * counters reflect:
  *
  * - which events were strictly out-of-order at ingest
- * - which fell within the 1m baseline window vs past it
+ * - which fell within the 1m rolling window vs past it
  * - which fell past the configured graceWindow
  *
  * The point of the milestone-B late-data driver is to characterise
@@ -40,7 +40,7 @@ const stubLiveStats = () => live.stats();
 
 describe('recordLatenessOnIngest classification', () => {
   it('classifies in-order events as not-late (no counters bumped)', () => {
-    configureLateness({ baselineWindowMs: 60_000, graceWindowMs: 30_000 });
+    configureLateness({ rollingWindowMs: 60_000, graceWindowMs: 30_000 });
     const t = 1_700_000_000_000;
     recordLatenessOnIngest('api-1', t);
     recordLatenessOnIngest('api-1', t + 1);
@@ -51,15 +51,15 @@ describe('recordLatenessOnIngest classification', () => {
       liveStats: stubLiveStats(),
     });
     expect(m.late.eventsLateAtIngestTotal).toBe(0);
-    expect(m.late.eventsLateWithinBaselineTotal).toBe(0);
-    expect(m.late.eventsLatePastBaselineTotal).toBe(0);
+    expect(m.late.eventsLateWithinRollingWindowTotal).toBe(0);
+    expect(m.late.eventsLatePastRollingWindowTotal).toBe(0);
     expect(m.late.eventsLatePastGraceTotal).toBe(0);
     expect(m.late.highWaterTs).toBe(t + 2);
   });
 
-  it('classifies a within-baseline late event correctly', () => {
+  it('classifies a within-rolling-window late event correctly', () => {
     // High-water is t + 2 from the previous test. Push a late event
-    // 5s behind: still inside the 60s baseline + 30s grace.
+    // 5s behind: still inside the 60s rolling window + 30s grace.
     const t = 1_700_000_000_000;
     recordLatenessOnIngest('api-1', t + 2 - 5_000);
     const m = snapshot({
@@ -68,10 +68,10 @@ describe('recordLatenessOnIngest classification', () => {
       liveStats: stubLiveStats(),
     });
     expect(m.late.eventsLateAtIngestTotal).toBe(1);
-    expect(m.late.eventsLateWithinBaselineTotal).toBe(1);
-    expect(m.late.eventsLatePastBaselineTotal).toBe(0);
+    expect(m.late.eventsLateWithinRollingWindowTotal).toBe(1);
+    expect(m.late.eventsLatePastRollingWindowTotal).toBe(0);
     expect(m.late.eventsLatePastGraceTotal).toBe(0);
-    expect(m.late.lateWithinBaselineByHost).toEqual({ 'api-1': 1 });
+    expect(m.late.lateWithinRollingWindowByHost).toEqual({ 'api-1': 1 });
     // Lateness reservoir picked up the lag.
     expect(m.late.latencyBehindHighWaterMs).not.toBeNull();
     expect(m.late.latencyBehindHighWaterMs!.count).toBe(1);
@@ -80,8 +80,8 @@ describe('recordLatenessOnIngest classification', () => {
   it('classifies a past-grace late event correctly (>30s behind)', () => {
     const t = 1_700_000_000_000;
     // 45s behind highWater — past 30s grace, but still inside the
-    // 60s baseline window for the rolling. Counter increments BOTH
-    // `eventsLatePastGraceTotal` AND `eventsLateWithinBaselineTotal`
+    // 60s rolling window. Counter increments BOTH
+    // `eventsLatePastGraceTotal` AND `eventsLateWithinRollingWindowTotal`
     // (the categories are independent: grace vs window).
     recordLatenessOnIngest('api-2', t + 2 - 45_000);
     const m = snapshot({
@@ -90,28 +90,28 @@ describe('recordLatenessOnIngest classification', () => {
       liveStats: stubLiveStats(),
     });
     expect(m.late.eventsLatePastGraceTotal).toBe(1);
-    expect(m.late.eventsLateWithinBaselineTotal).toBe(2); // +1 from this test
+    expect(m.late.eventsLateWithinRollingWindowTotal).toBe(2); // +1 from this test
   });
 
-  it('classifies a past-baseline late event correctly (>60s behind)', () => {
+  it('classifies a past-rolling-window late event correctly (>60s behind)', () => {
     const t = 1_700_000_000_000;
-    // 90s behind highWater — past both grace and baseline window.
+    // 90s behind highWater — past both grace and rolling window.
     recordLatenessOnIngest('api-3', t + 2 - 90_000);
     const m = snapshot({
       liveSeriesLength: 0,
       wsClientBufferedAmounts: [],
       liveStats: stubLiveStats(),
     });
-    expect(m.late.eventsLatePastBaselineTotal).toBe(1);
+    expect(m.late.eventsLatePastRollingWindowTotal).toBe(1);
     expect(m.late.eventsLatePastGraceTotal).toBe(2); // +1 from this test
-    // `eventsLateWithinBaselineTotal` did NOT increment — past-
-    // baseline events are exclusive of the within-baseline class.
-    expect(m.late.eventsLateWithinBaselineTotal).toBe(2);
+    // `eventsLateWithinRollingWindowTotal` did NOT increment — past-
+    // baseline events are exclusive of the within-rolling-window class.
+    expect(m.late.eventsLateWithinRollingWindowTotal).toBe(2);
   });
 
-  it('per-host counter accumulates for the within-baseline class only', () => {
+  it('per-host counter accumulates for the within-rolling-window class only', () => {
     const t = 1_700_000_000_000;
-    // Three more api-3 events, all within baseline.
+    // Three more api-3 events, all within rolling window.
     for (let i = 0; i < 3; i++) {
       recordLatenessOnIngest('api-3', t + 2 - 1_000);
     }
@@ -120,10 +120,10 @@ describe('recordLatenessOnIngest classification', () => {
       wsClientBufferedAmounts: [],
       liveStats: stubLiveStats(),
     });
-    expect(m.late.lateWithinBaselineByHost['api-3']).toBe(3);
-    // The earlier past-baseline api-3 push didn't increment per-host
-    // (host-bias drift is a within-baseline phenomenon).
-    expect(m.late.lateWithinBaselineByHost['api-2']).toBe(1);
+    expect(m.late.lateWithinRollingWindowByHost['api-3']).toBe(3);
+    // The earlier past-rolling-window api-3 push didn't increment per-host
+    // (host-bias drift is a within-rolling-window phenomenon).
+    expect(m.late.lateWithinRollingWindowByHost['api-2']).toBe(1);
   });
 
   it('high-water never decreases', () => {
@@ -148,8 +148,8 @@ describe('recordLatenessOnIngest classification', () => {
     });
     expect(m.late.highWaterTs).toBe(t + 1_000_000);
     // No counter ticked — this event was MORE recent than highWater.
-    // Total: 1 within-baseline (+5s) + 1 past-grace (+45s) + 1
-    // past-baseline (+90s) + 3 within-baseline api-3 (+1s) = 6.
+    // Total: 1 within-rolling-window (+5s) + 1 past-grace (+45s) + 1
+    // past-rolling-window (+90s) + 3 within-rolling-window api-3 (+1s) = 6.
     expect(m.late.eventsLateAtIngestTotal).toBe(6);
   });
 });

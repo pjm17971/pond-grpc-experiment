@@ -106,14 +106,19 @@ let pushManyBatchSizeMax = 0;
  *
  * - **late at ingest** — `event.timeMs < highWaterTs`. Strictly out
  *   of order; under pond `'strict'` mode this would throw.
- * - **late within baseline** — late at ingest AND
- *   `event.timeMs >= highWaterTs - baselineWindowMs`. The event
- *   falls inside the rolling baseline window's logical span, so a
+ * - **late within rolling window** — late at ingest AND
+ *   `event.timeMs >= highWaterTs - rollingWindowMs`. The event
+ *   falls inside the rolling window's logical span (1m today), so a
  *   correct late-repair semantic would have to retroactively shift
  *   the rolling's `cpu_avg`/`cpu_sd` for those windows. Pond's
  *   rolling does NOT repair these (the milestone-B gap).
- * - **late past baseline** — late at ingest AND
- *   `event.timeMs < highWaterTs - baselineWindowMs`. Outside the
+ *
+ *   (Earlier drafts of this doc called this "baseline"; renamed to
+ *   "rolling window" because pond's `TimeSeries.baseline()` is a
+ *   different operator — appends rolling-stats columns — and the
+ *   overload was confusing.)
+ * - **late past rolling window** — late at ingest AND
+ *   `event.timeMs < highWaterTs - rollingWindowMs`. Outside the
  *   rolling's logical window — even a correct repair semantic would
  *   leave the rolling untouched (the event's bucket was already
  *   evicted from the window). Counts here characterise tail
@@ -129,15 +134,15 @@ let pushManyBatchSizeMax = 0;
  * on the biased host vs. uniformly across the pool). Capped to
  * `LATE_BY_HOST_MAX_KEYS` to bound memory at runtime.
  */
-let lateBaselineWindowMs = 60_000;
+let lateRollingWindowMs = 60_000;
 let lateGraceWindowMs = 30_000;
 let highWaterTs: number | null = null;
 let eventsLateAtIngestTotal = 0;
-let eventsLateWithinBaselineTotal = 0;
-let eventsLatePastBaselineTotal = 0;
+let eventsLateWithinRollingWindowTotal = 0;
+let eventsLatePastRollingWindowTotal = 0;
 let eventsLatePastGraceTotal = 0;
 const LATE_BY_HOST_MAX_KEYS = 1_000;
-const lateWithinBaselineByHost = new Map<string, number>();
+const lateWithinRollingWindowByHost = new Map<string, number>();
 let lateByHostDropped = 0;
 
 /**
@@ -221,8 +226,8 @@ export function recordIngest(host: string, timeMs: number): void {
 /**
  * Configure the late-event detection thresholds. Called once on
  * aggregator startup with the values used to construct the
- * `LiveSeries` (the rolling baseline length is fixed at 60s today
- * by `aggregate.ts`'s fused-rolling spec; if that ever becomes
+ * `LiveSeries` (the rolling-window length is fixed at 60s today by
+ * `aggregate.ts`'s fused-rolling spec; if that ever becomes
  * configurable, plumb the new value here too).
  *
  * Calling without a stop is fine — replaces the current values.
@@ -231,10 +236,10 @@ export function recordIngest(host: string, timeMs: number): void {
  * a misconfiguration shouldn't silently zero them.
  */
 export function configureLateness(opts: {
-  baselineWindowMs: number;
+  rollingWindowMs: number;
   graceWindowMs: number;
 }): void {
-  lateBaselineWindowMs = opts.baselineWindowMs;
+  lateRollingWindowMs = opts.rollingWindowMs;
   lateGraceWindowMs = opts.graceWindowMs;
 }
 
@@ -266,18 +271,18 @@ export function recordLatenessOnIngest(
   if (lagMs > lateGraceWindowMs) {
     eventsLatePastGraceTotal += 1;
   }
-  if (lagMs <= lateBaselineWindowMs) {
-    eventsLateWithinBaselineTotal += 1;
-    const prev = lateWithinBaselineByHost.get(host);
+  if (lagMs <= lateRollingWindowMs) {
+    eventsLateWithinRollingWindowTotal += 1;
+    const prev = lateWithinRollingWindowByHost.get(host);
     if (prev !== undefined) {
-      lateWithinBaselineByHost.set(host, prev + 1);
-    } else if (lateWithinBaselineByHost.size < LATE_BY_HOST_MAX_KEYS) {
-      lateWithinBaselineByHost.set(host, 1);
+      lateWithinRollingWindowByHost.set(host, prev + 1);
+    } else if (lateWithinRollingWindowByHost.size < LATE_BY_HOST_MAX_KEYS) {
+      lateWithinRollingWindowByHost.set(host, 1);
     } else {
       lateByHostDropped += 1;
     }
   } else {
-    eventsLatePastBaselineTotal += 1;
+    eventsLatePastRollingWindowTotal += 1;
   }
 }
 
@@ -370,25 +375,25 @@ export type LatenessSnapshot = {
   };
   /** Highest `timeMs` ever observed at ingest. Null before first event. */
   highWaterTs: number | null;
-  /** Configured baseline-window length used by the late-classifier (ms). */
-  baselineWindowMs: number;
+  /** Configured rolling-window length used by the late-classifier (ms). */
+  rollingWindowMs: number;
   /** Configured grace-window length used by the late-classifier (ms). */
   graceWindowMs: number;
   /** Total events whose `timeMs` was < `highWaterTs` at arrival. */
   eventsLateAtIngestTotal: number;
   /**
    * Of `eventsLateAtIngestTotal`: events whose `timeMs` falls inside
-   * the baseline window. Pond's rolling does not retroactively
-   * repair these — milestone B's payoff scenario.
+   * the rolling window's logical span. Pond's rolling does not
+   * retroactively repair these — milestone B's payoff scenario.
    */
-  eventsLateWithinBaselineTotal: number;
+  eventsLateWithinRollingWindowTotal: number;
   /**
    * Of `eventsLateAtIngestTotal`: events whose `timeMs` falls past
-   * the baseline window's start (60s back). Even a correct repair
+   * the rolling window's start (60s back). Even a correct repair
    * semantic wouldn't change the rolling for these — bucket already
    * evicted from the window's logical span.
    */
-  eventsLatePastBaselineTotal: number;
+  eventsLatePastRollingWindowTotal: number;
   /**
    * Of `eventsLateAtIngestTotal`: events whose `timeMs` falls past
    * the configured grace window. Under `'drop'`/`'reorder'` pond
@@ -402,12 +407,12 @@ export type LatenessSnapshot = {
     | { p50: number; p95: number; p99: number; count: number }
     | null;
   /**
-   * Per-host count of `lateWithinBaseline` events. Drives the
+   * Per-host count of `lateWithinRollingWindow` events. Drives the
    * host-bias drift analysis in the friction note (do biased late
    * events land on the biased host or scatter). Capped at
    * `LATE_BY_HOST_MAX_KEYS` keys.
    */
-  lateWithinBaselineByHost: Record<string, number>;
+  lateWithinRollingWindowByHost: Record<string, number>;
   /** Late events whose host couldn't be tracked (cap reached). */
   lateByHostDropped: number;
   /**
@@ -517,14 +522,14 @@ export function snapshot(args: {
     late: {
       liveStats: args.liveStats,
       highWaterTs,
-      baselineWindowMs: lateBaselineWindowMs,
+      rollingWindowMs: lateRollingWindowMs,
       graceWindowMs: lateGraceWindowMs,
       eventsLateAtIngestTotal,
-      eventsLateWithinBaselineTotal,
-      eventsLatePastBaselineTotal,
+      eventsLateWithinRollingWindowTotal,
+      eventsLatePastRollingWindowTotal,
       eventsLatePastGraceTotal,
       latencyBehindHighWaterMs: latenessMs.snapshot(),
-      lateWithinBaselineByHost: Object.fromEntries(lateWithinBaselineByHost),
+      lateWithinRollingWindowByHost: Object.fromEntries(lateWithinRollingWindowByHost),
       lateByHostDropped,
       pondInsertThrowsTotal,
     },

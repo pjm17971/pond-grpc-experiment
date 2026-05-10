@@ -103,9 +103,27 @@ if (lateInjector) {
 
 const shutdown = async (signal: string) => {
   console.log(`received ${signal}, shutting down…`);
+  // Stop the simulator FIRST so no new events enter the late-injector
+  // queue while we drain. Drain forces any held events onto the wire
+  // through the same downstream path, then `stop()` clears any
+  // residual timers (idempotent after drain). Order matters for
+  // the conservation check the drift harness reads:
+  //   producer.events_emitted_total == aggregator.pond.ingested
+  //                                  + aggregator.pondInsertThrowsTotal
+  //                                  + aggregator.pond.rejected
+  // Without the drain, events whose setTimeout hadn't fired at
+  // SIGTERM are silently dropped — the conservation check shows a
+  // few-percent drift purely from the timer queue depth.
+  stopSimulator();
+  lateInjector?.drain();
+  // Brief sleep gives the downstream gRPC writer a chance to flush
+  // the drained events to the aggregator before the gRPC server
+  // tears down. Empirically 200ms is enough at experiment loads
+  // (a few hundred drained events × ~1ms each through the writer);
+  // longer-running deployments may want to bump this.
+  await new Promise((r) => setTimeout(r, 200));
   lateInjector?.stop();
   metricsServer?.close();
-  stopSimulator();
   await server.stop();
   process.exit(0);
 };

@@ -61,11 +61,37 @@ export async function startGrpcServer(
   return {
     stop: () =>
       new Promise<void>((resolve) => {
+        // tryShutdown waits for active streams to close cleanly. With
+        // an active long-lived `subscribe()` stream from the
+        // aggregator, that wait can be **indefinite** — the
+        // aggregator's gRPC client only ends the stream when it
+        // receives a server-side stream end OR is itself stopped.
+        // Under the drift harness's "stop producer first so its
+        // shutdown can drain the late-injector while subscribers
+        // still listen" ordering, we'd deadlock here.
+        //
+        // Solution: give tryShutdown a brief grace window for the
+        // happy path (no active streams), then forceShutdown. The
+        // 500ms is empirically long enough for an aggregator that
+        // finished its measurement window to disconnect on its own
+        // and short enough that the harness doesn't hang on the
+        // pathological case.
+        let resolved = false;
+        const force = setTimeout(() => {
+          if (resolved) return;
+          server.forceShutdown();
+          resolved = true;
+          resolve();
+        }, 500);
         server.tryShutdown((err) => {
+          if (resolved) return;
+          clearTimeout(force);
           if (err) {
-            // tryShutdown failed (active streams?). Fall back to forceShutdown.
+            // tryShutdown reported an error — typically "Server is
+            // already shutdown". Fall back to forceShutdown to be safe.
             server.forceShutdown();
           }
+          resolved = true;
           resolve();
         });
       }),
