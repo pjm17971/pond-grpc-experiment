@@ -1,5 +1,6 @@
 import { HOSTS } from '@pond-experiment/shared';
 import type { Event, EventBatch } from '@pond-experiment/shared/grpc';
+import { mulberry32 } from './rng.js';
 
 /**
  * Per-host CPU baseline. Each host gets a distinct mean so the chart
@@ -29,6 +30,27 @@ export type SimulatorOptions = {
   hostCount: number;
   /** Width of the random ±range around each host's mean CPU. */
   variability: number;
+  /**
+   * Optional RNG seed for the simulator's randomised state — CPU
+   * walk noise, anomaly bursts, per-event noise, and `requests`
+   * count. When provided, the simulator uses `mulberry32(seed)`
+   * instead of `Math.random()`, so two runs at the same seed
+   * produce identical event streams.
+   *
+   * Drives milestone-B's drift-comparison harness: the late-data
+   * driver needs the A/B legs to share the **same underlying
+   * workload** (only the late-injection layer differs between
+   * legs), otherwise baseline variance absorbs uncontrolled
+   * simulator noise and the noise-floor estimate is inflated.
+   * Codex review of PR #41 caught this — pre-fix, replicate
+   * seeds only seeded the late-injector and the simulator's
+   * `Math.random()` calls drifted independently across replicates.
+   *
+   * `undefined` (the default) keeps `Math.random()` for the
+   * dashboard / dev / bench paths where reproducibility isn't a
+   * goal.
+   */
+  seed?: number;
 };
 
 /**
@@ -100,6 +122,10 @@ export function startSimulator(
 ): () => void {
   const tickMs = 1000 / opts.eventsPerSec;
   const n = opts.hostCount;
+  // Use a seeded RNG when provided (drift-harness reproducibility);
+  // otherwise pass through `Math.random` for the dashboard / bench
+  // paths where reproducibility isn't a goal.
+  const random = opts.seed !== undefined ? mulberry32(opts.seed) : Math.random;
 
   // Per-host dynamic state. `hostMeans[i]` is host i's current
   // walking baseline; `burstEndMs[i]` is the wall-clock at which the
@@ -130,7 +156,7 @@ export function startSimulator(
         // average is good enough for visual texture; the dashboard
         // doesn't care about the higher moments.
         const noise =
-          (Math.random() - 0.5 + (Math.random() - 0.5)) *
+          (random() - 0.5 + (random() - 0.5)) *
           WALK_DRIFT *
           Math.sqrt(elapsedSec);
         hostMeans[i] = Math.max(
@@ -142,7 +168,7 @@ export function startSimulator(
         // bursts.
         if (
           baseT >= burstEndMs[i] &&
-          Math.random() < BURST_PROB_PER_SEC * elapsedSec
+          random() < BURST_PROB_PER_SEC * elapsedSec
         ) {
           burstEndMs[i] = baseT + BURST_DURATION_MS;
         }
@@ -157,13 +183,13 @@ export function startSimulator(
         0,
         Math.min(
           1,
-          dynamic + burst + (Math.random() - 0.5) * opts.variability,
+          dynamic + burst + (random() - 0.5) * opts.variability,
         ),
       );
       events[i] = {
         timeMs: baseT,
         cpu,
-        requests: Math.floor(Math.random() * 200),
+        requests: Math.floor(random() * 200),
         host: hostNameAt(i),
       };
     }

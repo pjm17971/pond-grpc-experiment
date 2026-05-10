@@ -154,6 +154,17 @@ async function runLeg(
       lateEventDelayTailMs: args.lateDelayTailMs,
       lateEventHostBias: args.hostBias,
       lateEventSeed: seed,
+      // Both A/B legs of a replicate share the SAME simulator seed
+      // so the underlying workload (CPU walk noise, anomaly bursts,
+      // requests counts, per-event noise) is identical between
+      // legs. The only thing that differs is the late-injection
+      // layer. Without this, Math.random() in the simulator
+      // contributes uncontrolled variance to the noise floor — the
+      // first cut of the multi-replicate harness suffered exactly
+      // this confound (Codex review of PR #41). Replicate-level
+      // independence comes from the seed varying across replicates;
+      // within-replicate, both legs share it.
+      simulatorSeed: seed,
       metricsPort: producerMetricsPort,
     });
     aggregator = await spawnAggregator({

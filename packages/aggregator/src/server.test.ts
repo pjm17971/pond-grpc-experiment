@@ -775,6 +775,92 @@ describe('server WS protocol', () => {
   });
 });
 
+describe('aggregatePartitionOrdering propagation (server → aggregate → partitionBy)', () => {
+  // Pinned in response to the Codex review of PR #41: the unit-
+  // level partitionOrdering test in `aggregate.test.ts` pins the
+  // option at `startAggregate(...)` directly, but not the
+  // propagation from `startServer({ aggregatePartitionOrdering })`
+  // through to `partitionBy('host', { ordering, graceWindow })`.
+  // A wiring regression at the server.ts → aggregate.ts hop could
+  // slip past the unit-level test. This pins the full chain.
+
+  it('threads aggregatePartitionOrdering through to partitionBy under reorder', async () => {
+    const live = new LiveSeries({
+      name: 'metrics-reorder-server',
+      schema,
+      retention: { maxAge: '60s' },
+      ordering: 'reorder',
+      graceWindow: '30s',
+    });
+    const port = 9550 + Math.floor(Math.random() * 200);
+    const server = await startServer({
+      port,
+      host: '127.0.0.1',
+      live,
+      aggregateTickMs: 50,
+      aggregatePartitionOrdering: 'reorder',
+      aggregatePartitionGraceWindowMs: 30_000,
+    });
+    try {
+      const tBase = Date.now() - 30_000;
+      live.push([new Date(tBase), 0.4, 100, 'api-1']);
+      live.push([new Date(tBase + 5_000), 0.5, 100, 'api-1']);
+      live.push([new Date(tBase + 10_000), 0.6, 100, 'api-1']);
+      // Late push — pre-fix this would throw from inside the
+      // partition router (sub-series defaulted to 'strict'). With
+      // `aggregatePartitionOrdering: 'reorder'` plumbed through
+      // server.ts → aggregate.ts → partitionBy, this push succeeds.
+      expect(() => {
+        live.push([new Date(tBase + 7_000), 0.55, 100, 'api-1']);
+      }).not.toThrow();
+      expect(live.length).toBe(4);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('matching graceWindow at server → partition pin', async () => {
+    // Source `LiveSeries` graceWindow is 30s; partitionGraceWindowMs
+    // option is 30s. Per pond's contract per-partition grace is
+    // bounded by the source's grace, so the effective grace is
+    // min(source, partition) = 30s. Pin that an event 25s late
+    // (within both) is accepted, and an event 35s late (beyond both)
+    // throws — proves the server-side option is what's reaching
+    // pond, not silently lost in transit.
+    const live = new LiveSeries({
+      name: 'metrics-grace-pin',
+      schema,
+      retention: { maxAge: '60s' },
+      ordering: 'reorder',
+      graceWindow: '30s',
+    });
+    const port = 9750 + Math.floor(Math.random() * 200);
+    const server = await startServer({
+      port,
+      host: '127.0.0.1',
+      live,
+      aggregateTickMs: 50,
+      aggregatePartitionOrdering: 'reorder',
+      aggregatePartitionGraceWindowMs: 30_000,
+    });
+    try {
+      const tBase = Date.now() - 60_000;
+      live.push([new Date(tBase), 0.5, 100, 'api-1']);
+      live.push([new Date(tBase + 40_000), 0.6, 100, 'api-1']);
+      // 25s late from highWater (tBase + 40s − 25s = tBase + 15s).
+      expect(() => {
+        live.push([new Date(tBase + 15_000), 0.55, 100, 'api-1']);
+      }).not.toThrow();
+      // 35s late — past 30s grace. Throws under reorder.
+      expect(() => {
+        live.push([new Date(tBase + 5_000), 0.4, 100, 'api-1']);
+      }).toThrow(/grace/i);
+    } finally {
+      await server.stop();
+    }
+  });
+});
+
 describe('/live-agg WS (M3.5 aggregate stream)', () => {
   let live: LiveSeries<typeof schema>;
   let server: RunningServer;

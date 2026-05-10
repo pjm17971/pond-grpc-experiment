@@ -27,6 +27,7 @@
  */
 
 import type { Event, EventBatch } from '@pond-experiment/shared/grpc';
+import { mulberry32 } from './rng.js';
 
 export type LateInjectorOptions = {
   /** 0..1 — base probability that any given event is held as late. */
@@ -67,24 +68,6 @@ export type LateInjectorMetrics = {
   /** Reservoir size — useful for sanity-checking the percentiles. */
   lateness_samples_count: number;
 };
-
-/**
- * Mulberry32 — a small, fast, decent-quality 32-bit RNG. Produces
- * `[0, 1)` uniformly. Seedable + deterministic, which is what the
- * brief requires for reproducible runs.
- *
- * Reference: https://stackoverflow.com/a/47593316
- */
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return (): number => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
 
 /**
  * Sample one delay from a log-normal distribution parameterised by

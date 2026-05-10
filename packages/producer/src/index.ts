@@ -9,6 +9,32 @@ const METRICS_PORT = Number(process.env.METRICS_PORT ?? '50052');
 const EVENTS_PER_SEC = Number(process.env.EVENTS_PER_SEC ?? '2');
 const HOST_COUNT = Number(process.env.HOST_COUNT ?? '4');
 const VARIABILITY = Number(process.env.VARIABILITY ?? '0.4');
+/**
+ * Optional seed for the simulator's CPU/burst/requests randomness.
+ * Default unset → `Math.random()` (the dashboard / bench / dev
+ * paths). Drift-comparison harness sets this to make A/B legs
+ * reproducible at the underlying-workload level so the noise floor
+ * isn't inflated by uncontrolled `Math.random()` variance — Codex
+ * review of PR #41.
+ */
+const SIMULATOR_SEED = process.env.SIMULATOR_SEED
+  ? Number(process.env.SIMULATOR_SEED)
+  : undefined;
+
+/**
+ * Wall-clock ms to sleep between `lateInjector.drain()` and
+ * `server.stop()` on shutdown so the gRPC writer has time to flush
+ * the drained late events to the active subscribe streams. Pond's
+ * gRPC writes via `call.write(...)` are not backpressure-awaited,
+ * so on slower machines or under larger drain queues the default
+ * 500ms may not be enough; bump via env if the drift harness's
+ * conservation check shows >0.5% drift. Codex review of PR #41
+ * caught the trade-off (drain isn't fully synchronous to the
+ * wire); documented here rather than implementing a backpressure-
+ * aware drain because the M4 bench's drain is small enough
+ * (≤200 events at 60s × 4 hosts × 10% late) that 500ms is ample.
+ */
+const DRAIN_FLUSH_MS = Number(process.env.DRAIN_FLUSH_MS ?? '500');
 
 /**
  * Late-event injection — the milestone-B driver work. Default
@@ -55,6 +81,7 @@ const stopSimulator = startSimulator(
     eventsPerSec: EVENTS_PER_SEC,
     hostCount: HOST_COUNT,
     variability: VARIABILITY,
+    seed: SIMULATOR_SEED,
   },
   lateInjector ? lateInjector.wrappedOnBatch : broadcast,
 );
@@ -118,10 +145,11 @@ const shutdown = async (signal: string) => {
   lateInjector?.drain();
   // Brief sleep gives the downstream gRPC writer a chance to flush
   // the drained events to the aggregator before the gRPC server
-  // tears down. Empirically 200ms is enough at experiment loads
-  // (a few hundred drained events × ~1ms each through the writer);
-  // longer-running deployments may want to bump this.
-  await new Promise((r) => setTimeout(r, 200));
+  // tears down. `call.write` is fire-and-forget (not backpressure-
+  // awaited), so this sleep is a heuristic; bump `DRAIN_FLUSH_MS`
+  // env if the drift harness's conservation check shows >0.5% drift
+  // on a slower machine or under larger drain queues.
+  await new Promise((r) => setTimeout(r, DRAIN_FLUSH_MS));
   lateInjector?.stop();
   metricsServer?.close();
   await server.stop();

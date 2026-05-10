@@ -133,6 +133,20 @@ let pushManyBatchSizeMax = 0;
  * workload analysis (do biased late events show up disproportionately
  * on the biased host vs. uniformly across the pool). Capped to
  * `LATE_BY_HOST_MAX_KEYS` to bound memory at runtime.
+ *
+ * **Experiment-only by design.** The per-host map is **first-N-wins
+ * forever** — once `LATE_BY_HOST_MAX_KEYS` distinct hosts are seen,
+ * subsequent new hosts are dropped (counted in `lateByHostDropped`).
+ * Departed hosts continue to occupy slots even if they stop
+ * producing events. For the M4 drift bench (a small, stable host
+ * set across a short measurement window) this is fine — the bench
+ * runs ~60s with hosts fixed at process start. For a long-running
+ * deployment with host churn (rotating instances, autoscale), the
+ * by-host distribution would become stale within hours; the
+ * counter is **not** intended for production-ops use. Codex review
+ * of PR #41 flagged this; documented here rather than retrofitted
+ * to LRU because the M4 bench scope is short-lived enough that
+ * eviction churn would itself distort the host-bias signal.
  */
 let lateRollingWindowMs = 60_000;
 let lateGraceWindowMs = 30_000;

@@ -158,6 +158,14 @@ export type ProducerOptions = {
   lateEventSeed?: number;
   /** Producer's HTTP /metrics port (only listens when injection is on). */
   metricsPort?: number;
+  /**
+   * Optional seed for the simulator's CPU/burst/requests randomness.
+   * When set, both A/B legs of the drift harness see the same
+   * underlying simulated workload — only the late-injection layer
+   * differs. Without it, Math.random() variance inflates the
+   * noise-floor estimate. Codex review of PR #41 caught this gap.
+   */
+  simulatorSeed?: number;
 };
 
 export async function spawnProducer(
@@ -186,6 +194,9 @@ export async function spawnProducer(
   }
   if (opts.metricsPort !== undefined) {
     env.METRICS_PORT = String(opts.metricsPort);
+  }
+  if (opts.simulatorSeed !== undefined) {
+    env.SIMULATOR_SEED = String(opts.simulatorSeed);
   }
   const { child, pid } = await spawnReady({
     cwd: resolvePath(repoRoot, 'packages/producer'),
