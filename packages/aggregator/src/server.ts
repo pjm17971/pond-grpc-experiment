@@ -333,28 +333,12 @@ export type ServerOptions = {
    * `live.partitionBy(...).sample({ stride })` (pond 0.17.0).
    */
   aggregateSampleStride?: number;
-  /**
-   * Per-partition ordering mode for the fused rolling's
-   * `partitionBy('host', { ordering })` call. Defaults to
-   * `'strict'`; pass `'reorder'` (with `aggregatePartitionGraceWindow
-   * Ms`) when the source `LiveSeries` is also `'reorder'` so late
-   * events flow through to the fused rolling without throwing in
-   * the partition router. See `aggregate.ts → AggregateOptions.
-   * partitionOrdering` for the full rationale.
-   *
-   * Removal-on-library-fix: when pond ships partition-ordering
-   * inheritance (per the M4 friction note's recommendation), this
-   * option drops out of the wire and `index.ts` reverts to the
-   * single-knob ORDERING env var.
-   */
-  aggregatePartitionOrdering?: 'strict' | 'reorder' | 'drop';
-  /**
-   * Per-partition graceWindow (ms). Only valid with
-   * `aggregatePartitionOrdering === 'reorder'`. Same removal-
-   * on-library-fix lifecycle as `aggregatePartitionOrdering`.
-   */
-  aggregatePartitionGraceWindowMs?: number;
 };
+
+// `aggregatePartitionOrdering` / `aggregatePartitionGraceWindowMs`
+// were temporary options here in 0.17.0 — see the matching note in
+// `aggregate.ts` and the M4 friction note. Pond 0.17.1 ships
+// partition-ordering inheritance from source, so both are gone.
 
 export type RunningServer = {
   stop: () => Promise<void>;
@@ -466,8 +450,6 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     {
       tickMs: opts.aggregateTickMs,
       sampleStride: opts.aggregateSampleStride,
-      partitionOrdering: opts.aggregatePartitionOrdering,
-      partitionGraceWindowMs: opts.aggregatePartitionGraceWindowMs,
     },
   );
 

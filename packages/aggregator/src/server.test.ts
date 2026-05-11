@@ -775,16 +775,17 @@ describe('server WS protocol', () => {
   });
 });
 
-describe('aggregatePartitionOrdering propagation (server → aggregate → partitionBy)', () => {
-  // Pinned in response to the Codex review of PR #41: the unit-
-  // level partitionOrdering test in `aggregate.test.ts` pins the
-  // option at `startAggregate(...)` directly, but not the
-  // propagation from `startServer({ aggregatePartitionOrdering })`
-  // through to `partitionBy('host', { ordering, graceWindow })`.
-  // A wiring regression at the server.ts → aggregate.ts hop could
-  // slip past the unit-level test. This pins the full chain.
+describe('partition-ordering inheritance through startServer (pond 0.17.1)', () => {
+  // Pre-0.17.1 the aggregator passed `aggregatePartitionOrdering` +
+  // `aggregatePartitionGraceWindowMs` through `startServer({...})`
+  // to thread the source `LiveSeries`'s ordering down to the per-
+  // partition sub-series. Pond 0.17.1 default-inherits these from
+  // the source, so the options are gone — but the integration
+  // behaviour the tests pinned (late events flow end-to-end + grace
+  // is honoured) still matters. These tests now verify what the
+  // library's inheritance gives us through a bare `startServer({...})`.
 
-  it('threads aggregatePartitionOrdering through to partitionBy under reorder', async () => {
+  it('late events flow through partitions under a reorder source', async () => {
     const live = new LiveSeries({
       name: 'metrics-reorder-server',
       schema,
@@ -798,18 +799,16 @@ describe('aggregatePartitionOrdering propagation (server → aggregate → parti
       host: '127.0.0.1',
       live,
       aggregateTickMs: 50,
-      aggregatePartitionOrdering: 'reorder',
-      aggregatePartitionGraceWindowMs: 30_000,
     });
     try {
       const tBase = Date.now() - 30_000;
       live.push([new Date(tBase), 0.4, 100, 'api-1']);
       live.push([new Date(tBase + 5_000), 0.5, 100, 'api-1']);
       live.push([new Date(tBase + 10_000), 0.6, 100, 'api-1']);
-      // Late push — pre-fix this would throw from inside the
-      // partition router (sub-series defaulted to 'strict'). With
-      // `aggregatePartitionOrdering: 'reorder'` plumbed through
-      // server.ts → aggregate.ts → partitionBy, this push succeeds.
+      // Late push — pond 0.17.1's inheritance means the partition
+      // sub-series picks up the source's `'reorder'` + 30s grace,
+      // so this push succeeds. Pre-0.17.1 + bare `partitionBy`
+      // would have crashed here.
       expect(() => {
         live.push([new Date(tBase + 7_000), 0.55, 100, 'api-1']);
       }).not.toThrow();
@@ -819,14 +818,11 @@ describe('aggregatePartitionOrdering propagation (server → aggregate → parti
     }
   });
 
-  it('matching graceWindow at server → partition pin', async () => {
-    // Source `LiveSeries` graceWindow is 30s; partitionGraceWindowMs
-    // option is 30s. Per pond's contract per-partition grace is
-    // bounded by the source's grace, so the effective grace is
-    // min(source, partition) = 30s. Pin that an event 25s late
-    // (within both) is accepted, and an event 35s late (beyond both)
-    // throws — proves the server-side option is what's reaching
-    // pond, not silently lost in transit.
+  it('grace window from the source is honoured at the partition layer', async () => {
+    // Source `LiveSeries` graceWindow is 30s; pond 0.17.1 inherits
+    // that down to the partition sub-series. Pin that an event 25s
+    // late (within grace) is accepted and 35s late (beyond grace)
+    // throws — proves the inheritance reaches pond's grace check.
     const live = new LiveSeries({
       name: 'metrics-grace-pin',
       schema,
@@ -840,8 +836,6 @@ describe('aggregatePartitionOrdering propagation (server → aggregate → parti
       host: '127.0.0.1',
       live,
       aggregateTickMs: 50,
-      aggregatePartitionOrdering: 'reorder',
-      aggregatePartitionGraceWindowMs: 30_000,
     });
     try {
       const tBase = Date.now() - 60_000;

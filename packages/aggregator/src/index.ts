@@ -121,16 +121,15 @@ const server = await startServer({
   // wiring and the `index.ts` comment block above for why this
   // moved out of `startIngest`.
   aggregateSampleStride: SAMPLE_STRIDE,
-  // Match the source `LiveSeries`'s ordering on the per-partition
-  // sub-series. Required under `'reorder'` — pond's `partitionBy`
-  // defaults to `'strict'`, which would crash the partition router
-  // on a late event the source already accepted. Surfaced by the
-  // milestone-B drift harness; see friction-notes/M3.5.md (or
-  // wherever the M4 note ends up landing).
-  aggregatePartitionOrdering: ORDERING,
-  aggregatePartitionGraceWindowMs:
-    ORDERING === 'reorder' ? GRACE_WINDOW_MS : undefined,
 });
+
+// (Pre-0.17.1 the aggregator passed `aggregatePartitionOrdering`
+// + `aggregatePartitionGraceWindowMs` through to `startServer` so
+// the per-partition sub-series matched the source's `'reorder'`
+// mode — pond's `partitionBy` defaulted partitions to `'strict'`
+// regardless of source. Pond 0.17.1 default-inherits ordering /
+// graceWindow / retention from the source, so the workaround is
+// dead. See `friction-notes/M4.md`.)
 
 console.log(
   `aggregator listening on :${PORT} (producer=${PRODUCER_URL}, sampleStride=${SAMPLE_STRIDE}, ordering=${ORDERING}${ORDERING === 'reorder' ? `, graceWindow=${GRACE_WINDOW_MS}ms` : ''})`,
