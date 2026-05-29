@@ -4,7 +4,12 @@ import type { RowForSchema } from 'pond-ts/types';
 import { type LiveSeries } from 'pond-ts';
 import { backoff, type Schema } from '@pond-experiment/shared';
 import { ProducerClient, SubscribeRequest } from '@pond-experiment/shared/grpc';
-import { recordIngest, recordPushMany } from './metrics.js';
+import {
+  recordIngest,
+  recordLatenessOnIngest,
+  recordPondInsertThrow,
+  recordPushMany,
+} from './metrics.js';
 
 type IngestRow = RowForSchema<Schema>;
 
@@ -13,6 +18,31 @@ export type IngestOptions = {
   producerUrl: string;
   /** Optional override; defaults to insecure (M2 is plaintext, TLS is M6). */
   channelCredentials?: ChannelCredentials;
+  /**
+   * Push strategy for handling pond's `#insert` throws. Drives the
+   * per-row recovery the milestone-B late-data driver needs:
+   *
+   * - `'bulk'` (default) — call `live.pushMany(rows)` once per gRPC
+   *   frame. Hot path under default `LATE_EVENT_FRACTION=0` and
+   *   `ORDERING=strict`, where no event ever throws and per-row
+   *   overhead would be wasted. If a throw does happen mid-batch,
+   *   the rest of the batch is lost (pond's `pushMany` is non-atomic
+   *   but doesn't expose a "stopped at row N" signal). The aggregator
+   *   stops the stream — same as today's pre-late-data behavior.
+   * - `'per-row'` — call `live.push(row)` per event in the batch,
+   *   wrapping each in try/catch. Each row is independent: a past-
+   *   grace event under `'reorder'` (or any out-of-order under
+   *   `'strict'`) throws, gets counted via `recordPondInsertThrow`,
+   *   and the loop continues with the next row. Use this whenever
+   *   the late-event driver is on (`LATE_EVENT_FRACTION>0` upstream)
+   *   so a single past-grace tail event doesn't take down the
+   *   on-time events behind it.
+   *
+   * The aggregator's `index.ts` selects `'per-row'` when `ORDERING`
+   * is `'reorder'` or `'drop'` (both modes where throws are expected
+   * by design); otherwise `'bulk'`.
+   */
+  pushStrategy?: 'bulk' | 'per-row';
 };
 
 /**
@@ -54,6 +84,7 @@ export function startIngest(
 ): () => void {
   const creds = opts.channelCredentials ?? credentials.createInsecure();
   const client = new ProducerClient(opts.producerUrl, creds);
+  const pushStrategy = opts.pushStrategy ?? 'bulk';
 
   let cancelled = false;
   let attempt = 0;
@@ -82,6 +113,12 @@ export function startIngest(
       for (let i = 0; i < events.length; i++) {
         const event = events[i];
         recordIngest(event.host, event.timeMs);
+        // Late-event correctness instrumentation. Cheap O(1) per
+        // event; the high-water bookkeeping inside is what drives
+        // the milestone-B late-data driver's friction-note counters.
+        // No-op (the highWater becomes the first event) when the
+        // producer never emits late events (`LATE_EVENT_FRACTION=0`).
+        recordLatenessOnIngest(event.host, event.timeMs);
         rows[i] = [
           new Date(event.timeMs),
           event.cpu,
@@ -91,7 +128,31 @@ export function startIngest(
       }
       if (rows.length > 0) {
         const t0 = performance.now();
-        live.pushMany(rows);
+        // Push strategy switches per-row vs bulk based on whether
+        // the aggregator's pond mode allows throws. Under default
+        // `'strict'` + `LATE_EVENT_FRACTION=0`, the bulk path is
+        // safe and faster; under `'reorder'`/`'drop'` we go per-row
+        // so a single throw doesn't strand the rest of the batch.
+        // See the IngestOptions.pushStrategy doc for the rationale.
+        if (pushStrategy === 'per-row') {
+          for (const row of rows) {
+            try {
+              live.push(row);
+            } catch (err) {
+              recordPondInsertThrow();
+              if (process.env.LATE_DEBUG === '1') {
+                // One-off debug aid — print the first few rejected
+                // throws so we know what pond rejected and why.
+                // Off by default; set LATE_DEBUG=1 to enable.
+                console.warn(
+                  `pond rejected push: ${(err as Error).message}`,
+                );
+              }
+            }
+          }
+        } else {
+          live.pushMany(rows);
+        }
         const totalMs = performance.now() - t0;
         recordPushMany(rows.length, totalMs);
       }

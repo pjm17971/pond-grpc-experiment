@@ -110,6 +110,16 @@ export type AggregateOptions = {
   sampleStride?: number;
 };
 
+// `partitionOrdering` / `partitionGraceWindowMs` were temporary
+// options here in 0.17.0 — workaround for pond's `partitionBy`
+// defaulting per-partition sub-series to `'strict'` regardless of
+// the source `LiveSeries`'s ordering. The M4 friction note
+// recommended pond default-inherit ordering / graceWindow /
+// retention from the source; pond 0.17.1 shipped exactly that
+// (the "option A" path). Both options removed in the 0.17.1 bump
+// — `partitionBy('host')` now inherits the source's mode
+// automatically. See `friction-notes/M4.md`.
+
 const DEFAULT_HISTORY_MAX_AGE_MS = 5 * 60 * 1000;
 
 /**
@@ -201,6 +211,13 @@ export function startAggregate(
   // thinned stream. `stride === 1` is the no-op pass-through —
   // skip the call so the hot path stays identical to pre-0.17 for
   // the unsampled deployment.
+  // Pond 0.17.1 default-inherits ordering / graceWindow / retention
+  // from the source `LiveSeries`, so a bare `partitionBy('host')`
+  // is the right shape under any source mode. Pre-0.17.1 the
+  // aggregator had to pass `{ ordering: 'reorder', graceWindow }`
+  // explicitly under `'reorder'` mode or late events would crash
+  // the partition router; that workaround is gone now. See the
+  // M4 friction note.
   const partitioned = live.partitionBy('host');
   const sampled =
     sampleStride > 1

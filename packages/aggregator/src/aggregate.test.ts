@@ -478,8 +478,8 @@ describe('startAggregate', () => {
       schema,
       retention: { maxAge: '6m' },
     });
-    const framesU: string[] = [];
-    const framesS: string[] = [];
+    const framesU: AggregateAppendMsg[] = [];
+    const framesS: AggregateAppendMsg[] = [];
     const { stop: stopU } = startAggregate(
       liveUnsampled,
       (f) => framesU.push(f),
@@ -591,7 +591,7 @@ describe('startAggregate', () => {
       schema,
       retention: { maxAge: '6m' },
     });
-    const frames: string[] = [];
+    const frames: AggregateAppendMsg[] = [];
     const { stop } = startAggregate(live, (f) => frames.push(f), {
       tickMs: 50,
       sampleStride: 2,
@@ -629,6 +629,63 @@ describe('startAggregate', () => {
       const ratio = lastA!.cpu_n / lastB!.cpu_n;
       expect(ratio).toBeGreaterThan(0.7);
       expect(ratio).toBeLessThan(1.4);
+    } finally {
+      stop();
+    }
+  });
+
+  it('partition-ordering inheritance: late events flow through partitions under reorder source (pond 0.17.1)', async () => {
+    // Pre-0.17.1 the aggregator passed `partitionOrdering: 'reorder'`
+    // + `partitionGraceWindowMs` explicitly into `startAggregate` to
+    // work around pond's `partitionBy` defaulting per-partition sub-
+    // series to `'strict'`. Pond 0.17.1 default-inherits ordering /
+    // graceWindow / retention from the source `LiveSeries`, so this
+    // test now pins what the LIBRARY guarantees — bare
+    // `startAggregate(live)` with a `'reorder'` source means late
+    // events flow through partitions without throwing.
+    //
+    // Scope of the assertion: push() must not throw, AND the late
+    // event must land in the source's buffer. Whether the fused
+    // rolling INCLUDES the late event in subsequent emits is the
+    // milestone-B rolling-no-repair gap — out of scope here, and
+    // observed during the harness run. Asserting cpu_n=4 would
+    // conflate the propagation fix with the repair capability.
+    const live = new LiveSeries({
+      name: 'metrics-reorder',
+      schema,
+      retention: { maxAge: '60s' },
+      ordering: 'reorder',
+      graceWindow: '30s',
+    });
+    const frames: AggregateAppendMsg[] = [];
+    const { stop } = startAggregate(live, (f) => frames.push(f), {
+      tickMs: 50,
+      // No partition-ordering / graceWindow args — relying on pond
+      // 0.17.1's inheritance from the source.
+    });
+    try {
+      const tBase = Date.now() - 30_000;
+      live.push([new Date(tBase), 0.4, 100, 'api-1']);
+      live.push([new Date(tBase + 5_000), 0.5, 100, 'api-1']);
+      live.push([new Date(tBase + 10_000), 0.6, 100, 'api-1']);
+      // Headline assertion: pond 0.17.1's inheritance kicks in and
+      // this late push does NOT throw. Pre-0.17.1, bare
+      // `partitionBy('host')` here would have crashed the partition
+      // router.
+      expect(() => {
+        live.push([new Date(tBase + 7_000), 0.55, 100, 'api-1']);
+      }).not.toThrow();
+
+      expect(live.length).toBe(4);
+
+      // Wait for tick + microtask drain so at least one fused frame
+      // emits — pinned to confirm the pipeline survives after the
+      // late event (no orphaned listeners, no stuck microtask).
+      await new Promise((res) => setTimeout(res, 200));
+      const apiRows = frames
+        .flatMap((f) => f.rows)
+        .filter((r) => r.host === 'api-1');
+      expect(apiRows.length).toBeGreaterThan(0);
     } finally {
       stop();
     }

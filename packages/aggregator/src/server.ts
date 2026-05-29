@@ -335,6 +335,11 @@ export type ServerOptions = {
   aggregateSampleStride?: number;
 };
 
+// `aggregatePartitionOrdering` / `aggregatePartitionGraceWindowMs`
+// were temporary options here in 0.17.0 — see the matching note in
+// `aggregate.ts` and the M4 friction note. Pond 0.17.1 ships
+// partition-ordering inheritance from source, so both are gone.
+
 export type RunningServer = {
   stop: () => Promise<void>;
 };
@@ -370,6 +375,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     return metricsSnapshot({
       liveSeriesLength: opts.live.length,
       wsClientBufferedAmounts: bufferedAmount,
+      liveStats: opts.live.stats(),
     });
   });
 
