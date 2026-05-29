@@ -267,20 +267,63 @@ work is pending.
 
 ### Phase A status
 
-**Status:** Pending (queued 2026-05-28).
-**Owner:** gRPC experiment agent (Claude).
-**Next action:** Run `pnpm perf`, capture V5 numbers, append V5
-section to `M3.5.md`.
+**Status:** ✅ Complete (2026-05-29). V5 bench + profile + regression
+bisect captured in [`M3.5.md`](./M3.5.md). Recommendation was "Step 7
+first" (GC the dominant cost line at 22%).
 
 ### Phase B status
 
-**Status:** Not started. Awaits Phase A signal.
-**Step 7 vs Step 3C ordering:** TBD by V5 profile.
+**Status:** Step 7 attempted and **WALKED BACK** (2026-05-29) after
+measurement falsified the thesis. Step 3 Phase C not started.
+
+**Step 7 (LiveSeries columnar ring buffer) — NO-GO.** The
+storage-strategy refactor that preceded it earned its keep (shipped
+as pond-ts PR #168) and stays; the ring backing itself did not.
+
+Bench (pond-ts side, `scripts/perf-live-series.mjs`):
+
+| metric | ring | Event[] | result |
+| --- | --- | --- | --- |
+| ingest (pushMany 300k, 50k window) | 630 ms | 67 ms | ring **9.4× slower** |
+| heap retained (200k window, isolated) | 36.2 MB | 27.9 MB | ring uses **more** |
+
+**Why the ring can't win here — the durable finding.** The gRPC
+hot path *needs* `Event` objects: the rolling pipeline subscribes
+to `'event'`, so `LiveSeries` materializes an Event per row
+**regardless of backing**. The ring then *decomposes* that Event
+back into typed-array columns — strictly more work than the array
+backing (create + decompose vs create + store-reference) — and its
+only theoretical payoff (not retaining the events) didn't even show
+as a heap win. **A columnar *buffer* doesn't avoid the allocation
+when the consumer needs events.** Only a columnar *rolling reducer*
+that consumes columns instead of `Event`s (pond-ts Step 3 Phase C)
+would actually cut the V5 GC pressure. That reframes the V5
+recommendation: "Step 7 first" was wrong; the GC line is driven by
+the rolling pipeline's event consumption, not by buffer storage.
+
+**What landed / what was reverted on pond-ts:**
+
+- Kept: PR #168 — `LiveStorage<S>` strategy layer +
+  `EventArrayLiveStorage` (behavior-preserving extraction).
+- Reverted: PR #169 reverts #167's `_appendRowTrusted` substrate
+  method (the ring prerequisite, now dead).
+- Abandoned (recoverable record, not merged): branch
+  `feat/step-7-ring-storage` holds the full `RingLiveStorage`
+  attempt + bench.
+
+**Step 3 Phase C (columnar rolling reducer)** is the *real* lever
+for the V5 GC pressure, but it's a much larger change (per-reducer
+columnar state machines) and earns its slot only if a future
+workload pushes near ceiling. Production target is 100k/s; V5 hits
+~210k/s. Deferred until friction earns it.
 
 ### Phase C status
 
-**Status:** Not started. Awaits Phase B PR(s) merged into pond-ts
-main and a new pond-ts version published.
+**Status:** N/A — no Phase B library work shipped to re-adopt. The
+wave's measurable conclusion: the substrate had already delivered
+its free wins (lazy events, fused rolling) by v0.17.1; the next
+real lever (columnar rolling) doesn't earn its cost at current
+production headroom.
 
 ## Cross-references
 
