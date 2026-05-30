@@ -552,3 +552,179 @@ Two follow-ups to surface back:
 The §A before-number numbers (`columnNativeOutput` counters,
 fanout phase p99s) are the canonical AFTER-target for the spike.
 
+
+---
+
+## Appendix — V7 on `feat/columnar-partition-routing` (2026-05-30, late)
+
+**Trigger.** Library agent built Phase 2 (column-native partition routing)
+on the WIP branch `feat/columnar-partition-routing`. Built locally,
+linked into the aggregator via `pnpm.overrides` →
+`file:/Users/peter.murphy/Code/pond/packages/core`. Same OOM cell as V6:
+100 hosts × 700 eps × 90s retention, strict, time-keyed, snapshot at +75s.
+
+**Verdict up front: REGRESS, not win.** Confirms the library agent's
+hypothesis that thin scatter at this partition count creates tiny chunks
+whose object overhead dwarfs the `Event` objects they replace. Per-partition
+chunk coalescing is the right next step before this approach is viable.
+
+### Headline: Events eliminated, but chunk-object count explodes 23.5×
+
+The Phase 2 routing is doing what it advertises — `partitionBy('host')` no
+longer retains per-partition `Event[]`. But the granularity at which scatter
+operates produces ~1-row chunks on this consumer's workload (100 hosts × 100
+events/batch = ~1 event/host/batch), and each ~1-row chunk carries a full
+`ColumnarStore` + column wrapper + ArrayBuffer entourage that costs more
+than the Event it replaced.
+
+| metric | V6 (0.18.0 released) | V7 (branch) | delta |
+| --- | --- | --- | --- |
+| **Win column** | | | |
+| `Event` count retained | 6,766,580 | **9,005** | **-99.87%** |
+| `Time` count retained | 6,729,450 | **183** | **-100%** |
+| Event + Time self-size | 514.8 MB | 359 KB | **-100%** |
+| **Regress column** | | | |
+| `ColumnarStore` count | 67,287 | **1,582,771** | **+23.5×** |
+| `Float64Column` count | 134,574 | **3,165,542** | **+23.5×** |
+| `StringColumn` count | 67,287 | **1,582,771** | **+23.5×** |
+| `TimeKeyColumn` count | 67,287 | **1,582,771** | **+23.5×** |
+| `ArrayBuffer` count | 201,932 | **4,748,384** | **+23.5×** |
+| `Float64Array` count | 201,881 | **4,748,333** | **+23.5×** |
+| ColumnarStore + cols + buffers self-size | ~210 MB | **~1.74 GB** | **+8.3×** |
+
+The 23.5× multiplier on every chunk-object class matches the
+`pushMany.calls × partitions_touched` math exactly:
+
+```
+V7 pushMany.calls         = 15,695
+V7 partitions per batch   = 100 (each tick produces 1 event per host
+                                 across all 100 hosts)
+V7 scatter chunks         = 15,695 × 100 = 1,569,500 expected
+V7 actual ColumnarStore   = 1,582,771    ← matches within startup noise
+```
+
+Each source pushMany of 100 events scatters into 100 per-partition chunks
+of 1 row each. The library agent's "tiny-chunk smoking gun" prediction
+lands cleanly.
+
+### Net per-event cost — 4.1× WORSE on V7
+
+Comparing per-event memory footprint (the right normalisation since V7's
+sustained throughput is lower, so total retention isn't apples-to-apples):
+
+| metric | V6 | V7 | delta |
+| --- | --- | --- | --- |
+| events ingested | 6,731,800 | 1,569,500 | -77% (throughput drop) |
+| total node self-size | 2.22 GB | 2.15 GB | -3% |
+| **bytes/event retained** | **~332 B** | **~1370 B** | **+4.1×** |
+
+V7 ingested 4.3× fewer events in roughly the same time and ended up holding
+nearly the same retained heap — meaning each event costs ~4× more memory to
+retain on V7 than on V6.
+
+### Throughput collapse
+
+The scatter overhead is so expensive per pushMany that the gRPC wire
+backpressures and the producer can't deliver at firehose:
+
+| metric | V6 | V7 | delta |
+| --- | --- | --- | --- |
+| Events ingested in ~85s run | 6,731,800 | 1,569,500 | **-77%** |
+| Sustained rate | ~41k/s | **~12k/s** | **-71%** |
+| `pushManyTotalMs` p50 | 0.42 ms | **9.87 ms** | **+23×** |
+| `pushManyTotalMs` p99 | 3.60 ms | **17.84 ms** | **+5×** |
+| `ingest→fanout` p99 | 24 ms | 24 ms | unchanged |
+| minor GC count | 1,699 | 819 | -52% (less work to do) |
+| minor GC max pause | 11.3 ms | 12.0 ms | +6% (noise) |
+| major GC count | 8 | 6 | -25% |
+| major GC max pause | 815 ms | 535 ms | -34% |
+
+The library agent's predicted "~30% ingest improvement" doesn't surface —
+because scatter's per-batch cost (creating 100 ColumnarStore + 300 column
+wrappers + 300 ArrayBuffers per pushMany) is dominating the ingest path.
+
+Don't be misled by the lower GC counts — those are an artefact of lower
+throughput, not a real win.
+
+### Chunk size sanity check
+
+V7's `ColumnarStore` count (1,582,771) is **higher than the event count**
+(1,569,500). That suggests every event lives in its own chunk on the
+partition sub-series side, plus a few thousand source-side fat chunks of
+~100 events each:
+
+```
+V7 source chunks (fat, ~100 events each):  ~15,695 × 100 events = 1,569,500
+V7 partition chunks (thin, 1 event each):  ~1,569,500 × 1 event = 1,569,500
+V7 expected total chunks:                  ~1,585,195
+V7 observed ColumnarStore:                  1,582,771   ← matches
+```
+
+Each partition chunk is a single-row `ColumnarStore` with three populated
+columns (time, cpu, requests) and one dictionary-encoded column (host).
+The wrappers cost ~84 B + 76 B + 61 B + 53 B per chunk just in chunk-object
+headers — before the ArrayBuffer backing (which is small at 1 row but still
+allocates a JS-side wrapper + bytes).
+
+### Per-partition deque depth at V7
+
+At ~12k/s sustained × 90s retention = ~1.08M events expected in partition
+deques. Observed: 1.57M ColumnarStore. The extra ~500k chunks suggest
+retention is operating, but the dead-chunk overhead lingers longer than
+the data does.
+
+### §A before-number counters — unchanged shape
+
+```
+fanoutBatchFires:           15,695    (V6: 67,318; lower because lower throughput)
+fanoutEventsTouched:    1,569,500    (V6: 6,731,800)
+fanoutRowsAllocated:    1,569,500    (V6: 6,731,800)
+aggregateBatchEventsTouched: 1,569,500
+```
+
+Per-second rates at V7 (127s × 1.57M events): ~12,358 batch events touched
+per second, ~12,358 row-objects allocated per second. About 7× lower than
+V6's listener-boundary allocation pressure, but that's purely a consequence
+of the throughput collapse — not a structural improvement.
+
+### Ping for the library agent
+
+**Verdict: not yet a win — chunk coalescing is the next lever.** The Event
+elimination (-99.87%) is structurally correct and proves the routing layer
+works. But the 23.5× multiplier on chunk-objects, layered onto the same
+per-chunk overhead, more than offsets the Event/Time savings — net per-event
+heap is **4.1× worse**.
+
+Recommendation: hold the merge. The two viable directions:
+
+1. **Per-partition chunk coalescing.** Accumulate scattered single-row
+   slices until a partition has accumulated `MIN_CHUNK_ROWS` events (e.g.
+   64–256), then materialise one `ColumnarStore` for the run. Trades a small
+   bounded latency (events sit in a per-partition staging buffer until the
+   threshold or a flush timer fires) for chunk-object count reduction of
+   N× where N is the threshold. At threshold=64, V7's 1.58M ColumnarStore
+   collapses to ~25k — comparable to V6's source-side chunk count.
+
+2. **Source-batch-granular partition chunks**. The source already holds
+   chunks of ~100 events. If scatter operated on the source-batch as a
+   unit rather than per-row, each partition would receive one chunk per
+   source pushMany containing all of its rows from that batch. At 100
+   hosts × 1 row/host/batch, that's still 100 chunks per pushMany, but
+   each chunk is a single-row view into the source's columnar buffer
+   — no new ArrayBuffer allocation, just a slice descriptor. The chunk
+   header overhead doesn't disappear, but the ArrayBuffer cost does (the
+   biggest single bucket at 398 MB in V7).
+
+Both fix the "100× more chunks than events deserves" shape. The first is
+simpler (a row-count threshold + a per-partition staging buffer); the
+second is more invasive (slice-view chunks need column-view APIs that
+don't own buffer memory). Either would let me re-measure with the same
+heap-profile harness.
+
+**Artifacts:**
+- `/tmp/claude-502/heap-profile-va9sGb/aggregator.heapsnapshot` (3.13 GB; V7 branch)
+- `/tmp/claude-502/heap-profile-va9sGb/aggregator.summary.json` (V7 /metrics)
+- `/tmp/heap-analysis-v7.log` — analyser output
+- This appendix is the canonical V7-vs-V6 comparison; cross-reference V6
+  appendix above for the released-0.18.0 baseline.
+
