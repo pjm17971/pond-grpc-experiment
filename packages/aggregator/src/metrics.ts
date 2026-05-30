@@ -87,6 +87,39 @@ let pushManyCalls = 0;
 let pushManyEventsTotal = 0;
 let pushManyBatchSizeMax = 0;
 
+/**
+ * §A before-number counters (column-native-output-spike). These
+ * track the transient allocations the chunked columnar backing
+ * still produces at the **listener boundary** — the slice §A is
+ * designed to remove.
+ *
+ * - `fanoutBatchFires`: pond `'batch'` callbacks delivered to
+ *   `fanout.ts`. Under pond 0.18.0's chunked backing, pond
+ *   synthesizes a transient `Event[]` per `'batch'` listener fire
+ *   from the column store. This counter × `pushMany.avgBatchSize`
+ *   ≈ transient Events created per second on the fanout side.
+ * - `fanoutEventsTouched`: cumulative count of Events the fanout's
+ *   loop walks (`e.get('host')` + `e.key().timestampMs()`). Equals
+ *   `sum(events.length)` per batch.
+ * - `fanoutRowsAllocated`: cumulative count of row-array entries
+ *   from `events.map(e.toJsonRow(schema))` per batch — these are
+ *   small plain-object allocations that go to young-gen GC. The
+ *   slice §A's column-native window listener replaces with column
+ *   walks.
+ * - `aggregateBatchEventsTouched`: cumulative count of Events the
+ *   `aggregate.ts` `'batch'` listener walks (sums the `requests`
+ *   column + reads first-event key once). Less work than fanout's
+ *   loop but still per-event-Event-handle reads — also §A's
+ *   target.
+ *
+ * All counters are cumulative since process startup; consumers
+ * compute rates by sampling over a window.
+ */
+let fanoutBatchFires = 0;
+let fanoutEventsTouched = 0;
+let fanoutRowsAllocated = 0;
+let aggregateBatchEventsTouched = 0;
+
 // ── GC observer ─────────────────────────────────────────────────
 const GC_KIND_NAMES: Record<number, string> = {
   [perfConstants.NODE_PERFORMANCE_GC_MAJOR]: 'major',
@@ -205,6 +238,35 @@ export function recordFanoutPhases(args: {
   fanoutBroadcastMs.add(args.broadcastMs);
 }
 
+/**
+ * §A before-number recorders. Cheap O(1) increments; safe to call
+ * from the hot path. Wire targets:
+ *
+ *   - `recordFanoutBatchFire(events.length)` — call once per
+ *     `live.on('batch', cb)` invocation in `fanout.ts`, BEFORE the
+ *     per-event loop and BEFORE `toJsonRow`. Captures both the
+ *     transient-Event surface (via batch fire × avg batch size)
+ *     and the per-event-touched count in one call.
+ *   - `recordFanoutRowsAllocated(rows.length)` — call right after
+ *     `events.map((e) => e.toJsonRow(schema))` in `fanout.ts`.
+ *     Counts the row-object array entries §A replaces with a
+ *     column walk.
+ *   - `recordAggregateBatchEventsTouched(events.length)` — call
+ *     once per `live.on('batch', cb)` invocation in `aggregate.ts`.
+ */
+export function recordFanoutBatchFire(eventCount: number): void {
+  fanoutBatchFires += 1;
+  fanoutEventsTouched += eventCount;
+}
+
+export function recordFanoutRowsAllocated(rowCount: number): void {
+  fanoutRowsAllocated += rowCount;
+}
+
+export function recordAggregateBatchEventsTouched(eventCount: number): void {
+  aggregateBatchEventsTouched += eventCount;
+}
+
 // ── Snapshot ────────────────────────────────────────────────────
 export type MetricsSnapshot = {
   uptimeSec: number;
@@ -262,6 +324,21 @@ export type MetricsSnapshot = {
   memory: NodeJS.MemoryUsage;
   /** GC pauses bucketed by kind ('major', 'minor', 'incremental', 'weakcb'). */
   gc: Record<string, GcBucket>;
+  /**
+   * §A before-number counters — the listener-boundary allocations
+   * the chunked columnar backing still produces post-#170. The
+   * slice the column-native-output spike replaces with column walks.
+   */
+  columnNativeOutput: {
+    /** `live.on('batch', cb)` fires delivered to fanout.ts. */
+    fanoutBatchFires: number;
+    /** Cumulative count of Events the fanout per-event loop touched. */
+    fanoutEventsTouched: number;
+    /** Cumulative count of row-objects `events.map(e.toJsonRow(schema))` allocated. */
+    fanoutRowsAllocated: number;
+    /** Cumulative count of Events the aggregate.ts batch listener touched. */
+    aggregateBatchEventsTouched: number;
+  };
 };
 
 function countArrivalEntries(): number {
@@ -304,5 +381,11 @@ export function snapshot(args: {
     },
     memory: process.memoryUsage(),
     gc: { ...gcByKind },
+    columnNativeOutput: {
+      fanoutBatchFires,
+      fanoutEventsTouched,
+      fanoutRowsAllocated,
+      aggregateBatchEventsTouched,
+    },
   };
 }

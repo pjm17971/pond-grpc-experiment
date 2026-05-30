@@ -1,3 +1,4 @@
+import { writeHeapSnapshot } from 'node:v8';
 import { LiveSeries } from 'pond-ts';
 import { schema } from '@pond-experiment/shared';
 import { startIngest } from './ingest.js';
@@ -31,6 +32,30 @@ const PRODUCER_URL = process.env.PRODUCER_URL ?? '127.0.0.1:50051';
  */
 const SAMPLE_STRIDE = Math.max(1, Number(process.env.SAMPLE_STRIDE ?? '1'));
 
+/**
+ * Override the `LiveSeries.retention.maxAge` from env. Default `30s`
+ * (the post-firehose-OOM fix per the comment block below). Set this
+ * to `90s` or `6m` to reproduce the historical OOM cells when
+ * profiling for the pond-ts column-native-live-pipeline brief.
+ * Accepts pond's `DurationLiteral` shape; passed straight through.
+ */
+const LIVE_RETENTION = process.env.LIVE_RETENTION ?? '30s';
+
+/**
+ * Heap-snapshot profiling hook. Set `HEAP_DUMP_AT_SEC=75` to
+ * schedule a `v8.writeHeapSnapshot()` call N seconds after startup —
+ * tuned so the source `LiveSeries` deque has had time to fully
+ * populate (~75s × ~70k/s = ~5.25M events at firehose, near the
+ * documented OOM cell). The snapshot path is logged so the caller
+ * can analyse it post-run. Gated on the env so non-profile runs
+ * pay zero cost. Companion analyser at
+ * `scripts/analyse-heap-snapshot.ts`.
+ */
+const HEAP_DUMP_AT_SEC = process.env.HEAP_DUMP_AT_SEC
+  ? Number(process.env.HEAP_DUMP_AT_SEC)
+  : undefined;
+const HEAP_DUMP_PATH = process.env.HEAP_DUMP_PATH;
+
 const stopGc = startGcObserver();
 
 // Retention sized as a small ingest buffer, NOT the rolling's
@@ -49,7 +74,7 @@ const stopGc = startGcObserver();
 const live = new LiveSeries({
   name: 'metrics',
   schema,
-  retention: { maxAge: '30s' },
+  retention: { maxAge: LIVE_RETENTION as `${number}s` },
 });
 
 const stopIngest = startIngest(live, {
@@ -66,8 +91,24 @@ const server = await startServer({
 });
 
 console.log(
-  `aggregator listening on :${PORT} (producer=${PRODUCER_URL}, sampleStride=${SAMPLE_STRIDE})`,
+  `aggregator listening on :${PORT} (producer=${PRODUCER_URL}, sampleStride=${SAMPLE_STRIDE}, retention=${LIVE_RETENTION}${
+    HEAP_DUMP_AT_SEC !== undefined ? `, heap-dump-at=${HEAP_DUMP_AT_SEC}s` : ''
+  })`,
 );
+
+if (HEAP_DUMP_AT_SEC !== undefined) {
+  setTimeout(() => {
+    const path = HEAP_DUMP_PATH ?? `/tmp/aggregator-${Date.now()}.heapsnapshot`;
+    console.log(`writing heap snapshot to ${path}…`);
+    const t0 = performance.now();
+    writeHeapSnapshot(path);
+    const ms = performance.now() - t0;
+    console.log(`heap snapshot written: ${path} (${ms.toFixed(0)}ms)`);
+    console.log(
+      `live.length=${live.length}, pond.stats()=${JSON.stringify(live.stats())}`,
+    );
+  }, HEAP_DUMP_AT_SEC * 1000);
+}
 
 const shutdown = async (signal: string) => {
   console.log(`received ${signal}, shutting down…`);

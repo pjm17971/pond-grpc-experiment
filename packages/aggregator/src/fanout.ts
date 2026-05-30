@@ -6,7 +6,12 @@ import {
   encode,
   schema,
 } from '@pond-experiment/shared';
-import { recordFanout, recordFanoutPhases } from './metrics.js';
+import {
+  recordFanout,
+  recordFanoutBatchFire,
+  recordFanoutPhases,
+  recordFanoutRowsAllocated,
+} from './metrics.js';
 
 /**
  * Subscribe to `live.on('batch', …)` and broadcast each batch as an
@@ -27,6 +32,15 @@ export function startFanout(
   broadcast: (frame: string) => void,
 ): () => void {
   return live.on('batch', (events) => {
+    // §A before-number counters: each batch-listener fire ≈ one
+    // synthesised Event[] from pond's chunked backing (post-#170).
+    // The per-event recordFanout loop touches each Event handle;
+    // the events.map(toJsonRow) call allocates one row-object per
+    // event. Both are the slice the column-native-output spike
+    // replaces with column walks. Record before the work so the
+    // count survives any later throw.
+    recordFanoutBatchFire(events.length);
+
     const t0 = performance.now();
     for (const e of events) {
       recordFanout(e.get('host'), e.key().timestampMs());
@@ -34,6 +48,7 @@ export function startFanout(
     const tAfterRecord = performance.now();
 
     const rows = events.map((e) => e.toJsonRow(schema));
+    recordFanoutRowsAllocated(rows.length);
     const msg: AppendMsg = { type: 'append', rows };
     const frame = encode(msg);
     const tAfterSerialize = performance.now();

@@ -155,6 +155,21 @@ export async function spawnProducer(
 export type AggregatorOptions = {
   httpPort: number;
   producerUrl: string;
+  /**
+   * Override the source `LiveSeries` retention `maxAge`. Default
+   * unspecified → aggregator uses its built-in `30s`. Pass `'90s'`
+   * or `'6m'` to reproduce historical OOM cells when running the
+   * heap-profile bench.
+   */
+  retention?: string;
+  /**
+   * Schedule `v8.writeHeapSnapshot()` N seconds after aggregator
+   * startup. Drives the OOM-cell heap-profile orchestrator. Off
+   * (unset) by default.
+   */
+  heapDumpAtSec?: number;
+  /** Path the snapshot is written to. Defaults to `/tmp/aggregator-<ts>.heapsnapshot`. */
+  heapDumpPath?: string;
 };
 
 export async function spawnAggregator(
@@ -164,6 +179,15 @@ export async function spawnAggregator(
     AGGREGATOR_PORT: String(opts.httpPort),
     PRODUCER_URL: opts.producerUrl,
   };
+  if (opts.retention !== undefined) {
+    env.LIVE_RETENTION = opts.retention;
+  }
+  if (opts.heapDumpAtSec !== undefined) {
+    env.HEAP_DUMP_AT_SEC = String(opts.heapDumpAtSec);
+  }
+  if (opts.heapDumpPath !== undefined) {
+    env.HEAP_DUMP_PATH = opts.heapDumpPath;
+  }
   const { child, pid } = await spawnReady({
     cwd: resolvePath(repoRoot, 'packages/aggregator'),
     env,
