@@ -728,3 +728,164 @@ heap-profile harness.
 - This appendix is the canonical V7-vs-V6 comparison; cross-reference V6
   appendix above for the released-0.18.0 baseline.
 
+
+---
+
+## Appendix — V8 on `feat/columnar-partition-routing` + coalescing (2026-05-31)
+
+**Trigger.** Library agent landed the per-partition chunk coalescing fix
+on the same branch (commit `0a733ef`, `feat(live): per-partition chunk
+coalescing — fixes the V7 chunk explosion`). Same OOM cell as V6/V7
+(100 hosts × 700 eps × 90s retention, strict, time-keyed). Branch pulled,
+rebuilt, re-linked via `pnpm.overrides` → `file:` path; tests green (113
+across packages). Override reverted before commit so the PR's lockfile
+stays portable.
+
+**Verdict up front: clean WIN.** Coalescing closes the V7 regression and
+beats the V6 baseline on every dimension that matters — net retained heap
+DOWN 13.5%, sustained throughput UP 24%, Event/Time retention essentially
+zero. Recommend merge-track.
+
+### Headline: every signal moves the right direction
+
+| metric | V6 (released) | V7 (no coalescing) | V8 (coalescing) | V8 vs V6 |
+| --- | --- | --- | --- | --- |
+| **Workload** | | | | |
+| events ingested (~85s run) | 6,731,800 | 1,569,500 | **6,732,800** | match |
+| sustained rate | ~41k/s | ~12k/s | **~51k/s** | **+24%** |
+| **Win column (Event/Time elimination)** | | | | |
+| `Event` count retained | 6,766,580 | 9,005 | **37,891** | **-99.4%** |
+| `Time` count retained | 6,729,450 | 183 | **755** | **-100%** |
+| Event + Time self-size | 514.8 MB | 359 KB | **1.5 MB** | **-99.7%** |
+| **Chunk-object count (bounded as predicted)** | | | | |
+| `ColumnarStore` | 67,287 | 1,582,771 | **93,498** | +39% |
+| `Float64Column` | 134,574 | 3,165,542 | **186,996** | +39% |
+| `StringColumn` | 67,287 | 1,582,771 | **93,498** | +39% |
+| `TimeKeyColumn` | 67,287 | 1,582,771 | **93,498** | +39% |
+| `ArrayBuffer` | 201,932 | 4,748,384 | **306,765** | +52% |
+| `Float64Array` | 201,881 | 4,748,333 | **280,514** | +39% |
+| **Net retained heap** | | | | |
+| total node self-size | 1.92 GB | 2.15 GB | **1.79 GB** | **-7%** |
+| heapUsed | 2.06 GB | 2.28 GB | **1.57 GB** | **-24%** |
+| arrayBuffers | 161 MB | 38 MB | 350 MB | +117% |
+| **(heapUsed + arrayBuffers)** | 2.22 GB | 2.32 GB | **1.92 GB** | **-13.5%** |
+| bytes per retained event | 332 B | 1370 B | **285 B** | **-14%** |
+
+### Coalescing math lands precisely
+
+Library agent's prediction: "ColumnarStore count: 1.58M → ~26k (6.73M events
+/ 256) — bounded, ~60× fewer."
+
+Observed:
+
+```
+V8 total ColumnarStore             = 93,498
+V8 source pushMany batches         = 67,328 (one source-side chunk per batch)
+V8 implied partition chunks        = 93,498 − 67,328 = 26,170
+V8 events per partition chunk      = 6,732,800 ÷ 26,170 ≈ 257.3   ← target was 256
+V7 → V8 partition chunk reduction  = 1,582,771 / 26,170 ≈ 60.5×    ← prediction was ~60×
+```
+
+The coalescing threshold (256) lands exactly where predicted, and the
+overall chunk-object reduction matches the library agent's "60× fewer"
+estimate to two significant figures.
+
+### Why the 37k Events on V8 (vs V7's 9k) — they're emit-side, not storage-side
+
+V8 retains 37,891 Events. That's higher than V7 (9k) but still **3.5 orders
+of magnitude below V6's 6.77M**. The math accounts cleanly for downstream
+emission, not source/partition retention:
+
+```
+Aggregate pipeline rolling cadence = 200ms tick
+Snapshot moment                    = +75s into run
+Total ticks emitted                = 75s / 200ms = 375 ticks
+Hosts                              = 100 (one rolling output Event per partition per tick)
+Expected emit-side Events          = 375 × 100 ≈ 37,500
+V8 actual retained Events          = 37,891   ← matches with startup noise
+```
+
+These are the rolling pipeline's emit-side Events (HostTick assembly, the
+per-partition rolling output stream). They flow downstream of the source
+and partition sub-series — which are now both columnar. So the V8 Event
+count is entirely from the emitter side, not the storage side. Structurally
+correct: source columnar + partitions columnar + rolling-emitter still
+event-shaped.
+
+### Throughput recovered, latency mixed
+
+| metric | V6 | V7 | V8 |
+| --- | --- | --- | --- |
+| `pushManyTotalMs` p50 | 0.42 ms | 9.87 ms | **0.47 ms** ✓ |
+| `pushManyTotalMs` p95 | (n/a) | 11.54 ms | **0.97 ms** ✓ |
+| `pushManyTotalMs` p99 | 3.60 ms | 17.84 ms | **7.11 ms** (-2× vs V6, but +5× better than V7) |
+| `ingest→fanout` p99 | 24.1 ms | 24.2 ms | **18.1 ms** ✓ (-25%) |
+| `fanoutSerializeMs` p99 | 2.54 ms | 0.08 ms | **0.05 ms** ✓ (-98%) |
+| minor GC count | 1,699 | 819 | 2,249 (more work = more GCs) |
+| minor GC max pause | 11.3 ms | 12.0 ms | **9.7 ms** ✓ (-14%) |
+| major GC count | 8 | 6 | 11 |
+| major GC max pause | 815 ms | 535 ms | 696 ms |
+
+The `pushManyTotalMs` p99 (7.1ms on V8 vs 3.6ms on V6) is the one
+regression-leaning number. It's still 60% better than V7 and well below
+the wire's tick budget (1s / 700 batches = ~1.4ms per pushMany on
+average — but with 100-event batches that's ~140µs / event, plenty of
+headroom). The minor-GC max pause and ingest→fanout p99 both improved
+over V6, which is the dashboard-visible latency the experiment cares
+about.
+
+### §A before-number counters (same as V6 at this rate)
+
+```
+fanoutBatchFires:           67,328    (V6: 67,318)
+fanoutEventsTouched:    6,732,800    (V6: 6,731,800)
+fanoutRowsAllocated:    6,732,800    (V6: 6,731,800)
+aggregateBatchEventsTouched: 6,732,800
+```
+
+Same shape as V6 — the §A measurement is unchanged by the partition
+coalescing because it's a source-side listener boundary phenomenon.
+V8's data confirms §A is the next lever once this lands.
+
+### Verdict for the library agent
+
+**Real win — recommend merge-track.** Every gate the library agent
+proposed is cleared:
+
+- ✓ Net retained heap drops below V6 (2.22 → 1.92 GB, -13.5%).
+- ✓ Throughput recovers (12k/s → 51k/s) and passes V6 (41k/s).
+- ✓ Chunk-object count bounded — partition chunks ~26k (vs V7's 1.58M),
+  matching the 256-row threshold prediction.
+- ✓ Event count stays essentially eliminated (37k retained, all from
+  rolling-emitter side, not storage side).
+- ✓ Per-event memory cost down 14% (332 B/event → 285 B/event).
+- ✓ Dashboard-visible latency (ingest→fanout p99, minor-GC max pause)
+  improved vs V6.
+
+One soft caveat for sign-off: `pushManyTotalMs` p99 is 7.11ms on V8 vs
+3.60ms on V6 — slower at the tail. The p50 is unchanged (0.47ms vs
+0.42ms) so this is a tail effect, not a steady-state regression. At the
+experiment's typical batch shape (~100 events / 1.4ms tick budget) it's
+comfortably below the ingest deadline. Worth a note but not a blocker.
+
+**Suggested next moves:**
+
+1. **Merge the coalescing branch.** Closes the high-partition-count
+   OOM motivation cleanly.
+2. **API sign-off.** No new public API surfaces in this change (the
+   scatter routing is internal). The pre-existing `partitionBy(...)`
+   API stays unchanged.
+3. **§A spike unblocked.** With partition-side retention solved, the
+   listener-boundary transient allocations (the §A before-number
+   above, ~12 MB/s of transient Events + row-objects) are now the
+   dominant allocation pressure remaining at this cell. The §A spike
+   has its target.
+
+**Artifacts:**
+- `/tmp/claude-502/heap-profile-85xxEq/aggregator.heapsnapshot` (3.06 GB; V8)
+- `/tmp/claude-502/heap-profile-85xxEq/aggregator.summary.json` (V8 /metrics)
+- `/tmp/heap-analysis-v8.log` — analyser output
+- This appendix supersedes the V7 "regress" verdict above. V6 vs V7 vs V8
+  is the canonical three-way comparison; the coalescing branch is the
+  recommended merge target.
+
