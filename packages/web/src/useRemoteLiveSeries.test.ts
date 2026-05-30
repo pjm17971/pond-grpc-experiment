@@ -63,12 +63,17 @@ describe('applyFrame', () => {
       schema,
       retention: { maxAge: '6m' },
     });
+    // pond 0.18.0 tightened the error message format from
+    // `column 'cpu' is required` to `row 0 col 1 (cpu) is required` —
+    // more useful (row-pointed) but breaks the old regex. Match the
+    // column name + "is required" loosely so the test survives a
+    // future format tightening.
     expect(() =>
       applyFrame(live, {
         type: 'snapshot',
         rows: [[1_700_000_000_000, null, null, 'api-x']],
       }),
-    ).toThrowError(/column 'cpu' is required/);
+    ).toThrowError(/cpu\b.*\brequired/);
     expect(live.length).toBe(0);
   });
 });

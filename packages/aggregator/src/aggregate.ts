@@ -13,6 +13,7 @@ import {
   type HostTick,
   type Schema,
 } from '@pond-experiment/shared';
+import { recordAggregateBatchEventsTouched } from './metrics.js';
 
 /**
  * Server-side aggregate-stream emitter.
@@ -274,6 +275,12 @@ export function startAggregate(
   // pins to 60; before then it's the actual elapsed-since-start.
   let firstEventTs: number | null = null;
   const offBatch = live.on('batch', (events) => {
+    // §A before-number: each event in this batch is touched once
+    // via the column-read API (`e.get('requests')`). Counter is a
+    // direct proxy for "Events synthesised by pond's chunked
+    // backing and delivered to this listener", since the listener
+    // walks every entry.
+    recordAggregateBatchEventsTouched(events.length);
     eventsIngested += events.length;
     for (const e of events) {
       requestsIngested += e.get('requests');

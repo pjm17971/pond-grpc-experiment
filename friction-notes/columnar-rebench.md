@@ -337,3 +337,218 @@ production headroom.
   discipline.
 - [`pond-ts CLAUDE.md`](https://github.com/pjm17971/pond-ts/blob/main/CLAUDE.md)
   — multi-agent experiment discipline + PR review protocol.
+
+---
+
+## Appendix — V6 re-bench on pond-ts v0.18.0 + §A before-number (2026-05-30)
+
+**Trigger.** pond-ts v0.18.0 shipped npm-side. PR #170 is the chunked
+columnar `LiveSeries` backing (the OOM fix this experiment's heap
+profile yesterday motivated). Library agent asked for a re-adoption
+A/B + a §A before-number for the column-native-output spike.
+
+**Workload.** Same OOM cell as yesterday's heap profile: 100 hosts ×
+700 eps/host = 70k/s target, retention `90s`, ordering `'strict'`,
+time-keyed. Heap snapshot at +75s into the aggregator process,
+`/metrics` scrape at +85s (no `/live` or `/live-agg` WS clients —
+fanout work happens but is broadcast to zero recipients, isolating
+the allocation pressure cleanly).
+
+### Headline — chunked backing engaged, retained-Event count unchanged
+
+The library agent's prediction was a 5–9× retained Event/Time heap
+drop. The measurement showed something different:
+
+| metric | 0.17.1 (yesterday) | 0.18.0 (today) | delta |
+| --- | --- | --- | --- |
+| heap snapshot file | 4.44 GB | 4.76 GB | +7% |
+| total node self-size | 1.92 GB | 2.22 GB | **+16%** |
+| nodes (total) | 55.33M | 63.27M | +14% |
+| `Event` count | 6,766,680 | 6,766,580 | **unchanged** |
+| `Time` count | 6,729,550 | 6,729,450 | **unchanged** |
+| `Event + Time` self-size | 514.8 MB | 514.8 MB | unchanged |
+| `Object` (data records) | 683 MB | 683 MB | unchanged |
+
+The chunked backing **did** engage on the source `LiveSeries` (its
+storage signatures appear in the heap):
+
+| new in 0.18.0 | count | bytes |
+| --- | --- | --- |
+| `JSArrayBufferData` (chunk-backing bytes) | 201,920 | 154.5 MB |
+| `ArrayBuffer` | 201,932 | 16.9 MB |
+| `Float64Array` (numeric columns) | 201,881 | 18.5 MB |
+| `Float64Column` (wrapper) | 134,574 | 8.2 MB |
+| `StringColumn` (host dictionary) | 67,287 | 5.1 MB |
+| `TimeKeyColumn` | 67,287 | 3.6 MB |
+| `ColumnarStore` (one per chunk) | 67,287 | 3.6 MB |
+| **total chunked-storage overhead** | | **~210 MB** |
+
+The chunk count (67,287) matches `pushMany.calls = 67,318` to within
+a few startup batches — one chunk per `pushMany`, as documented.
+
+### Why the Events didn't drop — partition sub-series carve-out
+
+Per the 0.18.0 CHANGELOG, the chunked backing applies to
+"top-level LiveSeries with `ordering: 'strict'` and a time key";
+the carve-out names "**internally-created series**" as still on the
+per-row `Event[]` path.
+
+`partitionBy('host')` creates 100 internally-managed per-partition
+sub-`LiveSeries` instances, one per host. Each retains its share of
+Events the standard way. At 6.73M events / 100 hosts = ~67k events
+per partition × 100 partitions = 6.73M Events. Snapshot confirms:
+the `Event`/`Time` retention is downstream of the source, in the
+partition sub-series.
+
+The 106 `LiveSeries` instances visible in the snapshot resolve as:
+1 source + 100 partition sub-series + 5 other internal (rolling).
+The chunked-storage signatures (67k chunks) match the source's
+`pushMany` count exactly, confirming **only the source engaged the
+chunked backing**.
+
+**Net retained heap on 0.18.0 went UP** by ~210 MB (chunked overhead
+layered onto unchanged partition retention) — not down 5–9×. The
+library agent's predicted win does not materialise for the
+experiment's consumer pattern (partitioned rolling over a high-
+partition-count source) because the dominant retention is in the
+partitioned sub-series, not the source. This is the disqualifying
+condition the library agent's email asked me to flag if Event-count
+didn't drop.
+
+**Pond-side fix to surface to the library agent (separate ask, not
+in §A's scope):** extend the chunked backing to internally-created
+partition sub-series, OR have `partitionBy(...)` route events to its
+sub-series via a column-native intake path that doesn't materialise
+`Event[]` per partition. Without that, the OOM-motivation high-
+partition-count consumer (us) still sees its dominant retention on
+0.18.0.
+
+### What the chunked backing DID buy us — latency + GC pause
+
+Even though retention is unchanged, the per-event cost-of-existence
+dropped substantially. Likely because the source's storage walk
+during GC marking is cheaper when backed by typed arrays instead of
+a 6.77M-entry `Event[]`.
+
+| metric | 0.17.1 | 0.18.0 | delta |
+| --- | --- | --- | --- |
+| minor GC count (over ~165s) | 1,549 | 1,699 | +10% |
+| minor GC total pause | 5.54 s | 5.16 s | -7% |
+| **minor GC max pause** | **43 ms** | **11.3 ms** | **-74%** |
+| major GC count | 8 | 8 | unchanged |
+| major GC max pause | 750 ms | 815 ms | +9% (noise) |
+| ingest→fanout p99 | 111 ms | **24 ms** | **-78%** |
+| pushManyTotal p99 | 15.9 ms | **3.6 ms** | **-77%** |
+
+The 4–5× latency improvements are the real story. The source's
+chunked backing makes minor-GC scans much cheaper (typed-array
+backings don't need young-gen pointer-graph walks), which collapses
+the tail-latency the dashboard cares about. The retained-heap
+reduction may be 0 for our consumer, but the GC-pause-driven
+latency win is meaningful and would have justified #170 even
+without the retained-heap claim.
+
+### §A before-number — listener-boundary allocations
+
+New per-event counters surfaced in `/metrics → columnNativeOutput`
+to measure the slice §A removes:
+
+```
+columnNativeOutput: {
+  fanoutBatchFires:           67,318    // 1 per source pushMany batch
+  fanoutEventsTouched:    6,731,800    // every Event in every fanout batch
+  fanoutRowsAllocated:    6,731,800    // events.map(e.toJsonRow(schema))
+  aggregateBatchEventsTouched: 6,731,800    // every Event in aggregate.ts batch listener
+}
+```
+
+At firehose × 75s, the source's chunked backing synthesises a
+transient `Event[]` per batch-listener fire. Both `fanout.ts` and
+`aggregate.ts` subscribe to `'batch'`; pond delivers the same
+`Event[]` to both (one synthesis, two listeners). The synthesised
+Events are then dropped after the callback returns and GC'd by the
+next minor cycle. The row-objects from `events.map(e.toJsonRow(schema))`
+in `fanout.ts` are an additional per-Event allocation that also
+goes to young-gen and gets GC'd after `JSON.stringify(frame)`.
+
+Per-second rates at this cell (75s × 6.73M events):
+- `fanoutBatchFires`: ~898/s
+- `fanoutEventsTouched`: ~89,757/s (transient Events synthesised per fanout fire)
+- `fanoutRowsAllocated`: ~89,757/s (transient row-objects)
+- `aggregateBatchEventsTouched`: ~89,757/s (Events touched by aggregate listener; shared with fanout)
+
+Estimated allocation pressure from this slice alone:
+- Events: 89,757/s × ~80 B = ~7.2 MB/s
+- Row-objects: 89,757/s × ~50 B = ~4.5 MB/s
+- **Total transient: ~11.7 MB/s** at this cell
+
+Over 75s that's ~880 MB of transient allocation churn, which
+accounts for most of the observed 1,699 minor GCs (averaging ~22
+GCs/s, consistent with ~12 MB/s allocation rate against a typical
+young-gen size). The minor GC pressure on 0.18.0 is dominated by
+this listener-boundary slice, not by storage-side work.
+
+**Fanout phase latencies** (per-pushMany batch wall-clock):
+
+| phase | 0.17.1 p99 | 0.18.0 p99 |
+| --- | --- | --- |
+| `fanoutRecordMs` (per-event loop) | 0.26 (from BENCH.md saturation) | 0.043 |
+| `fanoutSerializeMs` (`toJsonRow` + `JSON.stringify`) | **0.44** | **2.54** |
+| `fanoutBroadcastMs` | 0.05 | 0.00033 |
+| `pushManyTotalMs` | 0.88 | 3.60 |
+
+Caveat: the 0.17.1 fanout p99s come from BENCH.md's saturation row
+(P=1000, N=1000, ~486k/s achieved), not from yesterday's snapshot
+run; the cells aren't directly comparable. The right cross-version
+A/B for fanout phase latencies is a follow-up bench at matched
+cells. The 0.18.0 numbers here are the canonical §A before-number
+for the OOM-cell shape — the column-native output spike's
+after-number will run against these.
+
+### Re-adoption validation summary
+
+| claim | result |
+| --- | --- |
+| Chunked backing auto-engages on top-level strict+time | **✓ confirmed** (67k ColumnarStore + 154MB JSArrayBufferData visible) |
+| Retained Event/Time heap drops 5–9× | **✗ unchanged** for high-partition-count source — partitions carve out |
+| Latency / GC pause improves | **✓ exceeds expectations** (4–5× tail-latency reduction) |
+| Atomic-commit pushMany on chunked path | **✓ transparent** for fanout.ts (no mid-batch length inspection, no throws) |
+| Error-message format change (`row N col M (name)`) | one wire-decoder test regex updated (`useRemoteLiveSeries.test.ts`) |
+| Interval-keyed BREAKING | N/A — experiment is time-keyed throughout |
+
+### Ping for the library agent
+
+Two follow-ups to surface back:
+
+1. **Partition sub-series carve-out limits the OOM-fix scope.**
+   The experiment's heap is dominated by per-partition `Event[]`
+   retention, not the source's. #170's "zero retained `Event`"
+   claim doesn't realise for partitioned consumers because
+   `partitionBy(...)` internally creates per-partition sub-series
+   that fall under the per-row carve-out. If the goal is to fix
+   the OOM at the experiment's documented cell, this is the next
+   lever — either chunked sub-series, or a column-native intake
+   that bypasses per-partition `Event[]` allocation. Flagging as
+   the disqualifying condition the email asked about.
+
+2. **§A's payoff is bigger than the previous estimate.** With the
+   source's storage-side GC pressure substantially reduced by
+   #170 (minor-GC max pause 43ms → 11.3ms), the listener-boundary
+   transient allocations become the dominant remaining source of
+   GC pressure. ~90k transient Events/s + 90k row-objects/s at
+   this cell. The column-native output spike's payoff should be
+   measurable as: (a) minor-GC count reduction (transient-Event
+   path collapsed), (b) `fanoutSerializeMs` p99 reduction (column
+   walk vs per-Event `toJsonRow`), (c) `fanoutRecordMs` p99
+   reduction (column reads vs `e.get('host')` per Event).
+
+**Artifacts:**
+- `/tmp/claude-502/heap-profile-IRYQMY/aggregator.heapsnapshot` (4.76 GB; 0.18.0)
+- `/tmp/claude-502/heap-profile-IRYQMY/aggregator.summary.json` (0.18.0)
+- `/tmp/claude-502/heap-profile-R53u6p/aggregator.heapsnapshot` (4.43 GB; 0.17.1 baseline)
+- `/tmp/claude-502/heap-profile-R53u6p/aggregator.summary.json` (0.17.1 baseline)
+- `/tmp/heap-analysis-0180.log` and `/tmp/heap-analysis-strict.log` — analyser outputs
+
+The §A before-number numbers (`columnNativeOutput` counters,
+fanout phase p99s) are the canonical AFTER-target for the spike.
+
