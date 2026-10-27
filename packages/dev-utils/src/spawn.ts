@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,6 +41,8 @@ type SpawnOptions = {
   env: Record<string, string>;
   /** stdout/stderr line that signals readiness. */
   readyMatch: RegExp;
+  /** Run this binary instead of `tsx src/index.ts`. */
+  command?: string;
 };
 
 const READY_TIMEOUT_MS = 15_000;
@@ -51,8 +54,11 @@ async function spawnReady(opts: SpawnOptions): Promise<{
   // Resolve `tsx` from the package's node_modules/.bin. pnpm always
   // materialises a binary symlink there for each package's devDeps.
   const tsx = resolvePath(opts.cwd, 'node_modules/.bin/tsx');
+  const [cmd, args] = opts.command
+    ? [opts.command, []]
+    : [tsx, ['src/index.ts']];
 
-  const child = spawn(tsx, ['src/index.ts'], {
+  const child = spawn(cmd, args, {
     cwd: opts.cwd,
     env: { ...process.env, ...opts.env },
     stdio: 'pipe',
@@ -155,6 +161,12 @@ export async function spawnProducer(
 export type AggregatorOptions = {
   httpPort: number;
   producerUrl: string;
+  /**
+   * `'node'` (default) runs `packages/aggregator`; `'rust'` runs the
+   * release build of `packages/aggregator-rs` (`cargo build --release`
+   * there first). Defaults to the `AGGREGATOR_IMPL` env var.
+   */
+  impl?: 'node' | 'rust';
 };
 
 export async function spawnAggregator(
@@ -164,10 +176,29 @@ export async function spawnAggregator(
     AGGREGATOR_PORT: String(opts.httpPort),
     PRODUCER_URL: opts.producerUrl,
   };
-  const { child, pid } = await spawnReady({
-    cwd: resolvePath(repoRoot, 'packages/aggregator'),
-    env,
-    readyMatch: /aggregator listening on/,
-  });
+  const impl = opts.impl ?? (process.env.AGGREGATOR_IMPL === 'rust' ? 'rust' : 'node');
+  const rustBin = resolvePath(
+    repoRoot,
+    'packages/aggregator-rs/target/release/aggregator-rs',
+  );
+  if (impl === 'rust' && !existsSync(rustBin)) {
+    throw new Error(
+      `Rust aggregator not built: run \`cargo build --release\` in packages/aggregator-rs (needs protoc). Expected ${rustBin}`,
+    );
+  }
+  const { child, pid } = await spawnReady(
+    impl === 'rust'
+      ? {
+          cwd: resolvePath(repoRoot, 'packages/aggregator-rs'),
+          env,
+          readyMatch: /aggregator listening on/,
+          command: rustBin,
+        }
+      : {
+          cwd: resolvePath(repoRoot, 'packages/aggregator'),
+          env,
+          readyMatch: /aggregator listening on/,
+        },
+  );
   return { pid, stop: stopper(child) };
 }

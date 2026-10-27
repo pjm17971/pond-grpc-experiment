@@ -51,6 +51,14 @@ type Result = {
   N: number;
   targetTotalRate: number;
   achievedTotalRate: number;
+  /**
+   * WebSocket bytes/sec the probe actually received in the window, and
+   * whether it was still connected at the end. `Achieved/s` counts
+   * server-side fan-out calls, which keep rising with no client
+   * attached, so it only means "delivered" while the probe is up.
+   */
+  probeMbPerSec: number;
+  probeConnected: boolean;
   latencyP50: number;
   latencyP95: number;
   latencyP99: number;
@@ -101,6 +109,11 @@ async function runConfig(
     // first batches drain so the steady-state is what we measure.
     await sleep(5000);
 
+    let probeBytes = 0;
+    probe.on('message', (data: Buffer) => {
+      probeBytes += data.length;
+    });
+
     const baseline = await fetchMetrics(httpPort);
     const samples: MetricsSnapshot[] = [baseline];
     const startedAt = Date.now();
@@ -113,6 +126,13 @@ async function runConfig(
       }
     }
     const final = samples[samples.length - 1];
+    const probeConnected =
+      probe.readyState === WebSocket.OPEN && final.ws.clientCount >= 1;
+    if (!probeConnected) {
+      console.warn(
+        `[P=${cfg.P} N=${cfg.N}] probe was disconnected by the end; Achieved/s is fan-out work, not delivered rows`,
+      );
+    }
 
     const elapsedSec = final.uptimeSec - baseline.uptimeSec;
     const eventsDelta = final.events.fannedOut - baseline.events.fannedOut;
@@ -142,6 +162,9 @@ async function runConfig(
       N: cfg.N,
       targetTotalRate: cfg.P * cfg.N,
       achievedTotalRate: Math.round(achievedTotalRate),
+      probeMbPerSec:
+        elapsedSec > 0 ? probeBytes / 1024 / 1024 / elapsedSec : 0,
+      probeConnected,
       latencyP50: lat.p50,
       latencyP95: lat.p95,
       latencyP99: lat.p99,
@@ -177,8 +200,8 @@ function sleep(ms: number): Promise<void> {
 }
 
 const TABLE_HEADER = [
-  '| P | N | Target/s | Achieved/s | e2e p99 ms | pushMany p99 | fanout record p99 | fanout serialize p99 | fanout send p99 | GC major | GC minor | Heap peak | Avg batch | Residual |',
-  '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+  '| P | N | Target/s | Achieved/s | e2e p99 ms | pushMany p99 | fanout record p99 | fanout serialize p99 | fanout send p99 | GC major | GC minor | Heap peak | Avg batch | Residual | Probe MB/s |',
+  '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
 ].join('\n');
 
 function formatRow(r: Result): string {
@@ -197,7 +220,8 @@ function formatRow(r: Result): string {
     `${r.gcMinorCount} / ${r.gcMinorTotalMs.toFixed(0)}ms`,
     `${r.heapPeakMb} MB`,
     r.pushManyAvgBatch.toFixed(1),
-    `${r.arrivalQueueResidual} |`,
+    `${r.arrivalQueueResidual}`,
+    `${r.probeMbPerSec.toFixed(1)}${r.probeConnected ? '' : ' (DISCONNECTED)'} |`,
   ].join(' | ');
 }
 
@@ -229,6 +253,8 @@ async function main(): Promise<void> {
           N: cfg.N,
           targetTotalRate: cfg.P * cfg.N,
           achievedTotalRate: -1,
+          probeMbPerSec: 0,
+          probeConnected: false,
           latencyP50: 0,
           latencyP95: 0,
           latencyP99: 0,

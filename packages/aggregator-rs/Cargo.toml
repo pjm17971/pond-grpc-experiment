@@ -1,0 +1,19 @@
+[package]
+name = "aggregator-rs"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Rust aggregator for the gRPC experiment: gRPC in, WebSocket out. pond-rs live pipelines land here as pond-rs R3 steps merge."
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tonic = "0.12"
+prost = "0.13"
+axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+memory-stats = "1"
+
+[build-dependencies]
+tonic-build = "0.12"
