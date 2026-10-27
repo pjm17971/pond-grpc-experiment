@@ -88,7 +88,9 @@ async fn main() {
         .expect("server");
 }
 
-/// Dial the producer and re-dial with backoff, as `ingest.ts` does.
+/// Dial the producer and re-dial with backoff, as `ingest.ts` does:
+/// `shared/src/backoff.ts` (1 s doubling to 30 s, ±20% jitter), with
+/// the attempt counter reset on a stream's first delivered batch.
 async fn ingest(app: Arc<App>, producer: String) {
     let url = format!("http://{producer}");
     let mut attempt: u32 = 0;
@@ -96,11 +98,17 @@ async fn ingest(app: Arc<App>, producer: String) {
         match proto::producer_client::ProducerClient::connect(url.clone()).await {
             Ok(mut client) => match client.subscribe(proto::SubscribeRequest {}).await {
                 Ok(resp) => {
-                    attempt = 0;
                     let mut stream = resp.into_inner();
+                    let mut first = true;
                     loop {
                         match stream.message().await {
-                            Ok(Some(batch)) => on_batch(&app, batch),
+                            Ok(Some(batch)) => {
+                                if first {
+                                    attempt = 0;
+                                    first = false;
+                                }
+                                on_batch(&app, batch);
+                            }
                             Ok(None) => break,
                             Err(e) => {
                                 eprintln!("producer stream error: {e}");
@@ -113,10 +121,23 @@ async fn ingest(app: Arc<App>, producer: String) {
             },
             Err(e) => eprintln!("connect to {producer} failed: {e}"),
         }
-        let delay = (250u64 << attempt.min(5)).min(5_000);
+        let delay = backoff_ms(attempt);
         attempt += 1;
+        eprintln!("reconnecting in {delay}ms (attempt {attempt})");
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
+}
+
+/// Port of `shared/src/backoff.ts` defaults.
+fn backoff_ms(attempt: u32) -> u64 {
+    let base = (1000.0 * 2f64.powi(attempt.min(30) as i32)).min(30_000.0);
+    // Jitter source: the clock's sub-second nanos; no rand dependency.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let unit = nanos as f64 / 1e9 * 2.0 - 1.0; // -1 .. 1
+    (base + unit * base * 0.2).round() as u64
 }
 
 fn on_batch(app: &App, batch: proto::EventBatch) {
@@ -175,7 +196,11 @@ async fn live_client(mut socket: WebSocket, app: Arc<App>) {
                         }
                     }
                     // Fell more than CLIENT_QUEUE_FRAMES behind: close.
-                    Err(broadcast::error::RecvError::Lagged(_)) => break,
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        eprintln!("/live client {missed} frames behind; disconnecting");
+                        app.metrics.client_dropped();
+                        break;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
                 msg = socket.recv() => match msg {
@@ -190,4 +215,17 @@ async fn live_client(mut socket: WebSocket, app: Arc<App>) {
 
 async fn metrics_handler(State(app): State<Arc<App>>) -> impl IntoResponse {
     Json(app.metrics.snapshot())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backoff_ms;
+
+    #[test]
+    fn backoff_matches_node_defaults() {
+        for (attempt, base) in [(0u32, 1000.0), (1, 2000.0), (4, 16_000.0), (5, 30_000.0), (40, 30_000.0)] {
+            let d = backoff_ms(attempt) as f64;
+            assert!(d >= base * 0.8 - 1.0 && d <= base * 1.2 + 1.0, "attempt {attempt}: {d}");
+        }
+    }
 }

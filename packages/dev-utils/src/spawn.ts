@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -176,16 +177,22 @@ export async function spawnAggregator(
     PRODUCER_URL: opts.producerUrl,
   };
   const impl = opts.impl ?? (process.env.AGGREGATOR_IMPL === 'rust' ? 'rust' : 'node');
+  const rustBin = resolvePath(
+    repoRoot,
+    'packages/aggregator-rs/target/release/aggregator-rs',
+  );
+  if (impl === 'rust' && !existsSync(rustBin)) {
+    throw new Error(
+      `Rust aggregator not built: run \`cargo build --release\` in packages/aggregator-rs (needs protoc). Expected ${rustBin}`,
+    );
+  }
   const { child, pid } = await spawnReady(
     impl === 'rust'
       ? {
           cwd: resolvePath(repoRoot, 'packages/aggregator-rs'),
           env,
           readyMatch: /aggregator listening on/,
-          command: resolvePath(
-            repoRoot,
-            'packages/aggregator-rs/target/release/aggregator-rs',
-          ),
+          command: rustBin,
         }
       : {
           cwd: resolvePath(repoRoot, 'packages/aggregator'),

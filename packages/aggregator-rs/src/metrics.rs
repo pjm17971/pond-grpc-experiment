@@ -3,8 +3,9 @@
 //!
 //! Differences from Node, by necessity: there is no GC, so `gc` is
 //! always `{}`; `memory.heapUsed` and `memory.rss` both report the
-//! process resident size (from `/proc/self/statm`), which is the
-//! number to compare with Node's heap peak.
+//! process resident size (RSS), so the bench's "heap peak" column is
+//! Node's JS heap against Rust's whole-process RSS. Extra:
+//! `ws.clientsDropped`, clients cut off for falling behind.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -61,6 +62,7 @@ pub struct Metrics {
     push_max: AtomicUsize,
     window_len: AtomicUsize,
     clients: AtomicUsize,
+    clients_dropped: AtomicU64,
     ingest_to_fanout: Histogram,
     push_total: Histogram,
     pub fanout_serialize: Histogram,
@@ -79,6 +81,7 @@ impl Metrics {
             push_max: AtomicUsize::new(0),
             window_len: AtomicUsize::new(0),
             clients: AtomicUsize::new(0),
+            clients_dropped: AtomicU64::new(0),
             ingest_to_fanout: Histogram::new(),
             push_total: Histogram::new(),
             fanout_serialize: Histogram::new(),
@@ -117,6 +120,10 @@ impl Metrics {
         self.clients.fetch_sub(1, Ordering::Relaxed);
     }
 
+    pub fn client_dropped(&self) {
+        self.clients_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> Value {
         let calls = self.push_calls.load(Ordering::Relaxed);
         let events = self.push_events.load(Ordering::Relaxed);
@@ -146,18 +153,73 @@ impl Metrics {
                 "fanoutSerializeMs": self.fanout_serialize.snapshot(),
                 "fanoutBroadcastMs": self.fanout_broadcast.snapshot(),
             },
-            "ws": { "clientCount": clients, "bufferedAmount": vec![0; clients] },
+            "ws": {
+                "clientCount": clients,
+                "bufferedAmount": vec![0; clients],
+                "clientsDropped": self.clients_dropped.load(Ordering::Relaxed),
+            },
             "memory": { "rss": rss, "heapUsed": rss, "heapTotal": rss, "external": 0, "arrayBuffers": 0 },
             "gc": {},
         })
     }
 }
 
-/// Resident set size in bytes, or 0 where `/proc` is missing (macOS).
+/// Resident set size in bytes (Linux, macOS, Windows), or 0 if unknown.
 fn rss_bytes() -> u64 {
-    std::fs::read_to_string("/proc/self/statm")
-        .ok()
-        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .map(|pages| pages * 4096)
+    memory_stats::memory_stats()
+        .map(|m| m.physical_mem as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every field `packages/aggregator/scripts/bench.ts` reads.
+    #[test]
+    fn snapshot_has_the_fields_bench_reads() {
+        let m = Metrics::new();
+        m.record_ingest(3);
+        m.push_many(3, Duration::from_micros(10));
+        m.record_fanout(3, 100, Duration::from_micros(20));
+        m.fanout_serialize.add(Duration::from_micros(5));
+        m.fanout_broadcast.add(Duration::from_micros(5));
+        let s = m.snapshot();
+        for path in [
+            "/uptimeSec",
+            "/events/ingested",
+            "/events/fannedOut",
+            "/events/bytesFannedOut",
+            "/pushMany/calls",
+            "/pushMany/totalEvents",
+            "/pushMany/avgBatchSize",
+            "/pushMany/maxBatchSize",
+            "/liveSeriesLength",
+            "/arrivalQueueLength",
+            "/latency/ingestToFanoutMs/p99",
+            "/latency/pushManyTotalMs/p99",
+            "/latency/fanoutSerializeMs/p99",
+            "/latency/fanoutBroadcastMs/p99",
+            "/ws/clientCount",
+            "/memory/heapUsed",
+            "/gc",
+        ] {
+            assert!(s.pointer(path).is_some(), "missing {path}");
+        }
+        assert!(s["memory"]["heapUsed"].as_u64().unwrap() > 0);
+        assert_eq!(s["events"]["fannedOut"], 3);
+    }
+
+    #[test]
+    fn percentiles_follow_node_rule() {
+        let h = Histogram::new();
+        for ms in 1..=10 {
+            h.add(Duration::from_millis(ms));
+        }
+        let s = h.snapshot();
+        // Node: sorted[min(n - 1, floor(n * p))] with n = 10.
+        assert_eq!(s["p50"], 6.0);
+        assert_eq!(s["p99"], 10.0);
+        assert_eq!(s["count"], 10);
+    }
 }
