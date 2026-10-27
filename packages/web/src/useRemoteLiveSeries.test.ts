@@ -68,7 +68,7 @@ describe('applyFrame', () => {
         type: 'snapshot',
         rows: [[1_700_000_000_000, null, null, 'api-x']],
       }),
-    ).toThrowError(/column 'cpu' is required/);
+    ).toThrowError(/\(cpu\) is required/);
     expect(live.length).toBe(0);
   });
 });
