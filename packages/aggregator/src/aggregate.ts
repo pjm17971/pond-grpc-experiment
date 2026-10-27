@@ -206,7 +206,7 @@ export function startAggregate(
     sampleStride > 1
       ? partitioned.sample({ stride: sampleStride })
       : partitioned;
-  const fused: LiveSource<SeriesSchema> = sampled.rolling(
+  const fused = sampled.rolling(
       {
         '1m': {
           cpu_avg: { from: 'cpu', using: 'avg' },
