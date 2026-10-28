@@ -10,25 +10,40 @@ avg/sum/count; `200ms`: cpu samples/min/max/avg/stdev;
 by host by hand, one small `LiveSeries` per host; its results are kept
 below for comparison.
 
-**Result: every row identical to Node (checked side by side), and
-about 5x Node's throughput with the full stats running: 233–239k
-rows/s against 43–51k.**
+**Result: every row identical to Node when both see the same events
+(checked side by side), and about 5x Node's throughput with the full
+stats running: 233–239k rows/s against 43–51k.**
 
 ## Same output as Node? (`scripts/compare-agg.ts`)
 
 Both aggregators subscribe to one producer (20 hosts × 50/s, 75 s), so
-they see the same events, and every `/live-agg` row is compared by
+they see the same events once both have joined (see below), and every `/live-agg` row is compared by
 `ts` and host. The 200 ms fields are compared from the start; the rest
 (1 m baseline, anomaly counts) only once both have run a full minute
 (65 s). `window_age_seconds` is left out; it counts from each
 aggregator's start.
 
-| Run                           | Rows identical | Of which whole rows | Different | `events_per_sec` ticks |
-| ----------------------------- | -------------- | ------------------- | --------- | ---------------------- |
-| partitions, stride 1          | 7,500 / 7,500  | 1,000               | 0         | 365 / 365              |
-| partitions, `SAMPLE_STRIDE=3` | 7,500 / 7,500  | 1,000               | 0         | 365 / 365              |
+Six runs at stride 1 (each 7,500 host rows, 375 ticks):
 
-No rows only on one side, same field order, no ticks missing in Rust.
+| Runs | Both started from the same producer event? | Rows identical | Rows differing beyond last-bit rounding | `events_per_sec` |
+| ---- | ------------------------------------------ | -------------- | --------------------------------------- | ---------------- |
+| 3    | yes                                        | 7,500 / 7,500  | 0                                       | 365 / 365        |
+| 3    | no (Rust joined the stream earlier)        | 7,164–7,244    | 0, 20, 20                               | 365 / 365        |
+
+Plus one run with `SAMPLE_STRIDE=3`: 7,500 / 7,500 identical. Every run:
+no rows only on one side, the same hosts in the same order in every
+tick, same field order, no ticks missing in Rust.
+
+When runs differ, the cause is the test setup, not the aggregators:
+each one subscribes to the producer separately, and sometimes Rust
+gets one or two producer ticks (20 ms each) before Node does. Its first
+`/live-agg` tick then holds those extra events (`n_current` 6 vs 5,
+`window_age_seconds` 0.097 vs 0.076): those are the 20 rows, one tick
+of 20 hosts. After that the only differences are in the last digits of
+`current_sd` and `cpu_sd` (within 1e-12 of each other): the rolling
+standard deviation keeps running sums, and an event that was added and
+later removed leaves slightly different rounding behind. `compare-agg`
+reports `sameFirstEvent` and counts the rounding-only rows separately.
 
 The hand-split version matched only the first host of each batch.
 Every other host held exactly one more event in Rust (in all 7,106

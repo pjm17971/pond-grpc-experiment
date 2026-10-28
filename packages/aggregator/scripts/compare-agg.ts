@@ -8,7 +8,10 @@
  * events. Fields from the 200 ms slice should match from the start;
  * the 1 m baseline fields only once both have run past one minute
  * (they started at slightly different times), so those are compared
- * for ticks after `--settle` seconds (default 65). `SAMPLE_STRIDE` in
+ * for ticks after `--settle` seconds (default 65). Each aggregator joins
+ * the producer stream on its own, so one can start a producer tick
+ * earlier: `sameFirstEvent` says whether that happened, and rows that
+ * differ only by last-bit rounding are counted apart. `SAMPLE_STRIDE` in
  * the environment reaches both aggregators.
  */
 import WebSocket from 'ws';
@@ -33,12 +36,16 @@ type Row = Record<string, unknown> & { ts: number; host: string };
 
 const nodeEps = new Map<number, number>();
 const rustEps = new Map<number, number>();
+// Host order within each tick's frame.
+const nodeOrder = new Map<number, string>();
+const rustOrder = new Map<number, string>();
 
 function collect(
   port: number,
   into: Map<string, Row>,
   frames: string[],
   eps: Map<number, number>,
+  order: Map<number, string>,
 ) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/live-agg`);
   ws.on('message', (data) => {
@@ -47,7 +54,10 @@ function collect(
     const msg = JSON.parse(text);
     if (msg.type === 'aggregate-append') {
       for (const r of msg.rows) into.set(`${r.ts}|${r.host}`, r);
-      if (msg.globals) eps.set(msg.globals.ts, msg.globals.events_per_sec);
+      if (msg.globals) {
+        eps.set(msg.globals.ts, msg.globals.events_per_sec);
+        order.set(msg.globals.ts, msg.rows.map((r: Row) => r.host).join(','));
+      }
     }
   });
   return ws;
@@ -76,8 +86,8 @@ const nodeRows = new Map<string, Row>();
 const rustRows = new Map<string, Row>();
 const nodeFrames: string[] = [];
 const rustFrames: string[] = [];
-const a = collect(nodePort, nodeRows, nodeFrames, nodeEps);
-const b = collect(rustPort, rustRows, rustFrames, rustEps);
+const a = collect(nodePort, nodeRows, nodeFrames, nodeEps, nodeOrder);
+const b = collect(rustPort, rustRows, rustFrames, rustEps, rustOrder);
 const start = Date.now();
 await new Promise((r) => setTimeout(r, seconds * 1000));
 a.close();
@@ -99,6 +109,13 @@ const allFields = (r: Row) =>
 let rowsSame = 0;
 let rowsSameWholeRow = 0;
 const rowsDiff: string[] = [];
+// Rows whose differing fields are all numbers within 1e-12 of each other
+// (relative): last-bit rounding, not a different count or value.
+let rowsDiffRoundingOnly = 0;
+const close = (x: unknown, y: unknown) =>
+  typeof x === 'number' &&
+  typeof y === 'number' &&
+  Math.abs(x - y) <= 1e-12 * Math.max(Math.abs(x), Math.abs(y));
 let onlyNode = 0;
 let onlyRust = 0;
 for (const [k, r] of nodeRows) {
@@ -111,9 +128,25 @@ for (const [k, r] of nodeRows) {
   if (same(r, t, fields)) {
     rowsSame++;
     if (r.ts >= settleTs) rowsSameWholeRow++;
-  } else
+  } else {
+    const differing = fields.filter(
+      (f) => JSON.stringify(r[f]) !== JSON.stringify(t[f]),
+    );
+    if (differing.every((f) => close(r[f], t[f]))) rowsDiffRoundingOnly++;
     rowsDiff.push(`${k}: node=${JSON.stringify(r)} rust=${JSON.stringify(t)}`);
+  }
 }
+// Did both aggregators start from the same producer event? Each one
+// joins the producer stream separately; if one joined a tick earlier it
+// holds an extra event, and the rolling sums' rounding then differs in
+// the last bits for as long as that history matters.
+const firstCommon = [...nodeRows.keys()]
+  .filter((k) => rustRows.has(k))
+  .sort()[0];
+const sameFirstEvent =
+  firstCommon !== undefined &&
+  nodeRows.get(firstCommon)!.window_age_seconds ===
+    rustRows.get(firstCommon)!.window_age_seconds;
 for (const k of rustRows.keys()) if (!nodeRows.has(k)) onlyRust++;
 // `events_per_sec` comes from one rolling on the whole series in both
 // (no partitions), so it should match once both have a full second.
@@ -130,6 +163,18 @@ for (const [ts, v] of nodeEps) {
   if (v === w) epsSame++;
   else epsDiff.push(`${ts}: node=${v} rust=${w}`);
 }
+let orderSame = 0;
+let orderDifferent = 0;
+for (const [ts, hosts] of nodeOrder) {
+  const other = rustOrder.get(ts);
+  if (other === undefined) continue;
+  if (other === hosts) orderSame++;
+  else orderDifferent++;
+}
+if (process.env.COMPARE_DUMP) {
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(process.env.COMPARE_DUMP, rowsDiff.join('\n'));
+}
 const firstWithRows = (fs: string[]) =>
   fs.find((f) => f.includes('"aggregate-append"') && f.includes('"host"'));
 const keyOrder = (f: string | undefined) =>
@@ -145,11 +190,14 @@ console.log(
       sameFieldOrder:
         keyOrder(firstWithRows(nodeFrames)) ===
         keyOrder(firstWithRows(rustFrames)),
+      hostOrderPerTick: { same: orderSame, different: orderDifferent },
       sampleStride: Number(process.env.SAMPLE_STRIDE ?? '1'),
+      sameFirstEvent,
       hostRows: {
         identical: rowsSame,
         identicalWholeRowAfterSettle: rowsSameWholeRow,
         different: rowsDiff.length,
+        differentOnlyInRounding: rowsDiffRoundingOnly,
         examples: rowsDiff.slice(0, 3),
       },
       eventsPerSec: {

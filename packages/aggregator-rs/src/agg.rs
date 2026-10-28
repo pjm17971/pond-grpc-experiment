@@ -450,13 +450,17 @@ mod tests {
             ..AggOptions::default()
         });
         agg.attach(&mut live).unwrap();
-        let times: Vec<i64> = (0..=20).map(|i| 1_000_000 + i * 50).collect();
+        let times: Vec<i64> = (1..=20).map(|i| 1_000_000 + i * 50).collect();
         let ticks = run(&mut agg, &mut live, &["api-1"], &times);
         let last = ticks.last().unwrap();
-        // 21 events, every 3rd kept: 7.
-        assert_eq!(last.rows[0].cpu_n, 7.0);
-        // Totals see every event.
-        assert_eq!(last.globals.events_ingested_total, 21);
+        // The rolling only sees kept events (the 3rd, 6th, … at 150,
+        // 300, …, 900), so a tick fires when a kept event crosses it, as
+        // in Node: the 800 tick fires at 900 and nothing reaches 1000.
+        // Keeping the 1st, 4th, … instead would fire it at 950 with 7.
+        assert_eq!(last.globals.ts, 1_000_800);
+        assert_eq!(last.rows[0].cpu_n, 6.0);
+        // Totals see every event pushed so far (18 by 900).
+        assert_eq!(last.globals.events_ingested_total, 18);
     }
 
     #[test]
