@@ -8,12 +8,19 @@
 //! The 30 s window behind `/live` is a pond-rs `LiveSeries` (R3 step 2),
 //! as the Node side keeps a pond-ts one: each gRPC batch is one
 //! `push_many`, and the root's `Batch` output becomes the append frame,
-//! as Node's `live.on('batch')` does. `/live-agg` (per-host rolling stats
-//! every 200 ms) follows pond-rs R3 steps 4 to 6.
+//! as Node's `live.on('batch')` does.
+//!
+//! `/live-agg` sends per-host rolling stats every 200 ms (`agg.rs`), with
+//! a 5-minute snapshot on connect and a per-client top-N cut
+//! (`agg_wire.rs`), as `packages/aggregator/src/aggregate.ts` and
+//! `server.ts` do.
 //!
 //! Env: `AGGREGATOR_PORT` (default 8080), `PRODUCER_URL` (default
-//! `127.0.0.1:50051`).
+//! `127.0.0.1:50051`), `SAMPLE_STRIDE` (default 1: per host, keep every
+//! Nth event for the rolling stats).
 
+mod agg;
+mod agg_wire;
 mod metrics;
 mod wire;
 
@@ -21,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{RawQuery, State};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -41,6 +48,15 @@ const CLIENT_QUEUE_FRAMES: usize = 1024;
 
 struct Inner {
     live: LiveSeries,
+    agg: agg::Aggregate,
+}
+
+/// One `/live-agg` tick: the rows (each client cuts its own top N) and
+/// the frame for a client that takes them all, written once.
+struct AggTick {
+    rows: Vec<agg_wire::HostTick>,
+    globals: agg_wire::GlobalsTick,
+    full_frame: Arc<str>,
 }
 
 /// `packages/shared/src/schema.ts`, with the Node aggregator's
@@ -65,6 +81,7 @@ fn new_live() -> LiveSeries {
 struct App {
     inner: Mutex<Inner>,
     frames: broadcast::Sender<Arc<str>>,
+    agg_ticks: broadcast::Sender<Arc<AggTick>>,
     metrics: Metrics,
 }
 
@@ -76,10 +93,25 @@ async fn main() {
         .unwrap_or(8080);
     let producer = std::env::var("PRODUCER_URL").unwrap_or_else(|_| "127.0.0.1:50051".to_string());
 
+    let sample_stride: u64 = std::env::var("SAMPLE_STRIDE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .map(|v| v.floor().max(1.0) as u64)
+        .unwrap_or(1);
+
     let (frames, _) = broadcast::channel(CLIENT_QUEUE_FRAMES);
+    let (agg_ticks, _) = broadcast::channel(CLIENT_QUEUE_FRAMES);
+    let mut live = new_live();
+    let mut agg = agg::Aggregate::new(agg::AggOptions {
+        sample_stride,
+        ..agg::AggOptions::default()
+    });
+    agg.attach(&mut live).expect("aggregate pipeline");
     let app = Arc::new(App {
-        inner: Mutex::new(Inner { live: new_live() }),
+        inner: Mutex::new(Inner { live, agg }),
         frames,
+        agg_ticks,
         metrics: Metrics::new(),
     });
 
@@ -92,12 +124,15 @@ async fn main() {
         )
         .route("/metrics", get(metrics_handler))
         .route("/live", get(live_handler))
+        .route("/live-agg", get(live_agg_handler))
         .with_state(app);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .expect("bind aggregator port");
-    println!("aggregator listening on :{port} (producer={producer}, impl=rust)");
+    println!(
+        "aggregator listening on :{port} (producer={producer}, sampleStride={sample_stride}, impl=rust)"
+    );
     axum::serve(listener, router)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -167,7 +202,10 @@ fn on_batch(app: &App, batch: proto::EventBatch) {
     app.metrics.record_ingest(n);
 
     let started = Instant::now();
-    // Build the rows before taking the lock.
+    let mut requests_sum = 0.0;
+    for e in &batch.events {
+        requests_sum += e.requests as f64;
+    }
     let rows: Vec<(i64, Vec<Option<Value>>)> = batch
         .events
         .into_iter()
@@ -181,7 +219,8 @@ fn on_batch(app: &App, batch: proto::EventBatch) {
         })
         .collect();
     let frame = {
-        let mut inner = app.inner.lock().unwrap();
+        let mut guard = app.inner.lock().unwrap();
+        let inner = &mut *guard;
         let out = match inner.live.push_many(rows) {
             Ok(out) => out,
             Err(e) => {
@@ -195,24 +234,47 @@ fn on_batch(app: &App, batch: proto::EventBatch) {
                 return;
             }
         };
-        let Some(Output::Batch { events, .. }) =
-            out.into_iter().find(|o| o.kind() == OutputKind::Batch)
-        else {
-            return;
-        };
-        let ser = Instant::now();
-        let frame: Arc<str> = wire::append_frame(&events).into();
-        app.metrics.fanout_serialize.add(ser.elapsed());
+        inner.agg.observe_main(&out);
+        inner.agg.add_requests(requests_sum);
+        let root = inner.live.root();
+        let events = out.into_iter().find_map(|o| match o {
+            Output::Batch { node, events } if node == root => Some(events),
+            _ => None,
+        });
+        let frame = events.map(|events| {
+            let ser = Instant::now();
+            let frame: Arc<str> = wire::append_frame(&events).into();
+            app.metrics.fanout_serialize.add(ser.elapsed());
+            frame
+        });
         app.metrics.set_window_len(inner.live.len());
+
+        // Per-host rolling stats (read from `out` above); any tick this
+        // batch completed goes out.
+        let ticks = inner.agg.drain_ticks();
+        for tick in ticks {
+            let full_frame: Arc<str> =
+                agg_wire::append_frame(tick.rows.iter(), &tick.globals).into();
+            let _ = app.agg_ticks.send(Arc::new(AggTick {
+                rows: tick.rows,
+                globals: tick.globals,
+                full_frame,
+            }));
+        }
+
         // Send while holding the lock, so a client taking a snapshot
         // sees each batch either in the snapshot or as an append.
-        let bc = Instant::now();
-        let _ = app.frames.send(frame.clone());
-        app.metrics.fanout_broadcast.add(bc.elapsed());
+        if let Some(frame) = &frame {
+            let bc = Instant::now();
+            let _ = app.frames.send(frame.clone());
+            app.metrics.fanout_broadcast.add(bc.elapsed());
+        }
         frame
     };
     app.metrics.push_many(n, started.elapsed());
-    app.metrics.record_fanout(n, frame.len(), arrived.elapsed());
+    if let Some(frame) = frame {
+        app.metrics.record_fanout(n, frame.len(), arrived.elapsed());
+    }
 }
 
 async fn live_handler(ws: WebSocketUpgrade, State(app): State<Arc<App>>) -> impl IntoResponse {
@@ -250,6 +312,77 @@ async fn live_client(mut socket: WebSocket, app: Arc<App>) {
                     _ => {}
                 },
             }
+        }
+    }
+    app.metrics.client_disconnected();
+}
+
+async fn live_agg_handler(
+    ws: WebSocketUpgrade,
+    RawQuery(query): RawQuery,
+    State(app): State<Arc<App>>,
+) -> impl IntoResponse {
+    let prefs = agg_wire::parse_connect_query(query.as_deref());
+    ws.on_upgrade(move |socket| live_agg_client(socket, app, prefs))
+}
+
+/// One `/live-agg` client, as Node's `wss.on('connection')` branch: the
+/// history snapshot cut to the client's top N, then each tick cut the
+/// same way, and `set-top-n` control messages.
+async fn live_agg_client(mut socket: WebSocket, app: Arc<App>, mut prefs: agg_wire::ClientPrefs) {
+    let (snapshot, history_len, mut rx) = {
+        let inner = app.inner.lock().unwrap();
+        let (rows, globals) = inner.agg.history();
+        let projected = agg_wire::project_history(&rows, &mut prefs);
+        (
+            agg_wire::snapshot_frame(&agg::THRESHOLDS, &projected, &globals),
+            rows.len(),
+            app.agg_ticks.subscribe(),
+        )
+    };
+    if socket.send(Message::Text(snapshot)).await.is_err() {
+        return;
+    }
+    app.metrics.client_connected();
+    loop {
+        tokio::select! {
+            tick = rx.recv() => match tick {
+                Ok(t) => {
+                    let frame = match agg_wire::project(&t.rows, &mut prefs) {
+                        None => t.full_frame.to_string(),
+                        Some(kept) => agg_wire::append_frame(kept.into_iter(), &t.globals),
+                    };
+                    if socket.send(Message::Text(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    eprintln!("/live-agg client {missed} ticks behind; disconnecting");
+                    app.metrics.client_dropped();
+                    break;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            msg = socket.recv() => match msg {
+                // Node clamps n against the snapshot's row count (or 1000).
+                // Node reads text and binary frames alike.
+                Some(Ok(msg @ (Message::Text(_) | Message::Binary(_)))) => {
+                    let text = match msg {
+                        Message::Text(t) => t,
+                        Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+                        _ => unreachable!(),
+                    };
+                    if let Some((top_n, by)) = agg_wire::parse_control(&text, history_len) {
+                        prefs.top_n = top_n;
+                        if let Some(by) = by {
+                            prefs.rank_by = by;
+                        }
+                        prefs.last_top_hosts = None;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                _ => {}
+            },
         }
     }
     app.metrics.client_disconnected();

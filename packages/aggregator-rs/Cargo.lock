@@ -1194,7 +1194,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 [[package]]
 name = "pond-rs"
 version = "0.0.0"
-source = "git+https://github.com/pond-ts/pond?rev=99934b2cffef520925bcb37b496d3beb9dbe6204#99934b2cffef520925bcb37b496d3beb9dbe6204"
+source = "git+https://github.com/pond-ts/pond?rev=db9fe1a59d7cf05d27d0c25eb7d9d0fb351d8e44#db9fe1a59d7cf05d27d0c25eb7d9d0fb351d8e44"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -1204,6 +1204,8 @@ dependencies = [
  "icu_collator",
  "jiff",
  "jiff-tzdb",
+ "num-bigint",
+ "num-traits",
  "rayon",
  "serde",
  "serde_json",

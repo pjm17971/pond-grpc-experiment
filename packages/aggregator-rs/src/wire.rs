@@ -29,7 +29,7 @@ fn push_row(out: &mut String, e: &LiveEvent) {
 }
 
 /// JSON has no NaN/Infinity; pond-ts `toJsonRow` writes a gap as `null`.
-fn push_number(out: &mut String, v: f64) {
+pub(crate) fn push_number(out: &mut String, v: f64) {
     if v.is_finite() {
         // `{}` on f64 prints the shortest text that reads back exactly,
         // like JS `String(number)` for ordinary values (3.0 prints `3`).
