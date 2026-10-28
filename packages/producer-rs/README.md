@@ -23,6 +23,10 @@ Not like Node, on purpose:
 - With no subscriber connected the simulator does not run (Node runs
   it anyway and throws the batches away); its once-a-second walk
   restarts when a subscriber arrives, so an idle gap doesn't show.
-- Each subscriber has an unbounded queue, like Node's `call.write`: a
-  subscriber slower than the producer makes it grow here.
+- Subscribers read from one shared queue of 64 batches (a tokio
+  broadcast channel) instead of each getting its own. As in Node, a
+  subscriber more than 64 batches behind loses its oldest batches
+  (counted in `/metrics` when `METRICS_PORT` is set). Unlike Node, a
+  stalled subscriber's drops are counted when it next reads, not as
+  they happen.
 - `EVENTS_PER_SEC` of 0 or less is refused at start.

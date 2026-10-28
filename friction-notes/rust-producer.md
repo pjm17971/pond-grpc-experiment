@@ -31,7 +31,10 @@ The Rust → Node row (51k against a 1M target) is the Node aggregator's
 limit, not the producer's: it falls behind and a backlog builds up in
 the producer's per-subscriber queue, which is unbounded (as Node's
 `call.write` ignores backpressure). Producer memory isn't measured by
-the bench, so that backlog doesn't show in the table.
+the bench, so that backlog doesn't show in the table. (Since fixed:
+both producers now keep at most 64 batches per subscriber and count
+what they drop; `bench:dev` shows it as `Dropped/s`. See
+`producer-backpressure.md`.)
 
 ## Where the Rust aggregator now spends its time
 

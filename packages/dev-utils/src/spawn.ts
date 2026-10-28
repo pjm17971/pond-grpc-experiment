@@ -145,6 +145,11 @@ export type ProducerOptions = {
    * there first). Defaults to the `PRODUCER_IMPL` env var.
    */
   impl?: 'node' | 'rust';
+  /**
+   * Serve `GET /metrics` (produced and dropped batches/rows) on this
+   * port. Omitted: no metrics server.
+   */
+  metricsPort?: number;
 };
 
 export async function spawnProducer(
@@ -156,6 +161,9 @@ export async function spawnProducer(
     HOST_COUNT: String(opts.hostCount ?? 4),
     VARIABILITY: String(opts.variability ?? 0.4),
   };
+  if (opts.metricsPort !== undefined) {
+    env.METRICS_PORT = String(opts.metricsPort);
+  }
   const impl =
     opts.impl ?? (process.env.PRODUCER_IMPL === 'rust' ? 'rust' : 'node');
   const rustBin = resolvePath(

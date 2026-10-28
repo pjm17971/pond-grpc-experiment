@@ -1,3 +1,4 @@
+import { createServer } from 'node:http';
 import type { EventBatch } from '@pond-experiment/shared/grpc';
 import { startSimulator } from './simulator.js';
 import { startGrpcServer } from './grpc.js';
@@ -6,6 +7,20 @@ const PORT = Number(process.env.GRPC_PORT ?? '50051');
 const EVENTS_PER_SEC = Number(process.env.EVENTS_PER_SEC ?? '2');
 const HOST_COUNT = Number(process.env.HOST_COUNT ?? '4');
 const VARIABILITY = Number(process.env.VARIABILITY ?? '0.4');
+// Unset: no metrics server. Set: `GET /metrics` returns the counters
+// below as JSON (same shape as the Rust producer).
+const METRICS_PORT = process.env.METRICS_PORT;
+const QUEUE_BATCHES = 64;
+
+const counters = {
+  batchesProduced: 0,
+  rowsProduced: 0,
+  // Summed over subscribers: a batch dropped for two slow subscribers
+  // counts twice.
+  droppedBatches: 0,
+  droppedRows: 0,
+};
+const startedAt = Date.now();
 
 // One subscriber per open Subscribe stream. The simulator emits one
 // EventBatch per tick to every subscriber; subscribers close
@@ -20,12 +35,19 @@ const stopSimulator = startSimulator(
     variability: VARIABILITY,
   },
   (batch) => {
+    counters.batchesProduced++;
+    counters.rowsProduced += batch.events.length;
     for (const write of subscribers) write(batch);
   },
 );
 
 const server = await startGrpcServer({
   port: PORT,
+  queueBatches: QUEUE_BATCHES,
+  onDrop: (batch) => {
+    counters.droppedBatches++;
+    counters.droppedRows += batch.events.length;
+  },
   onSubscribe: (write) => {
     subscribers.add(write);
     return () => {
@@ -33,6 +55,24 @@ const server = await startGrpcServer({
     };
   },
 });
+
+if (METRICS_PORT !== undefined) {
+  const metrics = createServer((_req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(
+      JSON.stringify({
+        uptimeSec: (Date.now() - startedAt) / 1000,
+        subscribers: subscribers.size,
+        queueBatches: QUEUE_BATCHES,
+        ...counters,
+      }),
+    );
+  });
+  await new Promise<void>((resolve, reject) => {
+    metrics.once('error', reject);
+    metrics.listen(Number(METRICS_PORT), resolve);
+  });
+}
 
 console.log(
   `producer listening on :${PORT} (events=${EVENTS_PER_SEC}/s, hosts=${HOST_COUNT}, variability=±${VARIABILITY})`,
