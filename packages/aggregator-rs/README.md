@@ -12,9 +12,11 @@ cd packages/aggregator-rs && cargo build --release
 AGGREGATOR_IMPL=rust pnpm --filter @pond-experiment/aggregator bench:dev --P=1000 --N=1000 --seconds=20
 ```
 
-Status: **shell only.** `/live` (raw snapshot + appends), `/health`,
-`/metrics`. The 30 s window behind the snapshot is a `VecDeque`, to be
-replaced by a pond-rs `LiveSeries` when pond-rs R3 step 2 lands.
+Status: `/live` (raw snapshot + appends), `/health`, `/metrics`. The
+30 s window behind `/live` is a pond-rs `LiveSeries` (R3 step 2, pinned
+by git rev in `Cargo.toml`): one `push_many` per gRPC batch, and the
+root's `Batch` output becomes the append frame. Measured against the
+earlier plain-queue window in `friction-notes/pond-rs-live-window.md`.
 `/live-agg` (per-host rolling stats every 200 ms) is not built; it needs
 R3 steps 4-6 (rolling, triggers, partitions).
 

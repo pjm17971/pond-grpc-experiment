@@ -5,10 +5,11 @@
 //! snapshot frame then append frames (`packages/shared/src/wire.ts`),
 //! plus `/health` and `/metrics` in the shape the bench scripts read.
 //!
-//! This is the shell. The 30 s window behind the `/live` snapshot is a
-//! plain `VecDeque` for now; it becomes a pond-rs `LiveSeries` when
-//! pond-rs's live layer lands (R3 step 2), and `/live-agg` (per-host
-//! rolling stats every 200 ms) follows R3 steps 4 to 6.
+//! The 30 s window behind `/live` is a pond-rs `LiveSeries` (R3 step 2),
+//! as the Node side keeps a pond-ts one: each gRPC batch is one
+//! `push_many`, and the root's `Batch` output becomes the append frame,
+//! as Node's `live.on('batch')` does. `/live-agg` (per-host rolling stats
+//! every 200 ms) follows pond-rs R3 steps 4 to 6.
 //!
 //! Env: `AGGREGATOR_PORT` (default 8080), `PRODUCER_URL` (default
 //! `127.0.0.1:50051`).
@@ -16,7 +17,6 @@
 mod metrics;
 mod wire;
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,20 +28,38 @@ use axum::{Json, Router};
 use tokio::sync::broadcast;
 
 use metrics::Metrics;
-use wire::Row;
+use pond_rs::live::{LiveOptions, LiveSeries, Output, OutputKind};
+use pond_rs::{ColumnDef, ColumnKind, Value};
 
 pub mod proto {
     tonic::include_proto!("pond.experiment.v1");
 }
 
-/// Matches the Node aggregator's `retention: { maxAge: '30s' }`.
-const RETENTION_MS: i64 = 30_000;
 /// Append frames a slow `/live` client may fall behind by before it
 /// is disconnected. The Node aggregator has no limit (M4 never ran).
 const CLIENT_QUEUE_FRAMES: usize = 1024;
 
 struct Inner {
-    rows: VecDeque<Row>,
+    live: LiveSeries,
+}
+
+/// `packages/shared/src/schema.ts`, with the Node aggregator's
+/// `retention: { maxAge: '30s' }` and default strict ordering.
+fn new_live() -> LiveSeries {
+    let mut live = LiveSeries::with_options(
+        "metrics",
+        vec![
+            ColumnDef::required("time", ColumnKind::Time),
+            ColumnDef::required("cpu", ColumnKind::Number),
+            ColumnDef::required("requests", ColumnKind::Number),
+            ColumnDef::required("host", ColumnKind::String),
+        ],
+        LiveOptions::new().max_age("30s"),
+    )
+    .expect("schema");
+    let root = live.root();
+    live.watch(root, OutputKind::Batch).expect("watch root");
+    live
 }
 
 struct App {
@@ -61,9 +79,7 @@ async fn main() {
 
     let (frames, _) = broadcast::channel(CLIENT_QUEUE_FRAMES);
     let app = Arc::new(App {
-        inner: Mutex::new(Inner {
-            rows: VecDeque::new(),
-        }),
+        inner: Mutex::new(Inner { live: new_live() }),
         frames,
         metrics: Metrics::new(),
     });
@@ -149,22 +165,33 @@ fn on_batch(app: &App, batch: proto::EventBatch) {
     app.metrics.record_ingest(n);
 
     let started = Instant::now();
-    let rows: Vec<Row> = batch.events.into_iter().map(Row::from).collect();
+    let rows = batch.events.into_iter().map(|e| {
+        let values: Vec<Option<Value>> = vec![
+            Some(Value::Number(e.cpu)),
+            Some(Value::Number(e.requests as f64)),
+            Some(Value::String(e.host)),
+        ];
+        (e.time_ms, values)
+    });
     let frame = {
         let mut inner = app.inner.lock().unwrap();
+        let out = match inner.live.push_many(rows) {
+            Ok(out) => out,
+            Err(e) => {
+                // Strict ordering refuses the whole batch, as pond-ts.
+                eprintln!("push_many refused a batch of {n}: {e}");
+                return;
+            }
+        };
+        let Some(Output::Batch { events, .. }) =
+            out.into_iter().find(|o| o.kind() == OutputKind::Batch)
+        else {
+            return;
+        };
         let ser = Instant::now();
-        let frame: Arc<str> = wire::append_frame(&rows).into();
+        let frame: Arc<str> = wire::append_frame(&events).into();
         app.metrics.fanout_serialize.add(ser.elapsed());
-        let latest = rows.last().map(|r| r.time_ms).unwrap_or(i64::MIN);
-        inner.rows.extend(rows);
-        while inner
-            .rows
-            .front()
-            .is_some_and(|r| r.time_ms < latest - RETENTION_MS)
-        {
-            inner.rows.pop_front();
-        }
-        app.metrics.set_window_len(inner.rows.len());
+        app.metrics.set_window_len(inner.live.len());
         // Send while holding the lock, so a client taking a snapshot
         // sees each batch either in the snapshot or as an append.
         let bc = Instant::now();
@@ -183,7 +210,7 @@ async fn live_handler(ws: WebSocketUpgrade, State(app): State<Arc<App>>) -> impl
 async fn live_client(mut socket: WebSocket, app: Arc<App>) {
     let (snapshot, mut rx) = {
         let inner = app.inner.lock().unwrap();
-        (wire::snapshot_frame(inner.rows.iter()), app.frames.subscribe())
+        (wire::snapshot_frame(inner.live.events()), app.frames.subscribe())
     };
     app.metrics.client_connected();
     if socket.send(Message::Text(snapshot)).await.is_ok() {
