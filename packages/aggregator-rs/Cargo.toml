@@ -14,8 +14,8 @@ futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 memory-stats = "1"
-# pond-rs live layer (R3 step 2, pond-ts/pond #839). Pinned; bump as R3 lands.
-pond-rs = { git = "https://github.com/pond-ts/pond", rev = "379244274aa6187f6e104e5541027de5d9034708" }
+# pond-rs live layer (R3 step 2 #839 + column storage #842). Pinned; bump as R3 lands.
+pond-rs = { git = "https://github.com/pond-ts/pond", rev = "99934b2cffef520925bcb37b496d3beb9dbe6204" }
 
 [build-dependencies]
 tonic-build = "0.12"

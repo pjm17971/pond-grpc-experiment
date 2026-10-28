@@ -13,7 +13,7 @@ AGGREGATOR_IMPL=rust pnpm --filter @pond-experiment/aggregator bench:dev --P=100
 ```
 
 Status: `/live` (raw snapshot + appends), `/health`, `/metrics`. The
-30 s window behind `/live` is a pond-rs `LiveSeries` (R3 step 2, pinned
+30 s window behind `/live` is a pond-rs `LiveSeries` (R3 step 2 + column storage #842, pinned
 by git rev in `Cargo.toml`): one `push_many` per gRPC batch, and the
 root's `Batch` output becomes the append frame. Measured against the
 earlier plain-queue window in `friction-notes/pond-rs-live-window.md`.

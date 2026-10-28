@@ -50,6 +50,27 @@ pond-rs #839 already notes a column store as the fix for its
 `push_many` cost; this is the same cause showing up as memory. Passed to
 the pond-rs live-layer thread as friction.
 
+## Update: column storage (pond-ts/pond #842)
+
+pond-rs fixed the memory finding in #842 (live events stored by column).
+This PR now pins that rev (`99934b2`). The one API change was that
+`events()` now gives owned events, so `wire::snapshot_frame` takes them
+by value. Re-run, all three alternated in one batch (20 s each):
+
+| Load        | Window       | Achieved/s        | pushMany p99 ms | RSS peak         |
+| ----------- | ------------ | ----------------- | --------------- | ---------------- |
+| 100 × 1000  | VecDeque     | 86,084 / 87,464   | 0.43 / 0.09     | 189 / 173 MB     |
+| 100 × 1000  | pond-rs #839 | 86,890 / 85,926   | 1.30 / 1.60     | 729 / 633 MB     |
+| 100 × 1000  | pond-rs #842 | 85,812 / 85,627   | 0.21 / 0.18     | 171 / 170 MB     |
+| 1000 × 1000 | VecDeque     | 372,957 / 365,590 | 4.90 / 3.49     | 727 / 704 MB     |
+| 1000 × 1000 | pond-rs #839 | 318,316 / 335,784 | 8.21 / 9.24     | 2,400 / 2,503 MB |
+| 1000 × 1000 | pond-rs #842 | 387,994 / 374,094 | 4.05 / 4.53     | 755 / 735 MB     |
+
+**With #842 the pond-rs window costs about the same as the plain
+queue:** memory within 5%, batch p99 inside the queue's own run-to-run
+spread, throughput the same (producer-bound). The tables above this
+section describe #839 and are kept as the record of the finding.
+
 ## Behaviour change: bad batches
 
 The queue wrote a non-finite `cpu` as `null`. The `LiveSeries` has

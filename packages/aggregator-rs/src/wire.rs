@@ -4,6 +4,7 @@
 //! form). Written as text directly; building a `serde_json::Value` tree
 //! per frame is slower.
 
+use std::borrow::Borrow;
 use std::fmt::Write;
 
 use pond_rs::live::LiveEvent;
@@ -38,7 +39,7 @@ fn push_number(out: &mut String, v: f64) {
     }
 }
 
-fn frame<'a>(kind: &str, rows: impl Iterator<Item = &'a LiveEvent>, hint: usize) -> String {
+fn frame<E: Borrow<LiveEvent>>(kind: &str, rows: impl Iterator<Item = E>, hint: usize) -> String {
     let mut out = String::with_capacity(32 + hint * 48);
     out.push_str("{\"type\":\"");
     out.push_str(kind);
@@ -47,7 +48,7 @@ fn frame<'a>(kind: &str, rows: impl Iterator<Item = &'a LiveEvent>, hint: usize)
         if i > 0 {
             out.push(',');
         }
-        push_row(&mut out, r);
+        push_row(&mut out, r.borrow());
     }
     out.push_str("]}");
     out
@@ -57,7 +58,9 @@ pub fn append_frame(rows: &[LiveEvent]) -> String {
     frame("append", rows.iter(), rows.len())
 }
 
-pub fn snapshot_frame<'a>(rows: impl ExactSizeIterator<Item = &'a LiveEvent>) -> String {
+/// Takes owned events: pond-rs `LiveSeries::events()` builds each one
+/// from its column store.
+pub fn snapshot_frame(rows: impl ExactSizeIterator<Item = LiveEvent>) -> String {
     let n = rows.len();
     frame("snapshot", rows, n)
 }
@@ -134,7 +137,7 @@ mod tests {
     fn empty_snapshot() {
         let rows: Vec<LiveEvent> = vec![];
         assert_eq!(
-            snapshot_frame(rows.iter()),
+            snapshot_frame(rows.into_iter()),
             "{\"type\":\"snapshot\",\"rows\":[]}"
         );
     }
