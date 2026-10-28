@@ -16,7 +16,10 @@
 //!   and also cannot go below 1 ms (so Node caps at 1000 ticks/s).
 //! - The simulator runs once per tick and each subscriber gets a copy
 //!   through its own unbounded queue, like Node's `call.write` with
-//!   backpressure ignored.
+//!   backpressure ignored. A subscriber slower than the producer (the
+//!   Node aggregator at high load) makes that queue grow here.
+//! - With nobody subscribed the simulator does not run; its walk clock
+//!   restarts when a subscriber arrives (`Simulator::resume`).
 
 mod sim;
 
@@ -24,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::{TcpListenerStream, UnboundedReceiverStream};
 use tonic::{Request, Response, Status};
 
 pub mod proto {
@@ -72,6 +75,10 @@ fn now_ms() -> i64 {
 async fn main() {
     let port: u16 = env("GRPC_PORT", 50051);
     let events_per_sec: f64 = env("EVENTS_PER_SEC", 2.0);
+    if !(events_per_sec.is_finite() && events_per_sec > 0.0) {
+        eprintln!("EVENTS_PER_SEC must be a number above 0, got {events_per_sec}");
+        std::process::exit(2);
+    }
     let host_count: usize = env("HOST_COUNT", 4);
     let variability: f64 = env("VARIABILITY", 0.4);
 
@@ -83,10 +90,18 @@ async fn main() {
         variability,
     ));
 
-    let addr = ([0, 0, 0, 0], port).into();
+    // Bind first, so the ready line below means the port is ours (as
+    // Node prints only after `bindAsync` succeeds).
+    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("bind :{port} failed: {e}");
+            std::process::exit(1);
+        }
+    };
     let server = tonic::transport::Server::builder()
         .add_service(ProducerServer::new(Service { subscribers }))
-        .serve_with_shutdown(addr, async {
+        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
             let _ = tokio::signal::ctrl_c().await;
         });
     // Same ready line the Node producer prints (dev-utils waits for it).
@@ -110,15 +125,24 @@ async fn run_simulator(
     let mut every = tokio::time::interval(Duration::from_secs_f64(1.0 / events_per_sec));
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
     every.tick().await; // the first tick fires at once; Node's first is one period in
+    let mut idle = true;
     loop {
         every.tick().await;
         let mut list = subs.lock().unwrap();
-        if list.is_empty() {
-            continue; // Node also runs the simulator with nobody listening; skipping is cheaper and invisible
-        }
-        let batch = sim.tick(now_ms());
         // Drop subscribers whose stream has closed.
         list.retain(|tx| !tx.is_closed());
+        if list.is_empty() {
+            // Node runs the simulator with nobody listening; skipping it
+            // saves the CPU, and `resume` below hides the gap.
+            idle = true;
+            continue;
+        }
+        let now = now_ms();
+        if idle {
+            sim.resume(now);
+            idle = false;
+        }
+        let batch = sim.tick(now);
         if let Some((last, rest)) = list.split_last() {
             for tx in rest {
                 let _ = tx.send(Ok(batch.clone()));

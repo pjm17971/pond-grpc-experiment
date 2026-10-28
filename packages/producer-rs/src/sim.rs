@@ -60,6 +60,15 @@ impl Simulator {
         }
     }
 
+    /// Restart the once-a-second walk clock at `now_ms`. Called when a
+    /// subscriber arrives after an idle stretch (the simulator does not
+    /// run with nobody listening), so the first tick does not treat the
+    /// whole gap as elapsed walk time (a huge step, and a burst on every
+    /// host at once).
+    pub fn resume(&mut self, now_ms: i64) {
+        self.last_walk_ms = now_ms;
+    }
+
     /// One tick: one event per host, all stamped `now_ms`.
     pub fn tick(&mut self, now_ms: i64) -> EventBatch {
         let n = self.hosts.len();
@@ -128,6 +137,20 @@ mod tests {
         let n = 20_000;
         let sum: f64 = (0..n).map(|_| s.tick(0).events[0].cpu).sum();
         assert!((sum / n as f64 - 0.55).abs() < 0.01, "{}", sum / n as f64);
+    }
+
+    #[test]
+    fn resume_after_idle_does_not_burst_every_host() {
+        // Without `resume`, a 100 s gap makes the burst chance 0.02 * 100
+        // = 2, so every host would start a burst on the first tick.
+        let mut s = Simulator::new(1000, 0.4, 0, 11);
+        s.resume(100_000);
+        s.tick(100_000);
+        assert!(s.burst_end_ms.iter().all(|&t| t == 0));
+        // A real second later the walk steps as usual: ~2% of hosts burst.
+        s.tick(101_000);
+        let bursting = s.burst_end_ms.iter().filter(|&&t| t > 0).count();
+        assert!((5..=50).contains(&bursting), "{bursting}");
     }
 
     #[test]

@@ -21,4 +21,8 @@ Not like Node, on purpose:
 - Random numbers come from a small xorshift, not `Math.random`: same
   distributions, different values.
 - With no subscriber connected the simulator does not run (Node runs
-  it anyway and throws the batches away).
+  it anyway and throws the batches away); its once-a-second walk
+  restarts when a subscriber arrives, so an idle gap doesn't show.
+- Each subscriber has an unbounded queue, like Node's `call.write`: a
+  subscriber slower than the producer makes it grow here.
+- `EVENTS_PER_SEC` of 0 or less is refused at start.

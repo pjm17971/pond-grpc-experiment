@@ -23,8 +23,15 @@ thread plus gRPC), Rust aggregator ~50%. So the Node producer set the
 | Node     | Node       | 1000 × 1000  | 43,479            | 32.47           | 1,087 MB         |
 | Rust     | Node       | 1000 × 1000  | 51,197            | 224.67          | 1,157 MB         |
 
-Rust aggregator memory grows with rows held: the 30 s window holds
-~19M rows at 650k/s (~70 bytes per row over the whole process).
+Rust aggregator memory grows with rows held. A run is a 5 s warm-up
+plus 20 s, so the 30 s window never fills: at ~650k/s it holds up to
+~16M rows, about 85 bytes per row over the whole process.
+
+The Rust → Node row (51k against a 1M target) is the Node aggregator's
+limit, not the producer's: it falls behind and a backlog builds up in
+the producer's per-subscriber queue, which is unbounded (as Node's
+`call.write` ignores backpressure). Producer memory isn't measured by
+the bench, so that backlog doesn't show in the table.
 
 ## Where the Rust aggregator now spends its time
 
