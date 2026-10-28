@@ -8,7 +8,8 @@
  * events. Fields from the 200 ms slice should match from the start;
  * the 1 m baseline fields only once both have run past one minute
  * (they started at slightly different times), so those are compared
- * for ticks after `--settle` seconds (default 65).
+ * for ticks after `--settle` seconds (default 65). `SAMPLE_STRIDE` in
+ * the environment reaches both aggregators.
  */
 import WebSocket from 'ws';
 import {
@@ -93,17 +94,11 @@ const same = (r: Row, t: Row, fields: string[]) =>
 const allFields = (r: Row) =>
   Object.keys(r).filter((f) => f !== 'window_age_seconds');
 
-// The first host of each producer batch: Node's partitions all emit when
-// this host's event crosses a tick, so its row is built at the same
-// moment in both. Expect identical rows: the 200 ms slice fields from
-// the start, every field once both have a full minute.
-const firstHost = 'api-1';
-let firstSame = 0;
-let firstSameWholeRow = 0;
-const firstDiff: string[] = [];
-// Other hosts: Node emits them before their own crossing event arrives;
-// pond-rs (split by hand) after. Count Rust minus Node `n_current`.
-const otherOffset: Record<string, number> = {};
+// Every row should be identical: the 200 ms slice fields from the
+// start, every field once both have a full minute.
+let rowsSame = 0;
+let rowsSameWholeRow = 0;
+const rowsDiff: string[] = [];
 let onlyNode = 0;
 let onlyRust = 0;
 for (const [k, r] of nodeRows) {
@@ -112,23 +107,12 @@ for (const [k, r] of nodeRows) {
     onlyNode++;
     continue;
   }
-  if (r.host === firstHost) {
-    const fields = r.ts >= settleTs ? allFields(r) : slice;
-    if (same(r, t, fields)) {
-      firstSame++;
-      if (r.ts >= settleTs) firstSameWholeRow++;
-    } else
-      firstDiff.push(
-        `${k}: node=${JSON.stringify(r)} rust=${JSON.stringify(t)}`,
-      );
-  } else {
-    // The 200 ms slice from the start; the 1 m count once settled.
-    let d = `slice ${(t.n_current as number) - (r.n_current as number)}`;
-    if (r.ts >= settleTs) {
-      d += `, 1m ${(t.cpu_n as number) - (r.cpu_n as number)}`;
-    }
-    otherOffset[d] = (otherOffset[d] ?? 0) + 1;
-  }
+  const fields = r.ts >= settleTs ? allFields(r) : slice;
+  if (same(r, t, fields)) {
+    rowsSame++;
+    if (r.ts >= settleTs) rowsSameWholeRow++;
+  } else
+    rowsDiff.push(`${k}: node=${JSON.stringify(r)} rust=${JSON.stringify(t)}`);
 }
 for (const k of rustRows.keys()) if (!nodeRows.has(k)) onlyRust++;
 // `events_per_sec` comes from one rolling on the whole series in both
@@ -161,13 +145,13 @@ console.log(
       sameFieldOrder:
         keyOrder(firstWithRows(nodeFrames)) ===
         keyOrder(firstWithRows(rustFrames)),
-      firstHost: {
-        identical: firstSame,
-        identicalWholeRowAfterSettle: firstSameWholeRow,
-        different: firstDiff.length,
-        examples: firstDiff.slice(0, 3),
+      sampleStride: Number(process.env.SAMPLE_STRIDE ?? '1'),
+      hostRows: {
+        identical: rowsSame,
+        identicalWholeRowAfterSettle: rowsSameWholeRow,
+        different: rowsDiff.length,
+        examples: rowsDiff.slice(0, 3),
       },
-      otherHostsRustMinusNode: otherOffset,
       eventsPerSec: {
         missingInRust: epsMissingInRust,
         same: epsSame,

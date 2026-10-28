@@ -2,30 +2,24 @@
 //! `packages/aggregator/src/aggregate.ts` builds them.
 //!
 //! Node runs one partitioned fused rolling:
-//! `live.partitionBy('host').rolling({ '1m': {...}, '200ms': {...} },
-//! { trigger: Trigger.clock(every 200ms) })`. pond-rs has no live
-//! partitions yet (R3 step 6), so this splits by host by hand: one small
-//! `LiveSeries` per host with the same fused rolling on it. Each gRPC
-//! batch is grouped by host and pushed host by host.
-//!
-//! Two differences follow (see `friction-notes/pond-rs-live-agg.md`):
-//! - Node's partitions all emit when the first host's event crosses a
-//!   tick, before the other hosts' events at that time are added; here
-//!   each host emits after its own event, so its row holds one more.
-//! - Node still emits a host that has gone quiet; here a quiet host
-//!   emits nothing until its next event.
+//! `live.partitionBy('host')[.sample({ stride })].rolling({ '1m': {...},
+//! '200ms': {...} }, { trigger: Trigger.clock(every 200ms) })`. pond-rs
+//! builds the same on the main series: `partition_by("host")`, an optional
+//! `sample` per partition, then `partition_rolling_windows`. As in pond-ts,
+//! when any host's event crosses into a new 200 ms bucket every host known
+//! so far emits a row for it (quiet hosts included), all in one push.
 //!
 //! Globals (`events_per_sec`, running totals) come from the main series,
 //! as in Node: a 1 s count rolling on the same clock, and the root's
 //! batch and evict outputs.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use pond_rs::live::{
-    History, LiveOptions, LiveRolling, LiveSeries, Node, Output, OutputKind, RollingOptions,
-    RollingWindow, Trigger,
+    History, LivePartitionedRolling, LiveRolling, LiveSeries, Node, Output, OutputKind,
+    PartitionOptions, RollingOptions, RollingWindow, Trigger,
 };
-use pond_rs::{Agg, ColumnDef, ColumnKind, Reducer, Scalar, Sequence, Value};
+use pond_rs::{Agg, Reducer, Sample, Scalar, Sequence};
 
 use crate::agg_wire::{GlobalsTick, HostTick};
 
@@ -49,30 +43,17 @@ impl Default for AggOptions {
     }
 }
 
-struct Host {
-    live: LiveSeries,
-    rolling: Node<LiveRolling>,
-    /// Stride-sample counter, pond-ts `sample({ stride })`: keeps the
-    /// stride-th, 2·stride-th, … event.
-    seen: u64,
-}
-
-/// One host's rows for this batch: (time, cpu, requests).
-pub type HostRows = Vec<(i64, f64, f64)>;
-
 pub struct Aggregate {
     opts: AggOptions,
     trigger: Trigger,
-    hosts: HashMap<String, Host>,
     events_per_sec: Option<Node<LiveRolling>>,
+    hosts: Option<Node<LivePartitionedRolling>>,
     latest_events_per_sec: f64,
     events_ingested: u64,
     evicted: u64,
     requests_ingested: f64,
     first_event_ts: Option<i64>,
     pending: Vec<HostTick>,
-    last_emitted_ts: i64,
-    late_rows: u64,
     history_rows: VecDeque<HostTick>,
     history_globals: VecDeque<GlobalsTick>,
 }
@@ -92,45 +73,89 @@ impl Aggregate {
         Aggregate {
             opts,
             trigger,
-            hosts: HashMap::new(),
             events_per_sec: None,
+            hosts: None,
             latest_events_per_sec: 0.0,
             events_ingested: 0,
             evicted: 0,
             requests_ingested: 0.0,
             first_event_ts: None,
             pending: Vec::new(),
-            last_emitted_ts: i64::MIN,
-            late_rows: 0,
             history_rows: VecDeque::new(),
             history_globals: VecDeque::new(),
         }
     }
 
-    /// Build the globals rolling on the main series and watch what the
+    /// Build the globals rolling and the per-host rolling on the main
+    /// series (which needs a string `host` column), and watch what the
     /// totals need (root batch and evict, rolling events).
     pub fn attach(&mut self, live: &mut LiveSeries) -> pond_rs::Result<()> {
         let root = live.root();
+        let opts = RollingOptions::new()
+            .trigger(self.trigger)
+            .history(History::Off);
         let eps = live.rolling_windows(
             root,
             &[RollingWindow::new(
                 "1s",
                 &[Agg::new("events_per_sec", "cpu", Reducer::Count)],
             )],
-            &RollingOptions::new()
-                .trigger(self.trigger)
-                .history(History::Off),
+            &opts,
         )?;
         live.watch(eps, OutputKind::Event)?;
         live.watch(root, OutputKind::Evict)?;
+
+        // The rolling keeps its own windows, so each partition only needs
+        // to hold the event being routed (the main series keeps 30 s for
+        // `/live`; a partition would otherwise copy it).
+        let by_host = live.partition_by(root, "host", &PartitionOptions::new().max_events(1))?;
+        let tick = format!("{}ms", self.opts.tick_ms);
+        let windows = [
+            RollingWindow::new(
+                "1m",
+                &[
+                    Agg::new("cpu_avg", "cpu", Reducer::Avg),
+                    Agg::new("cpu_sd", "cpu", Reducer::Stdev),
+                    Agg::new("cpu_n", "cpu", Reducer::Count),
+                    Agg::new("requests_avg", "requests", Reducer::Avg),
+                    Agg::new("requests_sum", "requests", Reducer::Sum),
+                    Agg::new("requests_n", "requests", Reducer::Count),
+                ],
+            ),
+            RollingWindow::new(
+                &tick,
+                &[
+                    Agg::new("cpu_samples", "cpu", Reducer::Samples),
+                    Agg::new("cpu_min", "cpu", Reducer::Min),
+                    Agg::new("cpu_max", "cpu", Reducer::Max),
+                    Agg::new("current_avg", "cpu", Reducer::Avg),
+                    Agg::new("current_sd", "cpu", Reducer::Stdev),
+                ],
+            ),
+        ];
+        let stride = self.opts.sample_stride.max(1) as usize;
+        let hosts = if stride > 1 {
+            let sampled = live.per_partition(by_host, move |live, part| {
+                Ok(live.sample(part, Sample::Stride(stride))?.id())
+            })?;
+            live.partition_rolling_windows(sampled, &windows, &opts)?
+        } else {
+            live.partition_rolling_windows(by_host, &windows, &opts)?
+        };
+        live.watch(hosts, OutputKind::Event)?;
         self.events_per_sec = Some(eps);
+        self.hosts = Some(hosts);
         Ok(())
     }
 
-    /// Read the main series' outputs for one push: totals and the latest
-    /// events-per-second. `Batch` outputs are read here too (the `/live`
-    /// fan-out reads them separately).
+    /// Read the main series' outputs for one push: totals, the latest
+    /// events-per-second, and the per-host rows. `Batch` outputs are read
+    /// here too (the `/live` fan-out reads them separately). Totals are
+    /// read first, so a tick's globals include the whole push, as before.
     pub fn observe_main(&mut self, outputs: &[Output]) {
+        let eps = self.events_per_sec.map(|n| n.id());
+        let hosts = self.hosts.map(|n| n.id());
+        let mut host_rows = Vec::new();
         for out in outputs {
             match out {
                 Output::Batch { events, .. } => {
@@ -140,15 +165,18 @@ impl Aggregate {
                     }
                 }
                 Output::Evict { events, .. } => self.evicted += events.len() as u64,
-                Output::Event { node, event }
-                    if Some(*node) == self.events_per_sec.map(|n| n.id()) =>
-                {
+                Output::Event { node, event } if Some(*node) == eps => {
                     if let Ok(Some(v)) = event.number("events_per_sec") {
                         self.latest_events_per_sec = v;
                     }
                 }
+                Output::Event { node, event } if Some(*node) == hosts => host_rows.push(event),
                 _ => {}
             }
+        }
+        for e in host_rows {
+            let row = self.host_tick(e);
+            self.pending.push(row);
         }
     }
 
@@ -158,106 +186,7 @@ impl Aggregate {
         self.requests_ingested += sum;
     }
 
-    fn new_host(&self) -> pond_rs::Result<Host> {
-        // The rolling keeps its own window, so the host series only needs
-        // to hold the event being pushed.
-        let mut live = LiveSeries::with_options(
-            "host",
-            vec![
-                ColumnDef::required("time", ColumnKind::Time),
-                ColumnDef::required("cpu", ColumnKind::Number),
-                ColumnDef::required("requests", ColumnKind::Number),
-            ],
-            LiveOptions::new().max_events(1),
-        )?;
-        let root = live.root();
-        let tick = format!("{}ms", self.opts.tick_ms);
-        let rolling = live.rolling_windows(
-            root,
-            &[
-                RollingWindow::new(
-                    "1m",
-                    &[
-                        Agg::new("cpu_avg", "cpu", Reducer::Avg),
-                        Agg::new("cpu_sd", "cpu", Reducer::Stdev),
-                        Agg::new("cpu_n", "cpu", Reducer::Count),
-                        Agg::new("requests_avg", "requests", Reducer::Avg),
-                        Agg::new("requests_sum", "requests", Reducer::Sum),
-                        Agg::new("requests_n", "requests", Reducer::Count),
-                    ],
-                ),
-                RollingWindow::new(
-                    &tick,
-                    &[
-                        Agg::new("cpu_samples", "cpu", Reducer::Samples),
-                        Agg::new("cpu_min", "cpu", Reducer::Min),
-                        Agg::new("cpu_max", "cpu", Reducer::Max),
-                        Agg::new("current_avg", "cpu", Reducer::Avg),
-                        Agg::new("current_sd", "cpu", Reducer::Stdev),
-                    ],
-                ),
-            ],
-            &RollingOptions::new()
-                .trigger(self.trigger)
-                .history(History::Off),
-        )?;
-        live.watch(rolling, OutputKind::Event)?;
-        Ok(Host {
-            live,
-            rolling,
-            seen: 0,
-        })
-    }
-
-    /// Push one batch, already grouped by host in first-seen order, into
-    /// the per-host rollings, and collect the rows they emit.
-    pub fn push_hosts(&mut self, by_host: Vec<(String, HostRows)>) {
-        let stride = self.opts.sample_stride.max(1);
-        for (name, rows) in by_host {
-            if !self.hosts.contains_key(&name) {
-                match self.new_host() {
-                    Ok(h) => {
-                        self.hosts.insert(name.clone(), h);
-                    }
-                    Err(e) => {
-                        eprintln!("host pipeline for {name}: {e}");
-                        continue;
-                    }
-                }
-            }
-            let host = self.hosts.get_mut(&name).expect("just inserted");
-            let mut kept = Vec::with_capacity(rows.len());
-            for (t, cpu, req) in rows {
-                host.seen += 1;
-                if host.seen.is_multiple_of(stride) {
-                    kept.push((t, vec![Some(Value::Number(cpu)), Some(Value::Number(req))]));
-                }
-            }
-            if kept.is_empty() {
-                continue;
-            }
-            let outputs = match host.live.push_many(kept) {
-                Ok(o) => o,
-                // The main series already accepted these rows, so this
-                // would be a pond-rs bug; skip the host's rows for this batch.
-                Err(e) => {
-                    eprintln!("host {name} push refused: {e}");
-                    continue;
-                }
-            };
-            let rolling = host.rolling.id();
-            for out in outputs {
-                if let Output::Event { node, event } = out {
-                    if node == rolling {
-                        let row = self.host_tick(&name, &event);
-                        self.pending.push(row);
-                    }
-                }
-            }
-        }
-    }
-
-    fn host_tick(&self, host: &str, e: &pond_rs::live::LiveEvent) -> HostTick {
+    fn host_tick(&self, e: &pond_rs::live::LiveEvent) -> HostTick {
         let ts = e.begin();
         let num = |name: &str| e.number(name).ok().flatten();
         let samples: Vec<f64> = match e.array("cpu_samples") {
@@ -279,7 +208,12 @@ impl Aggregate {
         let (above, below) = anomalies(cpu_avg, cpu_sd, &samples, &THRESHOLDS);
         HostTick {
             ts,
-            host: host.to_string(),
+            host: e
+                .string("host")
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .to_string(),
             cpu_avg,
             cpu_sd,
             cpu_n: num("cpu_n").unwrap_or(0.0),
@@ -299,33 +233,14 @@ impl Aggregate {
 
     /// Ticks completed by the last push, oldest first (Node's `tryEmit`):
     /// rows grouped by `ts`; each tick also goes into the snapshot history.
-    ///
-    /// A row for a `ts` at or before the last tick sent is dropped, as
-    /// Node drops it. In Node that never happens (every partition emits
-    /// at once). Split by hand it can: a host whose crossing event comes
-    /// in a later gRPC batch than the others' (split batches, or a host
-    /// whose `SAMPLE_STRIDE` count is out of step). Those rows are
-    /// counted in [`Aggregate::late_rows`] (`/metrics`), first one logged.
+    /// Every host's row for a tick comes out of the same push.
     pub fn drain_ticks(&mut self) -> Vec<Tick> {
         if self.pending.is_empty() {
             return Vec::new();
         }
-        let mut rows = std::mem::take(&mut self.pending);
-        // Stable: hosts keep their push order within a tick.
-        rows.sort_by_key(|r| r.ts);
+        let rows = std::mem::take(&mut self.pending);
         let mut ticks: Vec<Tick> = Vec::new();
         for row in rows {
-            if row.ts <= self.last_emitted_ts {
-                self.late_rows += 1;
-                if self.late_rows == 1 {
-                    eprintln!(
-                        "/live-agg: row for {} at {} came after that tick was sent; dropped \
-                         (further ones counted in /metrics only)",
-                        row.host, row.ts
-                    );
-                }
-                continue;
-            }
             match ticks.last_mut() {
                 Some(t) if t.globals.ts == row.ts => t.rows.push(row),
                 _ => {
@@ -343,9 +258,6 @@ impl Aggregate {
                 }
             }
         }
-        if let Some(last) = ticks.last() {
-            self.last_emitted_ts = last.globals.ts;
-        }
         if self.opts.history_max_age_ms > 0 {
             for t in &ticks {
                 self.history_rows.extend(t.rows.iter().cloned());
@@ -361,11 +273,6 @@ impl Aggregate {
             }
         }
         ticks
-    }
-
-    /// Rows dropped because their tick had already been sent.
-    pub fn late_rows(&self) -> u64 {
-        self.late_rows
     }
 
     pub fn history(&self) -> (Vec<HostTick>, Vec<GlobalsTick>) {
@@ -406,6 +313,8 @@ pub fn anomalies(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pond_rs::live::LiveOptions;
+    use pond_rs::{ColumnDef, ColumnKind, Value};
 
     #[test]
     fn anomalies_match_node_rule() {
@@ -437,41 +346,42 @@ mod tests {
         .unwrap()
     }
 
-    /// Feed `ticks` producer ticks (every host, one time) through the
-    /// main series and the per-host rollings, as `on_batch` does.
+    /// Push one producer tick per time (every host listed, one row each)
+    /// through the main series, as `on_batch` does.
+    fn push(
+        agg: &mut Aggregate,
+        live: &mut LiveSeries,
+        t: i64,
+        k: usize,
+        hosts: &[&str],
+    ) -> Vec<Tick> {
+        let rows: Vec<(i64, Vec<Option<Value>>)> = hosts
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let cpu = 0.1 * (i + 1) as f64 + 0.01 * (k % 3) as f64;
+                (
+                    t,
+                    vec![
+                        Some(Value::Number(cpu)),
+                        Some(Value::Number(10.0)),
+                        Some(Value::String(h.to_string())),
+                    ],
+                )
+            })
+            .collect();
+        let outputs = live.push_many(rows).unwrap();
+        agg.observe_main(&outputs);
+        agg.add_requests(10.0 * hosts.len() as f64);
+        agg.drain_ticks()
+    }
+
     fn run(agg: &mut Aggregate, live: &mut LiveSeries, hosts: &[&str], times: &[i64]) -> Vec<Tick> {
         let root = live.root();
         live.watch(root, OutputKind::Batch).unwrap();
         let mut out = Vec::new();
         for (k, &t) in times.iter().enumerate() {
-            let rows: Vec<(i64, Vec<Option<Value>>)> = hosts
-                .iter()
-                .enumerate()
-                .map(|(i, h)| {
-                    let cpu = 0.1 * (i + 1) as f64 + 0.01 * (k % 3) as f64;
-                    (
-                        t,
-                        vec![
-                            Some(Value::Number(cpu)),
-                            Some(Value::Number(10.0)),
-                            Some(Value::String(h.to_string())),
-                        ],
-                    )
-                })
-                .collect();
-            let outputs = live.push_many(rows).unwrap();
-            agg.observe_main(&outputs);
-            agg.add_requests(10.0 * hosts.len() as f64);
-            let by_host = hosts
-                .iter()
-                .enumerate()
-                .map(|(i, h)| {
-                    let cpu = 0.1 * (i + 1) as f64 + 0.01 * (k % 3) as f64;
-                    (h.to_string(), vec![(t, cpu, 10.0)])
-                })
-                .collect();
-            agg.push_hosts(by_host);
-            out.extend(agg.drain_ticks());
+            out.extend(push(agg, live, t, k, hosts));
         }
         out
     }
@@ -509,24 +419,27 @@ mod tests {
     }
 
     #[test]
-    fn a_row_after_its_tick_was_sent_is_counted_and_dropped() {
+    fn every_host_emits_when_the_first_one_crosses_a_tick() {
         let mut live = main_series();
         let mut agg = Aggregate::new(AggOptions::default());
         agg.attach(&mut live).unwrap();
-        // Both hosts at 0 and 100; at 250 only api-1 arrives (tick 200
-        // goes out with api-1 alone), then api-2's 250 in the next batch.
-        agg.push_hosts(vec![
-            ("api-1".into(), vec![(0, 0.5, 1.0), (100, 0.5, 1.0)]),
-            ("api-2".into(), vec![(0, 0.5, 1.0), (100, 0.5, 1.0)]),
-        ]);
-        assert!(agg.drain_ticks().is_empty());
-        agg.push_hosts(vec![("api-1".into(), vec![(250, 0.5, 1.0)])]);
-        let ticks = agg.drain_ticks();
+        let root = live.root();
+        live.watch(root, OutputKind::Batch).unwrap();
+        assert!(push(&mut agg, &mut live, 0, 0, &["api-1", "api-2"]).is_empty());
+        assert!(push(&mut agg, &mut live, 100, 0, &["api-1", "api-2"]).is_empty());
+        // Only api-1 at 250: the 200 tick still has a row for both, and
+        // api-2's comes from its window as of 250 (as pond-ts).
+        let ticks = push(&mut agg, &mut live, 250, 0, &["api-1"]);
         assert_eq!(ticks.len(), 1);
-        assert_eq!(ticks[0].rows.len(), 1);
-        agg.push_hosts(vec![("api-2".into(), vec![(250, 0.5, 1.0)])]);
-        assert!(agg.drain_ticks().is_empty());
-        assert_eq!(agg.late_rows(), 1);
+        let hosts: Vec<&str> = ticks[0].rows.iter().map(|r| r.host.as_str()).collect();
+        assert_eq!(hosts, vec!["api-1", "api-2"]);
+        // api-1's crossing event is in its 1m window; api-2 has its two.
+        assert_eq!(ticks[0].rows[0].cpu_n, 3.0);
+        assert_eq!(ticks[0].rows[1].cpu_n, 2.0);
+        // api-2's late 250 goes into the next tick, not dropped.
+        assert!(push(&mut agg, &mut live, 250, 0, &["api-2"]).is_empty());
+        let ticks = push(&mut agg, &mut live, 400, 0, &["api-1"]);
+        assert_eq!(ticks[0].rows[1].cpu_n, 3.0);
     }
 
     #[test]

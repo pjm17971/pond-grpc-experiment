@@ -202,20 +202,10 @@ fn on_batch(app: &App, batch: proto::EventBatch) {
     app.metrics.record_ingest(n);
 
     let started = Instant::now();
-    // Build the rows, and the same rows grouped by host (first-seen
-    // order), before taking the lock.
     let mut requests_sum = 0.0;
-    let mut by_host: Vec<(String, agg::HostRows)> = Vec::new();
-    let mut host_slot: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for e in &batch.events {
         requests_sum += e.requests as f64;
-        let slot = *host_slot.entry(e.host.as_str()).or_insert_with(|| {
-            by_host.push((e.host.clone(), Vec::new()));
-            by_host.len() - 1
-        });
-        by_host[slot].1.push((e.time_ms, e.cpu, e.requests as f64));
     }
-    drop(host_slot);
     let rows: Vec<(i64, Vec<Option<Value>>)> = batch
         .events
         .into_iter()
@@ -246,8 +236,9 @@ fn on_batch(app: &App, batch: proto::EventBatch) {
         };
         inner.agg.observe_main(&out);
         inner.agg.add_requests(requests_sum);
+        let root = inner.live.root();
         let events = out.into_iter().find_map(|o| match o {
-            Output::Batch { events, .. } => Some(events),
+            Output::Batch { node, events } if node == root => Some(events),
             _ => None,
         });
         let frame = events.map(|events| {
@@ -258,10 +249,9 @@ fn on_batch(app: &App, batch: proto::EventBatch) {
         });
         app.metrics.set_window_len(inner.live.len());
 
-        // Per-host rolling stats; any tick this batch completed goes out.
-        inner.agg.push_hosts(by_host);
+        // Per-host rolling stats (read from `out` above); any tick this
+        // batch completed goes out.
         let ticks = inner.agg.drain_ticks();
-        app.metrics.set_agg_late_rows(inner.agg.late_rows());
         for tick in ticks {
             let full_frame: Arc<str> =
                 agg_wire::append_frame(tick.rows.iter(), &tick.globals).into();
