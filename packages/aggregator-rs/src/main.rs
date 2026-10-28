@@ -74,8 +74,7 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);
-    let producer =
-        std::env::var("PRODUCER_URL").unwrap_or_else(|_| "127.0.0.1:50051".to_string());
+    let producer = std::env::var("PRODUCER_URL").unwrap_or_else(|_| "127.0.0.1:50051".to_string());
 
     let (frames, _) = broadcast::channel(CLIENT_QUEUE_FRAMES);
     let app = Arc::new(App {
@@ -87,7 +86,10 @@ async fn main() {
     tokio::spawn(ingest(app.clone(), producer.clone()));
 
     let router = Router::new()
-        .route("/health", get(|| async { Json(serde_json::json!({ "ok": true })) }))
+        .route(
+            "/health",
+            get(|| async { Json(serde_json::json!({ "ok": true })) }),
+        )
         .route("/metrics", get(metrics_handler))
         .route("/live", get(live_handler))
         .with_state(app);
@@ -210,7 +212,10 @@ async fn live_handler(ws: WebSocketUpgrade, State(app): State<Arc<App>>) -> impl
 async fn live_client(mut socket: WebSocket, app: Arc<App>) {
     let (snapshot, mut rx) = {
         let inner = app.inner.lock().unwrap();
-        (wire::snapshot_frame(inner.live.events()), app.frames.subscribe())
+        (
+            wire::snapshot_frame(inner.live.events()),
+            app.frames.subscribe(),
+        )
     };
     app.metrics.client_connected();
     if socket.send(Message::Text(snapshot)).await.is_ok() {
@@ -250,9 +255,18 @@ mod tests {
 
     #[test]
     fn backoff_matches_node_defaults() {
-        for (attempt, base) in [(0u32, 1000.0), (1, 2000.0), (4, 16_000.0), (5, 30_000.0), (40, 30_000.0)] {
+        for (attempt, base) in [
+            (0u32, 1000.0),
+            (1, 2000.0),
+            (4, 16_000.0),
+            (5, 30_000.0),
+            (40, 30_000.0),
+        ] {
             let d = backoff_ms(attempt) as f64;
-            assert!(d >= base * 0.8 - 1.0 && d <= base * 1.2 + 1.0, "attempt {attempt}: {d}");
+            assert!(
+                d >= base * 0.8 - 1.0 && d <= base * 1.2 + 1.0,
+                "attempt {attempt}: {d}"
+            );
         }
     }
 }

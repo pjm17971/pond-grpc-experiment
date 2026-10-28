@@ -6,8 +6,8 @@
 
 use std::fmt::Write;
 
-use pond_rs::Value;
 use pond_rs::live::LiveEvent;
+use pond_rs::Value;
 
 /// One event as `[time_ms, cpu, requests, host]`, cells in schema order.
 fn push_row(out: &mut String, e: &LiveEvent) {
@@ -83,8 +83,19 @@ mod tests {
         live.watch(root, OutputKind::Batch).unwrap();
         let out = live
             .push_many(rows.into_iter().map(|(t, cpu, req, host)| {
-                let cpu = if cpu.is_nan() { None } else { Some(Value::Number(cpu)) };
-                (t, vec![cpu, Some(Value::Number(req)), Some(Value::String(host.into()))])
+                let cpu = if cpu.is_nan() {
+                    None
+                } else {
+                    Some(Value::Number(cpu))
+                };
+                (
+                    t,
+                    vec![
+                        cpu,
+                        Some(Value::Number(req)),
+                        Some(Value::String(host.into())),
+                    ],
+                )
             }))
             .unwrap();
         match out.into_iter().next() {
@@ -120,6 +131,9 @@ mod tests {
     #[test]
     fn empty_snapshot() {
         let rows: Vec<LiveEvent> = vec![];
-        assert_eq!(snapshot_frame(rows.iter()), "{\"type\":\"snapshot\",\"rows\":[]}");
+        assert_eq!(
+            snapshot_frame(rows.iter()),
+            "{\"type\":\"snapshot\",\"rows\":[]}"
+        );
     }
 }
