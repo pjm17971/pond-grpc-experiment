@@ -20,15 +20,18 @@ they see the same events, and every `/live-agg` row is compared by
 `ts` and host:
 
 - Same rows (none only on one side), same field order.
-- **First host of each batch: 375 of 375 rows identical, bit for
-  bit**: the 200 ms fields from the start, every field (1 m baseline,
-  anomaly counts) once both had run a full minute.
-  (`window_age_seconds` is left out; it counts from each aggregator's
-  start.)
+- **First host of each batch: 374 of 374 rows identical, bit for
+  bit.** The 200 ms fields are compared from the start; the rest (1 m
+  baseline, anomaly counts) only once both have run a full minute
+  (65 s), which leaves the last 50 rows compared whole, all 50
+  identical. (`window_age_seconds` is left out; it counts from each
+  aggregator's start.)
 - `events_per_sec` (one rolling on the whole series in both): 365 of
-  365 ticks identical.
-- **Every other host: 7,125 rows, each with exactly one more event in
-  the 200 ms slice (and the 1 m window) in Rust.** pond-ts 0.75
+  365 ticks identical, none missing in Rust.
+- **Every other host: 7,106 rows, each with exactly one more event in
+  Rust.** Before the 65 s mark only the 200 ms slice is compared, and
+  it is +1 in all 6,156 rows; after it, the slice and the 1 m window
+  are both +1 in all 950 rows. pond-ts 0.75
   `LivePartitionedFusedRolling.ingest` checks for a crossed boundary
   after each event and, on the first crossing, calls `#emitTick`,
   which emits every known partition at once. So the first host's event
@@ -40,6 +43,15 @@ they see the same events, and every `/live-agg` row is compared by
   Node a host that goes quiet still gets a row each tick (`#emitTick`
   evicts its windows and emits them). Split by hand, a quiet host
   emits nothing until its next event.
+- Late rows: a row for a host whose tick for that time already went
+  out can't change it. Rust counts and drops these
+  (`/metrics` → `aggregate.lateRowsDropped`); 0 in this run and in the
+  benches, since the producer sends in time order.
+- Number text: ordinary values print the same as JS. Very small or
+  very large ones don't (`1e-7` prints `0.0000001`, `1e21` prints all
+  22 digits) but read back to the same number. `-0` prints `-0` where
+  JS prints `0`; the compare treats them as equal. None of these
+  showed up in the run.
 
 ## Throughput (Rust producer, 20 s, alternated, one batch)
 

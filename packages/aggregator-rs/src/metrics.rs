@@ -6,7 +6,9 @@
 //! process resident size (RSS), so the bench's "heap peak" column is
 //! Node's JS heap against Rust's whole-process RSS. Extra:
 //! `ws.clientsDropped`, clients cut off for falling behind, and
-//! `pushMany.refusedBatches`, batches the window refused.
+//! `pushMany.refusedBatches`, batches the window refused, and
+//! `aggregate.lateRowsDropped`, `/live-agg` rows that came after their
+//! tick was sent (see `agg.rs`).
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -65,6 +67,7 @@ pub struct Metrics {
     window_len: AtomicUsize,
     clients: AtomicUsize,
     clients_dropped: AtomicU64,
+    agg_late_rows: AtomicU64,
     ingest_to_fanout: Histogram,
     push_total: Histogram,
     pub fanout_serialize: Histogram,
@@ -85,6 +88,7 @@ impl Metrics {
             window_len: AtomicUsize::new(0),
             clients: AtomicUsize::new(0),
             clients_dropped: AtomicU64::new(0),
+            agg_late_rows: AtomicU64::new(0),
             ingest_to_fanout: Histogram::new(),
             push_total: Histogram::new(),
             fanout_serialize: Histogram::new(),
@@ -132,6 +136,11 @@ impl Metrics {
         self.clients_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// `/live-agg` rows dropped because their tick had already gone out.
+    pub fn set_agg_late_rows(&self, n: u64) {
+        self.agg_late_rows.store(n, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> Value {
         let calls = self.push_calls.load(Ordering::Relaxed);
         let events = self.push_events.load(Ordering::Relaxed);
@@ -169,6 +178,7 @@ impl Metrics {
             },
             "memory": { "rss": rss, "heapUsed": rss, "heapTotal": rss, "external": 0, "arrayBuffers": 0 },
             "gc": {},
+            "aggregate": { "lateRowsDropped": self.agg_late_rows.load(Ordering::Relaxed) },
         })
     }
 }

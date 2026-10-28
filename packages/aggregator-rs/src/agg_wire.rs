@@ -188,12 +188,22 @@ pub fn parse_control(text: &str, host_count: usize) -> Option<(Option<usize>, Op
 }
 
 /// `parseConnectQuery`: `?n=<int>&by=<RankKey>` on the WebSocket URL.
-/// Bad values fall back to no filter / `cpu_avg`.
+/// Bad values fall back to no filter / `cpu_avg`. A repeated key takes
+/// its first value (`URLSearchParams.get`). No percent-decoding: valid
+/// values (digits, the three rank keys) never need it.
 pub fn parse_connect_query(query: Option<&str>) -> ClientPrefs {
     let mut prefs = ClientPrefs::default();
     let Some(q) = query else { return prefs };
-    for pair in q.split('&') {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+    let first = |key: &str| {
+        q.split('&')
+            .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v)
+    };
+    for (k, v) in [("n", first("n")), ("by", first("by"))]
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|v| (k, v)))
+    {
         match k {
             "n" if !v.is_empty() => {
                 if let Ok(n) = v.trim().parse::<f64>() {
@@ -499,6 +509,9 @@ mod tests {
         assert_eq!((p.top_n, p.rank_by), (None, RankKey::CpuAvg));
         let p = parse_connect_query(Some("n=99999"));
         assert_eq!(p.top_n, Some(1000));
+        // First value wins, as URLSearchParams.get.
+        let p = parse_connect_query(Some("n=3&n=7&by=cpu_sd&by=requests_sum"));
+        assert_eq!((p.top_n, p.rank_by), (Some(3), RankKey::CpuSd));
         assert_eq!(parse_connect_query(None), ClientPrefs::default());
     }
 }

@@ -99,6 +99,7 @@ const allFields = (r: Row) =>
 // the start, every field once both have a full minute.
 const firstHost = 'api-1';
 let firstSame = 0;
+let firstSameWholeRow = 0;
 const firstDiff: string[] = [];
 // Other hosts: Node emits them before their own crossing event arrives;
 // pond-rs (split by hand) after. Count Rust minus Node `n_current`.
@@ -113,13 +114,19 @@ for (const [k, r] of nodeRows) {
   }
   if (r.host === firstHost) {
     const fields = r.ts >= settleTs ? allFields(r) : slice;
-    if (same(r, t, fields)) firstSame++;
-    else
+    if (same(r, t, fields)) {
+      firstSame++;
+      if (r.ts >= settleTs) firstSameWholeRow++;
+    } else
       firstDiff.push(
         `${k}: node=${JSON.stringify(r)} rust=${JSON.stringify(t)}`,
       );
   } else {
-    const d = String((t.n_current as number) - (r.n_current as number));
+    // The 200 ms slice from the start; the 1 m count once settled.
+    let d = `slice ${(t.n_current as number) - (r.n_current as number)}`;
+    if (r.ts >= settleTs) {
+      d += `, 1m ${(t.cpu_n as number) - (r.cpu_n as number)}`;
+    }
     otherOffset[d] = (otherOffset[d] ?? 0) + 1;
   }
 }
@@ -127,10 +134,15 @@ for (const k of rustRows.keys()) if (!nodeRows.has(k)) onlyRust++;
 // `events_per_sec` comes from one rolling on the whole series in both
 // (no partitions), so it should match once both have a full second.
 let epsSame = 0;
+let epsMissingInRust = 0;
 const epsDiff: string[] = [];
 for (const [ts, v] of nodeEps) {
+  if (ts < start + 2000) continue;
   const w = rustEps.get(ts);
-  if (w === undefined || ts < start + 2000) continue;
+  if (w === undefined) {
+    epsMissingInRust++;
+    continue;
+  }
   if (v === w) epsSame++;
   else epsDiff.push(`${ts}: node=${v} rust=${w}`);
 }
@@ -151,11 +163,13 @@ console.log(
         keyOrder(firstWithRows(rustFrames)),
       firstHost: {
         identical: firstSame,
+        identicalWholeRowAfterSettle: firstSameWholeRow,
         different: firstDiff.length,
         examples: firstDiff.slice(0, 3),
       },
-      otherHostsRustMinusNodeNCurrent: otherOffset,
+      otherHostsRustMinusNode: otherOffset,
       eventsPerSec: {
+        missingInRust: epsMissingInRust,
         same: epsSame,
         different: epsDiff.length,
         examples: epsDiff.slice(0, 3),

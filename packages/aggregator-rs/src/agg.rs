@@ -72,6 +72,7 @@ pub struct Aggregate {
     first_event_ts: Option<i64>,
     pending: Vec<HostTick>,
     last_emitted_ts: i64,
+    late_rows: u64,
     history_rows: VecDeque<HostTick>,
     history_globals: VecDeque<GlobalsTick>,
 }
@@ -100,6 +101,7 @@ impl Aggregate {
             first_event_ts: None,
             pending: Vec::new(),
             last_emitted_ts: i64::MIN,
+            late_rows: 0,
             history_rows: VecDeque::new(),
             history_globals: VecDeque::new(),
         }
@@ -296,8 +298,14 @@ impl Aggregate {
     }
 
     /// Ticks completed by the last push, oldest first (Node's `tryEmit`):
-    /// rows grouped by `ts`; a `ts` at or before the last one sent is
-    /// dropped. Each tick also goes into the snapshot history.
+    /// rows grouped by `ts`; each tick also goes into the snapshot history.
+    ///
+    /// A row for a `ts` at or before the last tick sent is dropped, as
+    /// Node drops it. In Node that never happens (every partition emits
+    /// at once). Split by hand it can: a host whose crossing event comes
+    /// in a later gRPC batch than the others' (split batches, or a host
+    /// whose `SAMPLE_STRIDE` count is out of step). Those rows are
+    /// counted in [`Aggregate::late_rows`] (`/metrics`), first one logged.
     pub fn drain_ticks(&mut self) -> Vec<Tick> {
         if self.pending.is_empty() {
             return Vec::new();
@@ -308,6 +316,14 @@ impl Aggregate {
         let mut ticks: Vec<Tick> = Vec::new();
         for row in rows {
             if row.ts <= self.last_emitted_ts {
+                self.late_rows += 1;
+                if self.late_rows == 1 {
+                    eprintln!(
+                        "/live-agg: row for {} at {} came after that tick was sent; dropped \
+                         (further ones counted in /metrics only)",
+                        row.host, row.ts
+                    );
+                }
                 continue;
             }
             match ticks.last_mut() {
@@ -345,6 +361,11 @@ impl Aggregate {
             }
         }
         ticks
+    }
+
+    /// Rows dropped because their tick had already been sent.
+    pub fn late_rows(&self) -> u64 {
+        self.late_rows
     }
 
     pub fn history(&self) -> (Vec<HostTick>, Vec<GlobalsTick>) {
@@ -485,6 +506,27 @@ mod tests {
         let (rows, globals) = agg.history();
         assert_eq!(rows.len(), 10);
         assert_eq!(globals.len(), 5);
+    }
+
+    #[test]
+    fn a_row_after_its_tick_was_sent_is_counted_and_dropped() {
+        let mut live = main_series();
+        let mut agg = Aggregate::new(AggOptions::default());
+        agg.attach(&mut live).unwrap();
+        // Both hosts at 0 and 100; at 250 only api-1 arrives (tick 200
+        // goes out with api-1 alone), then api-2's 250 in the next batch.
+        agg.push_hosts(vec![
+            ("api-1".into(), vec![(0, 0.5, 1.0), (100, 0.5, 1.0)]),
+            ("api-2".into(), vec![(0, 0.5, 1.0), (100, 0.5, 1.0)]),
+        ]);
+        assert!(agg.drain_ticks().is_empty());
+        agg.push_hosts(vec![("api-1".into(), vec![(250, 0.5, 1.0)])]);
+        let ticks = agg.drain_ticks();
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].rows.len(), 1);
+        agg.push_hosts(vec![("api-2".into(), vec![(250, 0.5, 1.0)])]);
+        assert!(agg.drain_ticks().is_empty());
+        assert_eq!(agg.late_rows(), 1);
     }
 
     #[test]

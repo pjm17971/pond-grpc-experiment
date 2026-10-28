@@ -29,6 +29,6 @@ hold one more event; a host that goes quiet stops getting rows (Node
 keeps emitting it). Both come from the hand split, not pond-rs. No GC (`gc` is `{}`); `memory.heapUsed` reports process
 RSS, so the bench's "Heap peak" column compares Node's JS heap with
 Rust's whole-process memory. A `/live` client more than 1024 frames
-behind is disconnected (Node has no limit), logged on stderr and counted
+(or a `/live-agg` client more than 1024 ticks) behind is disconnected (Node has no limit), logged on stderr and counted
 in `ws.clientsDropped`. The bench's `Probe MB/s` column shows what the
 probe actually received and flags a disconnected probe.

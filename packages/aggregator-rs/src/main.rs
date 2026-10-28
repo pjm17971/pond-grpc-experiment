@@ -260,7 +260,9 @@ fn on_batch(app: &App, batch: proto::EventBatch) {
 
         // Per-host rolling stats; any tick this batch completed goes out.
         inner.agg.push_hosts(by_host);
-        for tick in inner.agg.drain_ticks() {
+        let ticks = inner.agg.drain_ticks();
+        app.metrics.set_agg_late_rows(inner.agg.late_rows());
+        for tick in ticks {
             let full_frame: Arc<str> =
                 agg_wire::append_frame(tick.rows.iter(), &tick.globals).into();
             let _ = app.agg_ticks.send(Arc::new(AggTick {
@@ -351,6 +353,7 @@ async fn live_agg_client(mut socket: WebSocket, app: Arc<App>, mut prefs: agg_wi
     if socket.send(Message::Text(snapshot)).await.is_err() {
         return;
     }
+    app.metrics.client_connected();
     loop {
         tokio::select! {
             tick = rx.recv() => match tick {
@@ -372,7 +375,13 @@ async fn live_agg_client(mut socket: WebSocket, app: Arc<App>, mut prefs: agg_wi
             },
             msg = socket.recv() => match msg {
                 // Node clamps n against the snapshot's row count (or 1000).
-                Some(Ok(Message::Text(text))) => {
+                // Node reads text and binary frames alike.
+                Some(Ok(msg @ (Message::Text(_) | Message::Binary(_)))) => {
+                    let text = match msg {
+                        Message::Text(t) => t,
+                        Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+                        _ => unreachable!(),
+                    };
                     if let Some((top_n, by)) = agg_wire::parse_control(&text, history_len) {
                         prefs.top_n = top_n;
                         if let Some(by) = by {
@@ -386,6 +395,7 @@ async fn live_agg_client(mut socket: WebSocket, app: Arc<App>, mut prefs: agg_wi
             },
         }
     }
+    app.metrics.client_disconnected();
 }
 
 async fn metrics_handler(State(app): State<Arc<App>>) -> impl IntoResponse {
