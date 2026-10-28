@@ -9,7 +9,7 @@ const HOST_COUNT = Number(process.env.HOST_COUNT ?? '4');
 const VARIABILITY = Number(process.env.VARIABILITY ?? '0.4');
 // Unset: no metrics server. Set: `GET /metrics` returns the counters
 // below as JSON (same shape as the Rust producer).
-const METRICS_PORT = process.env.METRICS_PORT;
+const METRICS_PORT = process.env.METRICS_PORT || undefined;
 const QUEUE_BATCHES = 64;
 
 const counters = {
@@ -35,6 +35,9 @@ const stopSimulator = startSimulator(
     variability: VARIABILITY,
   },
   (batch) => {
+    // Counted only while someone is subscribed, as in the Rust producer
+    // (which skips the simulator when nobody is).
+    if (subscribers.size === 0) return;
     counters.batchesProduced++;
     counters.rowsProduced += batch.events.length;
     for (const write of subscribers) write(batch);

@@ -5,7 +5,11 @@
  * counted, while the fast one gets every batch and the producer's memory
  * stays flat.
  *
- *   PRODUCER_IMPL=rust pnpm --filter @pond-experiment/aggregator exec tsx scripts/slow-subscriber.ts --P=100 --N=1000 --seconds=10
+ * The Rust producer counts a stalled subscriber's drops when it next
+ * reads, so for Rust `droppedWhilePaused` stays near 0 and the drops
+ * appear in `droppedTotal` after the resume.
+ *
+ *   PRODUCER_IMPL=rust pnpm --filter @pond-experiment/aggregator exec tsx scripts/slow-subscriber.ts --P=100 --N=200 --seconds=10
  */
 import { execFileSync } from 'node:child_process';
 import { credentials } from '@grpc/grpc-js';
@@ -23,7 +27,10 @@ const args = Object.fromEntries(
   }),
 );
 const P = args.P ?? 100;
-const N = args.N ?? 1000;
+// The test client must keep up with the fast subscriber: at 100 × 1000
+// one Node client can't decode two 100k rows/s streams, and the "fast"
+// one gets drops too.
+const N = args.N ?? 200;
 const seconds = args.seconds ?? 10;
 
 const grpcPort = await allocatePort();

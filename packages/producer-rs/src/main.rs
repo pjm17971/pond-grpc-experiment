@@ -178,6 +178,8 @@ async fn serve_metrics(
     let started = Instant::now();
     loop {
         let Ok((mut sock, _)) = listener.accept().await else {
+            // e.g. out of file handles: back off rather than spin.
+            tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
         let body = format!(
@@ -192,7 +194,8 @@ async fn serve_metrics(
         );
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            let _ = sock.read(&mut buf).await;
+            // The request itself is ignored; don't wait on it for long.
+            let _ = tokio::time::timeout(Duration::from_secs(1), sock.read(&mut buf)).await;
             let head = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()

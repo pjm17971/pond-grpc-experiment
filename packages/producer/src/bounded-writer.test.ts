@@ -33,7 +33,7 @@ const batch = (t: number): EventBatch => ({
 describe('boundedWriter', () => {
   it('writes straight through while the stream has room', () => {
     const f = fakeCall(100);
-    const write = boundedWriter(f.call, 3);
+    const { write } = boundedWriter(f.call, 3);
     for (let t = 1; t <= 5; t++) write(batch(t));
     expect(f.written).toEqual([1, 2, 3, 4, 5]);
   });
@@ -41,7 +41,7 @@ describe('boundedWriter', () => {
   it('queues after write() returns false and drops the oldest past max', () => {
     const f = fakeCall(2);
     const dropped: number[] = [];
-    const write = boundedWriter(f.call, 3, (b) =>
+    const { write } = boundedWriter(f.call, 3, (b) =>
       dropped.push(b.events[0].timeMs),
     );
     // 1 fits, 2 is accepted but write() says full; 3..7 wait in the
@@ -56,9 +56,19 @@ describe('boundedWriter', () => {
     expect(f.written).toEqual([1, 2, 5, 6, 7, 8]);
   });
 
+  it('after close, drops what was queued and writes nothing more', () => {
+    const f = fakeCall(1);
+    const w = boundedWriter(f.call, 10);
+    for (let t = 1; t <= 3; t++) w.write(batch(t));
+    w.close();
+    f.drain(100); // a late 'drain' after the stream ended
+    w.write(batch(4));
+    expect(f.written).toEqual([1]);
+  });
+
   it('stops again if the stream fills while flushing', () => {
     const f = fakeCall(1);
-    const write = boundedWriter(f.call, 10);
+    const { write } = boundedWriter(f.call, 10);
     for (let t = 1; t <= 4; t++) write(batch(t));
     expect(f.written).toEqual([1]);
     f.drain(1); // room for one more: 2 goes, 3 and 4 keep waiting

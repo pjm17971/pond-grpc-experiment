@@ -45,11 +45,11 @@ export async function startGrpcServer(
 
   const impl: ProducerServer = {
     subscribe(call: ServerWritableStream<SubscribeRequest, EventBatch>) {
-      const unsubscribe = opts.onSubscribe(
-        boundedWriter(call, opts.queueBatches ?? 64, opts.onDrop),
-      );
+      const writer = boundedWriter(call, opts.queueBatches ?? 64, opts.onDrop);
+      const unsubscribe = opts.onSubscribe(writer.write);
       const cleanup = () => {
         unsubscribe();
+        writer.close();
       };
       call.on('cancelled', cleanup);
       call.on('close', cleanup);
@@ -88,6 +88,7 @@ export async function startGrpcServer(
  * enough). From then until `'drain'` batches wait in a queue of at most
  * `max`; past that the oldest waiting batch is dropped, so a slow
  * subscriber never stalls the simulator or the other subscribers.
+ * `close` (stream ended) empties the queue and stops any later flush.
  */
 export function boundedWriter(
   call: {
@@ -96,10 +97,12 @@ export function boundedWriter(
   },
   max: number,
   onDrop?: (batch: EventBatch) => void,
-): (batch: EventBatch) => void {
+): { write: (batch: EventBatch) => void; close: () => void } {
   const queue: EventBatch[] = [];
   let blocked = false;
+  let closed = false;
   const flush = () => {
+    if (closed) return;
     blocked = false;
     while (queue.length > 0) {
       if (!call.write(queue.shift()!)) {
@@ -109,7 +112,8 @@ export function boundedWriter(
       }
     }
   };
-  return (batch) => {
+  const write = (batch: EventBatch) => {
+    if (closed) return;
     if (blocked) {
       queue.push(batch);
       if (queue.length > max) onDrop?.(queue.shift()!);
@@ -120,4 +124,9 @@ export function boundedWriter(
       call.once('drain', flush);
     }
   };
+  const close = () => {
+    closed = true;
+    queue.length = 0;
+  };
+  return { write, close };
 }

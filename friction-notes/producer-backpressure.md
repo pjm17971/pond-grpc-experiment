@@ -13,7 +13,8 @@ Now:
   behind in the channel; once it is more than 64 batches behind, its
   oldest batches are skipped (`Lagged(n)`) and counted. Sending never
   blocks, so one slow subscriber can't hold up the others. A stalled
-  subscriber's drops are counted when it next reads.
+  subscriber's drops are counted when it next reads; if it disconnects
+  without reading again, they are never counted.
 - **Node producer:** `boundedWriter` (`packages/producer/src/grpc.ts`)
   writes straight through while `call.write` returns true. After it
   returns false, batches wait in a queue of 64 until `'drain'`, and the
@@ -22,7 +23,8 @@ Now:
 - **Metrics:** with `METRICS_PORT` set, both serve `GET /metrics`:
   `uptimeSec`, `subscribers`, `queueBatches`, `batchesProduced`,
   `rowsProduced`, `droppedBatches`, `droppedRows` (drops summed over
-  subscribers).
+  subscribers). Production is counted only while someone is
+  subscribed, in both.
 - **`bench:dev`** shows `Dropped/s` next to `Achieved/s` (`n/a` for a
   producer without `/metrics`).
 
@@ -32,7 +34,8 @@ producer.
 ## Slow subscriber check (`scripts/slow-subscriber.ts`)
 
 Two subscribers on one producer (100 hosts × 200/s); one stops reading
-(its stream is paused) for 10 s, then resumes.
+(its stream is paused) for 10 s, then resumes. Drops are the script's
+`droppedTotal` (for Rust they only show after the resume, see above).
 
 | Producer | Produced (batches) | Dropped for the slow one | Fast one received   | Producer memory |
 | -------- | ------------------ | ------------------------ | ------------------- | --------------- |
