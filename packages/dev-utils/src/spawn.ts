@@ -139,6 +139,12 @@ export type ProducerOptions = {
   eventsPerSec?: number;
   hostCount?: number;
   variability?: number;
+  /**
+   * `'node'` (default) runs `packages/producer`; `'rust'` runs the
+   * release build of `packages/producer-rs` (`cargo build --release`
+   * there first). Defaults to the `PRODUCER_IMPL` env var.
+   */
+  impl?: 'node' | 'rust';
 };
 
 export async function spawnProducer(
@@ -150,10 +156,25 @@ export async function spawnProducer(
     HOST_COUNT: String(opts.hostCount ?? 4),
     VARIABILITY: String(opts.variability ?? 0.4),
   };
+  const impl =
+    opts.impl ?? (process.env.PRODUCER_IMPL === 'rust' ? 'rust' : 'node');
+  const rustBin = resolvePath(
+    repoRoot,
+    'packages/producer-rs/target/release/producer-rs',
+  );
+  if (impl === 'rust' && !existsSync(rustBin)) {
+    throw new Error(
+      `Rust producer not built: run \`cargo build --release\` in packages/producer-rs (needs protoc). Expected ${rustBin}`,
+    );
+  }
   const { child, pid } = await spawnReady({
-    cwd: resolvePath(repoRoot, 'packages/producer'),
+    cwd: resolvePath(
+      repoRoot,
+      impl === 'rust' ? 'packages/producer-rs' : 'packages/producer',
+    ),
     env,
     readyMatch: /producer listening on/,
+    command: impl === 'rust' ? rustBin : undefined,
   });
   return { pid, stop: stopper(child) };
 }
@@ -176,7 +197,8 @@ export async function spawnAggregator(
     AGGREGATOR_PORT: String(opts.httpPort),
     PRODUCER_URL: opts.producerUrl,
   };
-  const impl = opts.impl ?? (process.env.AGGREGATOR_IMPL === 'rust' ? 'rust' : 'node');
+  const impl =
+    opts.impl ?? (process.env.AGGREGATOR_IMPL === 'rust' ? 'rust' : 'node');
   const rustBin = resolvePath(
     repoRoot,
     'packages/aggregator-rs/target/release/aggregator-rs',

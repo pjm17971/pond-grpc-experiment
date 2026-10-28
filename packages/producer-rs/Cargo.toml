@@ -1,0 +1,15 @@
+[package]
+name = "producer-rs"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Rust producer for the gRPC experiment: same simulator and gRPC stream as packages/producer, fast enough to load the aggregators past the Node producer's ceiling."
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio-stream = "0.1"
+tonic = "0.12"
+prost = "0.13"
+
+[build-dependencies]
+tonic-build = "0.12"
