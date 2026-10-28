@@ -1,4 +1,4 @@
-import { writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -65,6 +65,12 @@ type Result = {
    * attached, so it only means "delivered" while the probe is up.
    */
   probeMbPerSec: number;
+  /**
+   * CPU the aggregator used over the measurement, in cores (1.0 = one
+   * core busy the whole time), summed over its process group. -1 where
+   * `/proc` isn't available (macOS).
+   */
+  aggCpuCores: number;
   probeConnected: boolean;
   latencyP50: number;
   latencyP95: number;
@@ -127,6 +133,7 @@ async function runConfig(
     const producerBaseline = await fetchProducerMetrics(
       producerMetricsPort,
     ).catch(() => null);
+    const cpuStart = groupCpuSec(aggregator.pid);
     const baseline = await fetchMetrics(httpPort);
     const samples: MetricsSnapshot[] = [baseline];
     const startedAt = Date.now();
@@ -139,6 +146,7 @@ async function runConfig(
       }
     }
     const final = samples[samples.length - 1];
+    const cpuEnd = groupCpuSec(aggregator.pid);
     const producerFinal = await fetchProducerMetrics(
       producerMetricsPort,
     ).catch(() => null);
@@ -188,6 +196,10 @@ async function runConfig(
       targetTotalRate: cfg.P * cfg.N,
       achievedTotalRate: Math.round(achievedTotalRate),
       droppedTotalRate: Math.round(droppedTotalRate),
+      aggCpuCores:
+        cpuStart < 0 || cpuEnd < 0 || elapsedSec <= 0
+          ? -1
+          : (cpuEnd - cpuStart) / elapsedSec,
       probeMbPerSec:
         elapsedSec > 0 ? probeBytes / 1024 / 1024 / elapsedSec : 0,
       probeConnected,
@@ -221,6 +233,34 @@ async function fetchMetrics(port: number): Promise<MetricsSnapshot> {
   return (await r.json()) as MetricsSnapshot;
 }
 
+/**
+ * User + system CPU seconds of every process in group `pgid` (the
+ * aggregator is spawned detached, so tsx and the node it starts share
+ * one group). -1 without `/proc`.
+ */
+function groupCpuSec(pgid: number): number {
+  let ticks = 0;
+  try {
+    for (const name of readdirSync('/proc')) {
+      if (!/^\d+$/.test(name)) continue;
+      let stat: string;
+      try {
+        stat = readFileSync(`/proc/${name}/stat`, 'utf8');
+      } catch {
+        continue; // exited meanwhile
+      }
+      // Fields after the ")" that closes the command name: state ppid
+      // pgrp ... utime (14th field overall) stime (15th).
+      const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      if (Number(f[2]) !== pgid) continue;
+      ticks += Number(f[11]) + Number(f[12]);
+    }
+  } catch {
+    return -1;
+  }
+  return ticks / 100; // USER_HZ is 100 on Linux
+}
+
 type ProducerMetrics = { uptimeSec: number; droppedRows: number };
 
 async function fetchProducerMetrics(port: number): Promise<ProducerMetrics> {
@@ -234,8 +274,8 @@ function sleep(ms: number): Promise<void> {
 }
 
 const TABLE_HEADER = [
-  '| P | N | Target/s | Achieved/s | Dropped/s | e2e p99 ms | pushMany p99 | fanout record p99 | fanout serialize p99 | fanout send p99 | GC major | GC minor | Heap peak | Avg batch | Residual | Probe MB/s |',
-  '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+  '| P | N | Target/s | Achieved/s | Dropped/s | Agg CPU cores | e2e p99 ms | pushMany p99 | fanout record p99 | fanout serialize p99 | fanout send p99 | GC major | GC minor | Heap peak | Avg batch | Residual | Probe MB/s |',
+  '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
 ].join('\n');
 
 function formatRow(r: Result): string {
@@ -246,6 +286,7 @@ function formatRow(r: Result): string {
     num(r.targetTotalRate),
     num(r.achievedTotalRate),
     r.droppedTotalRate < 0 ? 'n/a' : num(r.droppedTotalRate),
+    r.aggCpuCores < 0 ? 'n/a' : r.aggCpuCores.toFixed(2),
     r.latencyP99.toFixed(2),
     r.pushManyTotalP99.toFixed(2),
     r.fanoutRecordP99.toFixed(2),
@@ -290,6 +331,7 @@ async function main(): Promise<void> {
           achievedTotalRate: -1,
           droppedTotalRate: -1,
           probeMbPerSec: 0,
+          aggCpuCores: -1,
           probeConnected: false,
           latencyP50: 0,
           latencyP95: 0,
