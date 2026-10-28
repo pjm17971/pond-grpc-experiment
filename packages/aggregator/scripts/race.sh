@@ -23,7 +23,7 @@ for round in $(seq 1 "$rounds"); do
         echo "| $agg $row"
       else
         echo "| $agg | $P | $N | FAILED |"
-        tail -5 <<<"$out" | sed 's/^/#   /' >&2
+        tail -5 <<<"$out" | sed 's/^/#   /'
       fi
     done
   done

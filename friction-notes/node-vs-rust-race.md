@@ -41,17 +41,23 @@ Columns:
 - **Peak MB**: for Node the JS heap, for Rust the whole process (RSS),
   so Node's real footprint is higher than shown.
 - One Node run (10 × 10, round 2) printed no result; two re-runs of
-  that config gave 100 / 100 rows/s, 0.03 cores, 1.6–2.3 ms p99.
-  `race.sh` now prints the tail of a failed run's output.
+  that config, run by hand and not in the saved log, gave 100 / 100
+  rows/s, 0.03 cores, 1.6–2.3 ms p99. `race.sh` now prints the tail
+  of a failed run's output into the same log as the rows.
+- CPU includes every thread (Node's GC and I/O threads too) and, for
+  Node, the idle `tsx` launcher. So Node's 0.82–0.99 is not proof its
+  main thread is pegged.
 
 ## What it says
 
-- **Up to 10k rows/s both keep up.** Rust does it on 3–7x less CPU
-  (10 × 1000: 0.13 vs 0.73–0.75 cores; 1000 × 10: 0.05 vs 0.31–0.34)
-  and a quarter or less of the memory (even comparing Node's JS heap
-  with Rust's whole process).
-- **Node tops out at ~34–35k rows/s.** At every 100k config it is at
-  one core (0.82–0.99) and drops ~65% of the stream. Rust takes all
+- **Up to 10k rows/s both keep up.** Where the readings are big
+  enough to compare, Rust uses 3–7x less CPU (10 × 1000: 0.13 vs
+  0.73–0.75 cores; 1000 × 10: 0.05 vs 0.31–0.34); at the smallest
+  loads both round to 0.01–0.06. Rust uses roughly a quarter to
+  two-fifths of the memory (e.g. 1000 × 1: 30 vs 77–83 MB), even
+  comparing Node's JS heap with Rust's whole process.
+- **Node tops out at ~34–35k rows/s.** At every 100k config it uses
+  0.82–0.99 cores and drops ~65% of the stream. Rust takes all
   100k on 0.29–0.44 cores.
 - **At 1M rows/s Rust takes 232–237k** on one core (1.04) and drops
   the rest. Its ingest runs on a single thread (gRPC read,
@@ -59,7 +65,8 @@ Columns:
   sampled earlier, see `rust-producer.md`), so that's its ceiling
   here: ~7x Node.
 - **Latency:** Rust's p99 is lower in most configs, about equal at
-  1000 × 1000 (both saturated). Not at 1000 × 100:
+  1000 × 1000, but there both are saturated and measure different
+  slices (Node's p99 covers ~3% of the stream, Rust's ~23%). Not at 1000 × 100:
   25–27 ms against Node's 7.6–14.7 ms, while Rust keeps up and Node
   drops 65% (so Node handles a third of the rows). I have not looked
   into where Rust's 26 ms goes; at 1000 hosts each 200 ms tick emits
@@ -67,7 +74,7 @@ Columns:
 
 On Peter's laptop (M1 Pro, main f80fd5d, before the bounded producer),
 1000 × 1000: Rust 434–564k rows/s, Node 109–127k. The ratio
-(~4–5x) is lower than here (~7x); I have not checked why.
+(3.4–5.2x) is lower than here (~7x); I have not checked why.
 
 ## Not covered
 
