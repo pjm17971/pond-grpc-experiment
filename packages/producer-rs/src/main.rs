@@ -3,7 +3,9 @@
 //! Same contract as `packages/producer` (Node): serves `Subscribe` on
 //! `events.proto` and sends one `EventBatch` per tick, one event per
 //! host. Env: `GRPC_PORT` (50051), `EVENTS_PER_SEC` (2, per host),
-//! `HOST_COUNT` (4), `VARIABILITY` (0.4).
+//! `HOST_COUNT` (4), `VARIABILITY` (0.4), `METRICS_PORT` (unset: off;
+//! else `GET /metrics` serves the counters in `Counters` as JSON, same
+//! shape as the Node producer).
 //!
 //! Why it exists: the Node producer is one JS thread and tops out near
 //! 370k events/s in the cloud container (measured at 1000 hosts ×
@@ -14,20 +16,28 @@
 //! - Ticks keep to the target rate: a late tick is made up (tokio
 //!   `MissedTickBehavior::Burst`), where Node's `setInterval` drifts
 //!   and also cannot go below 1 ms (so Node caps at 1000 ticks/s).
-//! - The simulator runs once per tick and each subscriber gets a copy
-//!   through its own unbounded queue, like Node's `call.write` with
-//!   backpressure ignored. A subscriber slower than the producer (the
-//!   Node aggregator at high load) makes that queue grow here.
+//! - The simulator runs once per tick and every subscriber reads it from
+//!   one bounded queue (`QUEUE_BATCHES`, 64 batches; a tokio broadcast
+//!   channel). gRPC only takes the next batch when HTTP/2 flow control
+//!   lets it send, so a subscriber slower than the producer falls behind
+//!   in the queue; once it is 64 batches behind, its oldest unsent
+//!   batches are dropped (it skips ahead) rather than stalling the
+//!   producer or the other subscribers. Drops are counted.
 //! - With nobody subscribed the simulator does not run; its walk clock
 //!   restarts when a subscriber arrives (`Simulator::resume`).
 
 mod sim;
 
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::{TcpListenerStream, UnboundedReceiverStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::wrappers::{BroadcastStream, TcpListenerStream};
+use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
 pub mod proto {
@@ -37,23 +47,51 @@ pub mod proto {
 use proto::producer_server::{Producer, ProducerServer};
 use proto::{EventBatch, SubscribeRequest};
 
-type Subscribers = Arc<Mutex<Vec<mpsc::UnboundedSender<Result<EventBatch, Status>>>>>;
+/// Batches a subscriber may fall behind before its oldest are dropped.
+const QUEUE_BATCHES: usize = 64;
+
+/// Producer counters (`/metrics`).
+#[derive(Default)]
+struct Counters {
+    batches_produced: AtomicU64,
+    rows_produced: AtomicU64,
+    /// Summed over subscribers: a batch dropped for two slow subscribers
+    /// counts twice.
+    dropped_batches: AtomicU64,
+    dropped_rows: AtomicU64,
+}
 
 struct Service {
-    subscribers: Subscribers,
+    tx: broadcast::Sender<EventBatch>,
+    counters: Arc<Counters>,
+    rows_per_batch: u64,
 }
+
+type BatchStream = Pin<Box<dyn Stream<Item = Result<EventBatch, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl Producer for Service {
-    type SubscribeStream = UnboundedReceiverStream<Result<EventBatch, Status>>;
+    type SubscribeStream = BatchStream;
 
     async fn subscribe(
         &self,
         _req: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.subscribers.lock().unwrap().push(tx);
-        Ok(Response::new(UnboundedReceiverStream::new(rx)))
+        let counters = Arc::clone(&self.counters);
+        let rows_per_batch = self.rows_per_batch;
+        // `Lagged(n)`: this subscriber fell more than QUEUE_BATCHES behind
+        // and the oldest n batches it had not taken are gone.
+        let stream = BroadcastStream::new(self.tx.subscribe()).filter_map(move |item| match item {
+            Ok(batch) => Some(Ok(batch)),
+            Err(BroadcastStreamRecvError::Lagged(n)) => {
+                counters.dropped_batches.fetch_add(n, Ordering::Relaxed);
+                counters
+                    .dropped_rows
+                    .fetch_add(n * rows_per_batch, Ordering::Relaxed);
+                None
+            }
+        });
+        Ok(Response::new(Box::pin(stream)))
     }
 }
 
@@ -82,13 +120,28 @@ async fn main() {
     let host_count: usize = env("HOST_COUNT", 4);
     let variability: f64 = env("VARIABILITY", 0.4);
 
-    let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
+    let (tx, _) = broadcast::channel(QUEUE_BATCHES);
+    let counters = Arc::new(Counters::default());
     tokio::spawn(run_simulator(
-        subscribers.clone(),
+        tx.clone(),
+        Arc::clone(&counters),
         events_per_sec,
         host_count,
         variability,
     ));
+    let metrics_port: Option<u16> = std::env::var("METRICS_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    if let Some(mp) = metrics_port {
+        let listener = match tokio::net::TcpListener::bind(("0.0.0.0", mp)).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("bind metrics :{mp} failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        tokio::spawn(serve_metrics(listener, tx.clone(), Arc::clone(&counters)));
+    }
 
     // Bind first, so the ready line below means the port is ours (as
     // Node prints only after `bindAsync` succeeds).
@@ -100,7 +153,11 @@ async fn main() {
         }
     };
     let server = tonic::transport::Server::builder()
-        .add_service(ProducerServer::new(Service { subscribers }))
+        .add_service(ProducerServer::new(Service {
+            tx,
+            counters,
+            rows_per_batch: host_count as u64,
+        }))
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
             let _ = tokio::signal::ctrl_c().await;
         });
@@ -111,8 +168,48 @@ async fn main() {
     server.await.expect("gRPC server");
 }
 
+/// A bare-bones HTTP server for `GET /metrics` (any path answers): the
+/// bench scrapes it once a second, so no framework.
+async fn serve_metrics(
+    listener: tokio::net::TcpListener,
+    tx: broadcast::Sender<EventBatch>,
+    counters: Arc<Counters>,
+) {
+    let started = Instant::now();
+    loop {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            // e.g. out of file handles: back off rather than spin.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        let body = format!(
+            "{{\"uptimeSec\":{},\"subscribers\":{},\"queueBatches\":{},\"batchesProduced\":{},\"rowsProduced\":{},\"droppedBatches\":{},\"droppedRows\":{}}}",
+            started.elapsed().as_secs_f64(),
+            tx.receiver_count(),
+            QUEUE_BATCHES,
+            counters.batches_produced.load(Ordering::Relaxed),
+            counters.rows_produced.load(Ordering::Relaxed),
+            counters.dropped_batches.load(Ordering::Relaxed),
+            counters.dropped_rows.load(Ordering::Relaxed),
+        );
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            // The request itself is ignored; don't wait on it for long.
+            let _ = tokio::time::timeout(Duration::from_secs(1), sock.read(&mut buf)).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+    }
+}
+
 async fn run_simulator(
-    subs: Subscribers,
+    tx: broadcast::Sender<EventBatch>,
+    counters: Arc<Counters>,
     events_per_sec: f64,
     host_count: usize,
     variability: f64,
@@ -128,10 +225,7 @@ async fn run_simulator(
     let mut idle = true;
     loop {
         every.tick().await;
-        let mut list = subs.lock().unwrap();
-        // Drop subscribers whose stream has closed.
-        list.retain(|tx| !tx.is_closed());
-        if list.is_empty() {
+        if tx.receiver_count() == 0 {
             // Node runs the simulator with nobody listening; skipping it
             // saves the CPU, and `resume` below hides the gap.
             idle = true;
@@ -143,11 +237,11 @@ async fn run_simulator(
             idle = false;
         }
         let batch = sim.tick(now);
-        if let Some((last, rest)) = list.split_last() {
-            for tx in rest {
-                let _ = tx.send(Ok(batch.clone()));
-            }
-            let _ = last.send(Ok(batch));
-        }
+        counters.batches_produced.fetch_add(1, Ordering::Relaxed);
+        counters
+            .rows_produced
+            .fetch_add(batch.events.len() as u64, Ordering::Relaxed);
+        // Never blocks: a full queue overwrites the oldest batch.
+        let _ = tx.send(batch);
     }
 }

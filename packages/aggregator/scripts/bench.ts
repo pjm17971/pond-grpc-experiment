@@ -52,6 +52,13 @@ type Result = {
   targetTotalRate: number;
   achievedTotalRate: number;
   /**
+   * Rows/s the producer dropped because the aggregator fell 64 batches
+   * behind (producer `/metrics`). Before the producers had a bounded
+   * queue this showed up nowhere: the backlog just grew. -1 (shown as
+   * n/a) when the producer has no `/metrics`.
+   */
+  droppedTotalRate: number;
+  /**
    * WebSocket bytes/sec the probe actually received in the window, and
    * whether it was still connected at the end. `Achieved/s` counts
    * server-side fan-out calls, which keep rising with no client
@@ -85,6 +92,7 @@ async function runConfig(
 ): Promise<Result> {
   const grpcPort = await allocatePort();
   const httpPort = await allocatePort();
+  const producerMetricsPort = await allocatePort();
   let producer: SpawnedProcess | undefined;
   let aggregator: SpawnedProcess | undefined;
   let probe: WebSocket | undefined;
@@ -94,6 +102,7 @@ async function runConfig(
       grpcPort,
       eventsPerSec: cfg.N,
       hostCount: cfg.P,
+      metricsPort: producerMetricsPort,
     });
     aggregator = await spawnAggregator({
       httpPort,
@@ -114,6 +123,10 @@ async function runConfig(
       probeBytes += data.length;
     });
 
+    // null: a producer without `/metrics` (an older build).
+    const producerBaseline = await fetchProducerMetrics(
+      producerMetricsPort,
+    ).catch(() => null);
     const baseline = await fetchMetrics(httpPort);
     const samples: MetricsSnapshot[] = [baseline];
     const startedAt = Date.now();
@@ -126,6 +139,18 @@ async function runConfig(
       }
     }
     const final = samples[samples.length - 1];
+    const producerFinal = await fetchProducerMetrics(
+      producerMetricsPort,
+    ).catch(() => null);
+    const producerSec =
+      producerBaseline && producerFinal
+        ? producerFinal.uptimeSec - producerBaseline.uptimeSec
+        : 0;
+    const droppedTotalRate =
+      producerBaseline && producerFinal && producerSec > 0
+        ? (producerFinal.droppedRows - producerBaseline.droppedRows) /
+          producerSec
+        : -1;
     const probeConnected =
       probe.readyState === WebSocket.OPEN && final.ws.clientCount >= 1;
     if (!probeConnected) {
@@ -162,6 +187,7 @@ async function runConfig(
       N: cfg.N,
       targetTotalRate: cfg.P * cfg.N,
       achievedTotalRate: Math.round(achievedTotalRate),
+      droppedTotalRate: Math.round(droppedTotalRate),
       probeMbPerSec:
         elapsedSec > 0 ? probeBytes / 1024 / 1024 / elapsedSec : 0,
       probeConnected,
@@ -195,13 +221,21 @@ async function fetchMetrics(port: number): Promise<MetricsSnapshot> {
   return (await r.json()) as MetricsSnapshot;
 }
 
+type ProducerMetrics = { uptimeSec: number; droppedRows: number };
+
+async function fetchProducerMetrics(port: number): Promise<ProducerMetrics> {
+  const r = await fetch(`http://127.0.0.1:${port}/metrics`);
+  if (!r.ok) throw new Error(`producer /metrics returned ${r.status}`);
+  return (await r.json()) as ProducerMetrics;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 const TABLE_HEADER = [
-  '| P | N | Target/s | Achieved/s | e2e p99 ms | pushMany p99 | fanout record p99 | fanout serialize p99 | fanout send p99 | GC major | GC minor | Heap peak | Avg batch | Residual | Probe MB/s |',
-  '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+  '| P | N | Target/s | Achieved/s | Dropped/s | e2e p99 ms | pushMany p99 | fanout record p99 | fanout serialize p99 | fanout send p99 | GC major | GC minor | Heap peak | Avg batch | Residual | Probe MB/s |',
+  '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
 ].join('\n');
 
 function formatRow(r: Result): string {
@@ -211,6 +245,7 @@ function formatRow(r: Result): string {
     `${r.N}`,
     num(r.targetTotalRate),
     num(r.achievedTotalRate),
+    r.droppedTotalRate < 0 ? 'n/a' : num(r.droppedTotalRate),
     r.latencyP99.toFixed(2),
     r.pushManyTotalP99.toFixed(2),
     r.fanoutRecordP99.toFixed(2),
@@ -253,6 +288,7 @@ async function main(): Promise<void> {
           N: cfg.N,
           targetTotalRate: cfg.P * cfg.N,
           achievedTotalRate: -1,
+          droppedTotalRate: -1,
           probeMbPerSec: 0,
           probeConnected: false,
           latencyP50: 0,

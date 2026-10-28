@@ -1,4 +1,8 @@
-import { Server, ServerCredentials, type ServerWritableStream } from '@grpc/grpc-js';
+import {
+  Server,
+  ServerCredentials,
+  type ServerWritableStream,
+} from '@grpc/grpc-js';
 import {
   ProducerService,
   type EventBatch,
@@ -15,6 +19,14 @@ export type GrpcServerOptions = {
    * function that the server invokes on stream end / cancel / error.
    */
   onSubscribe: (write: (batch: EventBatch) => void) => () => void;
+  /**
+   * Batches a subscriber may fall behind before its oldest are dropped
+   * (default 64). Counted on top of what grpc-js itself buffers (its
+   * stream's `highWaterMark`, 16 objects).
+   */
+  queueBatches?: number;
+  /** Called with each batch dropped for a slow subscriber. */
+  onDrop?: (batch: EventBatch) => void;
 };
 
 export type RunningGrpcServer = {
@@ -33,14 +45,11 @@ export async function startGrpcServer(
 
   const impl: ProducerServer = {
     subscribe(call: ServerWritableStream<SubscribeRequest, EventBatch>) {
-      const unsubscribe = opts.onSubscribe((batch) => {
-        // ServerWritableStream.write returns a boolean for backpressure
-        // signalling. v1 ignores it — slow-client policy is M4. The
-        // stream's internal queue absorbs short bursts.
-        call.write(batch);
-      });
+      const writer = boundedWriter(call, opts.queueBatches ?? 64, opts.onDrop);
+      const unsubscribe = opts.onSubscribe(writer.write);
       const cleanup = () => {
         unsubscribe();
+        writer.close();
       };
       call.on('cancelled', cleanup);
       call.on('close', cleanup);
@@ -70,4 +79,54 @@ export async function startGrpcServer(
         });
       }),
   };
+}
+
+/**
+ * A writer that honours the stream's backpressure. `call.write` returns
+ * false once grpc-js's own buffer is full, which happens when HTTP/2
+ * flow control stops it sending (the subscriber is not reading fast
+ * enough). From then until `'drain'` batches wait in a queue of at most
+ * `max`; past that the oldest waiting batch is dropped, so a slow
+ * subscriber never stalls the simulator or the other subscribers.
+ * `close` (stream ended) empties the queue and stops any later flush.
+ */
+export function boundedWriter(
+  call: {
+    write: (b: EventBatch) => boolean;
+    once: (e: 'drain', f: () => void) => unknown;
+  },
+  max: number,
+  onDrop?: (batch: EventBatch) => void,
+): { write: (batch: EventBatch) => void; close: () => void } {
+  const queue: EventBatch[] = [];
+  let blocked = false;
+  let closed = false;
+  const flush = () => {
+    if (closed) return;
+    blocked = false;
+    while (queue.length > 0) {
+      if (!call.write(queue.shift()!)) {
+        blocked = true;
+        call.once('drain', flush);
+        return;
+      }
+    }
+  };
+  const write = (batch: EventBatch) => {
+    if (closed) return;
+    if (blocked) {
+      queue.push(batch);
+      if (queue.length > max) onDrop?.(queue.shift()!);
+      return;
+    }
+    if (!call.write(batch)) {
+      blocked = true;
+      call.once('drain', flush);
+    }
+  };
+  const close = () => {
+    closed = true;
+    queue.length = 0;
+  };
+  return { write, close };
 }

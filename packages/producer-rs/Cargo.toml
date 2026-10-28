@@ -6,8 +6,8 @@ publish = false
 description = "Rust producer for the gRPC experiment: same simulator and gRPC stream as packages/producer, fast enough to load the aggregators past the Node producer's ceiling."
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
-tokio-stream = { version = "0.1", features = ["net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "io-util", "net"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tonic = "0.12"
 prost = "0.13"
 
