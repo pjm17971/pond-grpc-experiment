@@ -122,6 +122,8 @@ mod tests {
         assert!(f.contains("0.25,3,"));
     }
 
+    /// The production schema requires `cpu`, so a gap never reaches the
+    /// writer there; this pins the writer itself (pond-ts `toJsonRow`).
     #[test]
     fn gap_is_null() {
         let f = append_frame(&events(vec![(1, f64::NAN, 1.0, "h")]));

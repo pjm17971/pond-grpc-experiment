@@ -167,21 +167,31 @@ fn on_batch(app: &App, batch: proto::EventBatch) {
     app.metrics.record_ingest(n);
 
     let started = Instant::now();
-    let rows = batch.events.into_iter().map(|e| {
-        let values: Vec<Option<Value>> = vec![
-            Some(Value::Number(e.cpu)),
-            Some(Value::Number(e.requests as f64)),
-            Some(Value::String(e.host)),
-        ];
-        (e.time_ms, values)
-    });
+    // Build the rows before taking the lock.
+    let rows: Vec<(i64, Vec<Option<Value>>)> = batch
+        .events
+        .into_iter()
+        .map(|e| {
+            let values = vec![
+                Some(Value::Number(e.cpu)),
+                Some(Value::Number(e.requests as f64)),
+                Some(Value::String(e.host)),
+            ];
+            (e.time_ms, values)
+        })
+        .collect();
     let frame = {
         let mut inner = app.inner.lock().unwrap();
         let out = match inner.live.push_many(rows) {
             Ok(out) => out,
             Err(e) => {
-                // Strict ordering refuses the whole batch, as pond-ts.
-                eprintln!("push_many refused a batch of {n}: {e}");
+                // Strict order and required columns refuse the whole
+                // batch, as pond-ts does (Node's pushMany throws). A
+                // non-finite cpu counts as a missing value. Counted in
+                // /metrics; only the first refusal is logged.
+                if app.metrics.batch_refused() == 1 {
+                    eprintln!("push_many refused a batch of {n}: {e} (further refusals counted in /metrics only)");
+                }
                 return;
             }
         };
@@ -251,7 +261,35 @@ async fn metrics_handler(State(app): State<Arc<App>>) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::backoff_ms;
+    use super::{backoff_ms, new_live};
+    use pond_rs::Value;
+
+    fn row(t: i64, cpu: f64) -> (i64, Vec<Option<Value>>) {
+        (
+            t,
+            vec![
+                Some(Value::Number(cpu)),
+                Some(Value::Number(1.0)),
+                Some(Value::String("h".into())),
+            ],
+        )
+    }
+
+    /// The production window refuses a whole batch with a non-finite
+    /// cpu or an out-of-order row, as pond-ts does, and keeps what it had.
+    #[test]
+    fn window_refuses_bad_batches_whole() {
+        let mut live = new_live();
+        live.push_many(vec![row(1_000, 0.5)]).unwrap();
+        assert!(live
+            .push_many(vec![row(2_000, 0.5), row(3_000, f64::NAN)])
+            .is_err());
+        assert!(live.push_many(vec![row(4_000, f64::INFINITY)]).is_err());
+        assert!(live
+            .push_many(vec![row(5_000, 0.5), row(500, 0.5)])
+            .is_err());
+        assert_eq!(live.len(), 1);
+    }
 
     #[test]
     fn backoff_matches_node_defaults() {

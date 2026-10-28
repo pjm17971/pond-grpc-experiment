@@ -5,7 +5,8 @@
 //! always `{}`; `memory.heapUsed` and `memory.rss` both report the
 //! process resident size (RSS), so the bench's "heap peak" column is
 //! Node's JS heap against Rust's whole-process RSS. Extra:
-//! `ws.clientsDropped`, clients cut off for falling behind.
+//! `ws.clientsDropped`, clients cut off for falling behind, and
+//! `pushMany.refusedBatches`, batches the window refused.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -60,6 +61,7 @@ pub struct Metrics {
     push_calls: AtomicU64,
     push_events: AtomicU64,
     push_max: AtomicUsize,
+    push_refused: AtomicU64,
     window_len: AtomicUsize,
     clients: AtomicUsize,
     clients_dropped: AtomicU64,
@@ -79,6 +81,7 @@ impl Metrics {
             push_calls: AtomicU64::new(0),
             push_events: AtomicU64::new(0),
             push_max: AtomicUsize::new(0),
+            push_refused: AtomicU64::new(0),
             window_len: AtomicUsize::new(0),
             clients: AtomicUsize::new(0),
             clients_dropped: AtomicU64::new(0),
@@ -98,6 +101,11 @@ impl Metrics {
         self.push_events.fetch_add(n as u64, Ordering::Relaxed);
         self.push_max.fetch_max(n, Ordering::Relaxed);
         self.push_total.add(took);
+    }
+
+    /// Counts a batch `push_many` refused; returns the new total.
+    pub fn batch_refused(&self) -> u64 {
+        self.push_refused.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     pub fn record_fanout(&self, n: usize, bytes: usize, since_arrival: Duration) {
@@ -142,6 +150,7 @@ impl Metrics {
                 "totalEvents": events,
                 "avgBatchSize": if calls == 0 { 0.0 } else { events as f64 / calls as f64 },
                 "maxBatchSize": self.push_max.load(Ordering::Relaxed),
+                "refusedBatches": self.push_refused.load(Ordering::Relaxed),
             },
             "liveSeriesLength": self.window_len.load(Ordering::Relaxed),
             "arrivalQueueLength": 0,

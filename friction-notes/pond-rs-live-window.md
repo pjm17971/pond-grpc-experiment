@@ -5,8 +5,9 @@ plain `VecDeque` of gRPC events to a pond-rs `LiveSeries` (R3 step 2,
 pond-ts/pond #839, rev `3792442`). Same schema and retention as the
 Node side (`maxAge: '30s'`, strict order).
 
-**Result: same throughput, about 2x slower `push_many` p99, and 3.7x
-the memory.** The memory is the finding worth acting on.
+**Result: same throughput, a slower batch handler (p99 1.7–2.6x at
+1000 × 1000, 9–14x at 100 × 1000 where it is under 1.3 ms either way),
+and 3.7x the memory.** The memory is the finding worth acting on.
 
 ## Bench (20 s, alternated, same batch)
 
@@ -32,8 +33,10 @@ serialize, broadcast.
 ## Why the memory
 
 At 1000 × 1000 the window holds about 345k × 30 ≈ 10.3M rows:
-2,539 MB / 10.3M ≈ **250 bytes per row** in pond-rs, against
-691 MB / 10.3M ≈ 67 bytes in the queue.
+2,539 MB / 10.3M ≈ 250 bytes per row in pond-rs, against
+691 MB / 10.3M ≈ 67 bytes in the queue. Both are peak process memory
+over rows, so they include fixed costs; the difference, **about 180
+bytes per row**, is the cleaner number.
 
 pond-rs R3 step 2 stores each event as its own heap object
 (`LiveEvent` = `Arc<EventData { key, values: Vec<Option<Value>> }>`).
@@ -46,6 +49,15 @@ i64, `String`).
 pond-rs #839 already notes a column store as the fix for its
 `push_many` cost; this is the same cause showing up as memory. Passed to
 the pond-rs live-layer thread as friction.
+
+## Behaviour change: bad batches
+
+The queue wrote a non-finite `cpu` as `null`. The `LiveSeries` has
+`cpu` required (as the Node schema does), and pond-rs reads NaN/±Inf
+as missing, so such a batch is refused whole and sends no append frame.
+Node does the same (its `pushMany` throws). The simulator never sends
+one. Refusals are counted in `/metrics` as `pushMany.refusedBatches`;
+only the first is logged.
 
 ## Other friction
 
