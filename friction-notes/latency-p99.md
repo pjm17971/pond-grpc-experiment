@@ -22,8 +22,8 @@ Both report `latency.ingestToFanoutMs`, kept in a ring of the last
 
 So Node's number is the latency of roughly the one batch before the
 final scrape, with the slow parts left out. Rust's is a real p99 over
-10 s that includes the slow parts. That's also why Node's figure
-jumps around: in today's re-run it read 386–532 ms.
+10 s that includes the slow parts. In today's re-run Node's old figure
+read 386–532 ms (7.6–14.7 ms in the race); I have not looked into why.
 
 ## Same rule for both: `batchDoneMs`
 
@@ -32,7 +32,20 @@ New metric in both aggregators, new `Batch done p50 / p99` columns in
 work the batch causes (`/live` frame sent, and any `/live-agg` tick
 built and sent). One sample per batch. Node stops the clock in a
 microtask queued after `pushMany`, which runs after the aggregator's
-own tick microtask.
+own tick microtask (grpc-js hands over the next message with
+`process.nextTick`, after the microtasks drain).
+
+Same end point, not quite the same work:
+
+- `bench:dev` only connects a `/live` client. With no `/live-agg`
+  client, Node builds no tick JSON; Rust always builds the full tick
+  frame (~2.5 ms on a tick batch). This counts against Rust.
+- "Sent" for Rust means handed to a channel; the socket writes happen
+  on other tasks. Node's `ws.send` to the probe runs inside the timed
+  window. This counts against Node, but is small.
+- Neither counts time a batch waits before its callback runs. For an
+  overloaded Node (dropping rows) the latency a reader sees is worse
+  than `batchDoneMs`.
 
 1000 × 100, Rust producer, 30 s, two rounds alternating (cloud
 container, 4 cores; this machine was busier than during the race:
@@ -45,20 +58,29 @@ Rust used 0.71–0.72 cores here against 0.42–0.44 then):
 | Node | 28,629     | 71,505    | 1.08      | 22.06             | 65.52             | 386.12           |
 | Rust | 99,965     | 0         | 0.71      | 6.37              | 21.36             | 21.36            |
 
-Measured the same way, Rust's batches are about 3.5x faster at p50
-and 3x at p99, while it handles 3.5x the rows. `e2e p99` is left in
+Measured this way, Rust's batches are about 3.5x faster at p50 and
+3.1–3.6x at p99, while it handles 3.5x the rows. `e2e p99` is left in
 the table for history; use `Batch done` to compare the two.
 
 ## Where Rust's 21 ms p99 goes
 
-Split with temporary timers (not committed), live run, 1000 × 100:
+Split with temporary timers (not committed). Live run, 1000 × 100,
+whole batch:
 
-| Rust batch                                                | p50 ms  | p99 ms |
-| --------------------------------------------------------- | ------- | ------ |
-| Plain batch (19 of 20)                                    | 5.3–5.9 | 10–12  |
-| Batch that crosses a 200 ms tick (1 in 20)                | 15      | 25–29  |
-| of which `push_many`                                      | 4.7–6   | 12–15  |
-| of which building + sending the 1000-row `/live-agg` tick | 2.7     | 5–6    |
+| Rust batch                                 | p50 ms  | p99 ms |
+| ------------------------------------------ | ------- | ------ |
+| Plain batch (19 of 20)                     | 5.3–5.9 | 10–12  |
+| Batch that crosses a 200 ms tick (1 in 20) | 15      | 25–29  |
+
+Offline (same pipeline, synthetic 1000-row batches, no network, 60 s
+after a 31 s warm-up), by part:
+
+| Part                                      | Plain p50 | Tick p50 | Tick p99 |
+| ----------------------------------------- | --------- | -------- | -------- |
+| `push_many`                               | 5.4       | 10.6     | 16.9     |
+| reading the outputs (`observe_main`)      | 0.0       | 1.4      | 2.5      |
+| `/live` frame JSON                        | 0.5       | 0.5      | 1.2      |
+| `/live-agg` tick: group rows + frame JSON | –         | 2.5      | 4.8      |
 
 A batch arrives every 10 ms with 1000 rows. One in 20 crosses a
 200 ms tick, so 5% of batches carry the tick work; that sets the p99.
@@ -66,9 +88,8 @@ On a tick batch, `push_many` also emits 1000 per-host rolling rows
 (1 m and 200 ms windows), and the aggregator turns them into the
 `/live-agg` frame.
 
-Offline (same pipeline, synthetic batches, no network): `push_many`
-5.4 ms per plain 1000-row batch, 10.6 ms on a tick batch; the tick
-frame 2.5 ms. A callgrind profile of 200 batches shows no single hot
+The tick parts add up to ~15 ms, matching the live run. A callgrind
+profile of 200 batches shows no single hot
 spot. `push_many` is 63% of instructions; inside it, the per-host
 partitions take 38%, of which the per-host rolling is 23%.
 malloc/free is about a fifth of everything. Most of the rest is the
