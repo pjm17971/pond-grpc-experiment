@@ -54,6 +54,13 @@ function pct(sorted: ReadonlyArray<number>, p: number): number {
 const ingestToFanout = new Histogram();
 /** Wall-clock ms `live.pushMany(rows)` took, per call (includes pond's synchronous batch listener fire). */
 const pushManyTotalMs = new Histogram();
+/**
+ * Per gRPC batch: from the ingest callback to the end of all work the
+ * batch causes (the `/live` frame and any `/live-agg` tick, which is
+ * sent from a microtask after `pushMany`). One sample per batch, the
+ * same rule as the Rust aggregator, so the two compare directly.
+ */
+const batchDoneMs = new Histogram();
 /** Wall-clock ms spent in fanout's `recordFanout` loop, per pond batch. */
 const fanoutRecordMs = new Histogram();
 /** Wall-clock ms spent in `events.map(toJsonRow)` + `JSON.stringify`, per pond batch. */
@@ -186,6 +193,11 @@ export function recordPushMany(batchSize: number, totalMs: number): void {
   pushManyTotalMs.add(totalMs);
 }
 
+/** Called once per gRPC batch when all of its work is done. */
+export function recordBatchDone(ms: number): void {
+  batchDoneMs.add(ms);
+}
+
 /**
  * Called once per pond `'batch'` listener fire (inside `fanout.ts`).
  * Records how the listener's wall-clock budget breaks down across
@@ -235,6 +247,14 @@ export type MetricsSnapshot = {
   arrivalTimesDropped: number;
   latency: {
     ingestToFanoutMs:
+      | { p50: number; p95: number; p99: number; count: number }
+      | null;
+    /**
+     * Per gRPC batch, ingest callback to all of its work done (`/live`
+     * frame and any `/live-agg` tick). One sample per batch; the Rust
+     * aggregator reports the same thing.
+     */
+    batchDoneMs:
       | { p50: number; p95: number; p99: number; count: number }
       | null;
     /** Per-pushMany-call total, includes pond's synchronous batch listener. */
@@ -293,6 +313,7 @@ export function snapshot(args: {
     arrivalTimesDropped,
     latency: {
       ingestToFanoutMs: ingestToFanout.snapshot(),
+      batchDoneMs: batchDoneMs.snapshot(),
       pushManyTotalMs: pushManyTotalMs.snapshot(),
       fanoutRecordMs: fanoutRecordMs.snapshot(),
       fanoutSerializeMs: fanoutSerializeMs.snapshot(),

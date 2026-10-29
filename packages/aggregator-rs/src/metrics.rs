@@ -66,6 +66,7 @@ pub struct Metrics {
     clients: AtomicUsize,
     clients_dropped: AtomicU64,
     ingest_to_fanout: Histogram,
+    batch_done: Histogram,
     push_total: Histogram,
     pub fanout_serialize: Histogram,
     pub fanout_broadcast: Histogram,
@@ -86,6 +87,7 @@ impl Metrics {
             clients: AtomicUsize::new(0),
             clients_dropped: AtomicU64::new(0),
             ingest_to_fanout: Histogram::new(),
+            batch_done: Histogram::new(),
             push_total: Histogram::new(),
             fanout_serialize: Histogram::new(),
             fanout_broadcast: Histogram::new(),
@@ -114,6 +116,13 @@ impl Metrics {
         self.bytes_fanned_out
             .fetch_add(bytes as u64 * clients, Ordering::Relaxed);
         self.ingest_to_fanout.add(since_arrival);
+    }
+
+    /// Arrival to the end of all work a batch causes (`/live` frame and
+    /// any `/live-agg` tick); one sample per batch, as Node's
+    /// `batchDoneMs`.
+    pub fn record_batch_done(&self, took: Duration) {
+        self.batch_done.add(took);
     }
 
     pub fn set_window_len(&self, n: usize) {
@@ -157,6 +166,7 @@ impl Metrics {
             "arrivalTimesDropped": 0,
             "latency": {
                 "ingestToFanoutMs": self.ingest_to_fanout.snapshot(),
+                "batchDoneMs": self.batch_done.snapshot(),
                 "pushManyTotalMs": self.push_total.snapshot(),
                 "fanoutRecordMs": Value::Null,
                 "fanoutSerializeMs": self.fanout_serialize.snapshot(),

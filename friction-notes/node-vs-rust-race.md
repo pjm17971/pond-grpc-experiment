@@ -64,13 +64,10 @@ Columns:
   `push_many`, `/live-agg` and the `/live` frame under one lock;
   sampled earlier, see `rust-producer.md`), so that's its ceiling
   here: ~7x Node.
-- **Latency:** Rust's p99 is lower in most configs, about equal at
-  1000 × 1000, but there both are saturated and measure different
-  slices (Node's p99 covers ~3% of the stream, Rust's ~23%). Not at 1000 × 100:
-  25–27 ms against Node's 7.6–14.7 ms, while Rust keeps up and Node
-  drops 65% (so Node handles a third of the rows). I have not looked
-  into where Rust's 26 ms goes; at 1000 hosts each 200 ms tick emits
-  1000 rows.
+- **Latency:** the `e2e p99` column does not compare the two: Node
+  and Rust measure different things (see `latency-p99.md`). Measured
+  the same way at 1000 × 100, a batch takes Rust 6 ms (p50) / 21–22 ms
+  (p99) and Node 22 ms / 66–79 ms while dropping ~72%.
 
 On Peter's laptop (M1 Pro, main f80fd5d, before the bounded producer),
 1000 × 1000: Rust 434–564k rows/s, Node 109–127k. The ratio
@@ -82,4 +79,3 @@ On Peter's laptop (M1 Pro, main f80fd5d, before the bounded producer),
   under that between rows of this table mean little.
 - Only the producer's own pattern: every host sends every tick, in
   time order. No late data, no gaps, no reconnects.
-- Rust's 1000 × 100 p99 (above).

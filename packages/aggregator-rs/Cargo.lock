@@ -1194,7 +1194,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 [[package]]
 name = "pond-rs"
 version = "0.0.0"
-source = "git+https://github.com/pond-ts/pond?rev=db9fe1a59d7cf05d27d0c25eb7d9d0fb351d8e44#db9fe1a59d7cf05d27d0c25eb7d9d0fb351d8e44"
+source = "git+https://github.com/pond-ts/pond?rev=2adef386917f0a1571bc24af08392bb6c62dead7#2adef386917f0a1571bc24af08392bb6c62dead7"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
