@@ -3,7 +3,7 @@ name = "aggregator-rs"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "Rust aggregator for the gRPC experiment: gRPC in, WebSocket out. pond-rs live pipelines land here as pond-rs R3 steps merge."
+description = "Rust aggregator for the gRPC experiment: gRPC in, WebSocket out. Uses the pond-rs live layer."
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
@@ -14,8 +14,8 @@ futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 memory-stats = "1"
-# pond-rs live layer (R3 steps 2-7 + #852 per-event cuts, #853). Pinned; bump as pond-rs lands.
-pond-rs = { git = "https://github.com/pond-ts/pond", rev = "2adef386917f0a1571bc24af08392bb6c62dead7" }
+# pond-rs from crates.io; the live layer is behind the `live` feature.
+pond-rs = { version = "0.1", features = ["live"] }
 
 [build-dependencies]
 tonic-build = "0.12"
