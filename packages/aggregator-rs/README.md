@@ -15,7 +15,7 @@ AGGREGATOR_IMPL=rust pnpm --filter @pond-experiment/aggregator bench:dev --P=100
 Status: `/live` (raw snapshot + appends), `/live-agg` (per-host rolling
 stats every 200 ms, 5-minute snapshot, per-client top-N), `/health`,
 `/metrics`. The 30 s window behind `/live` is a pond-rs `LiveSeries`
-(pinned by git rev in `Cargo.toml`). `/live-agg` (`src/agg.rs`) runs
+(pond-rs 0.1 from crates.io). `/live-agg` (`src/agg.rs`) runs
 the same fused rolling as Node (1 m baseline + 200 ms slice, clock
 trigger) on pond-rs live partitions (`partition_by("host")`, optional
 per-host `sample`, `partition_rolling_windows`). Checked against Node
