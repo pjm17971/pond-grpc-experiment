@@ -85,6 +85,12 @@ type Result = {
   /** Average number of events per `live.pushMany(rows)` invocation. */
   pushManyAvgBatch: number;
   pushManyMaxBatch: number;
+  /**
+   * Per gRPC batch, arrival to all its work done (ms). Same rule in
+   * both aggregators; 0 for a build without `batchDoneMs`.
+   */
+  batchDoneP50: number;
+  batchDoneP99: number;
   /** Per-phase wall-clock breakdown at p99 (ms). */
   pushManyTotalP99: number;
   fanoutRecordP99: number;
@@ -215,6 +221,8 @@ async function runConfig(
       pushManyAvgBatch:
         pmCallsDelta === 0 ? 0 : pmEventsDelta / pmCallsDelta,
       pushManyMaxBatch: final.pushMany.maxBatchSize,
+      batchDoneP50: final.latency.batchDoneMs?.p50 ?? 0,
+      batchDoneP99: p99(final.latency.batchDoneMs),
       pushManyTotalP99: p99(final.latency.pushManyTotalMs),
       fanoutRecordP99: p99(final.latency.fanoutRecordMs),
       fanoutSerializeP99: p99(final.latency.fanoutSerializeMs),
@@ -274,8 +282,8 @@ function sleep(ms: number): Promise<void> {
 }
 
 const TABLE_HEADER = [
-  '| P | N | Target/s | Achieved/s | Dropped/s | Agg CPU cores | e2e p99 ms | pushMany p99 | fanout record p99 | fanout serialize p99 | fanout send p99 | GC major | GC minor | Heap peak | Avg batch | Residual | Probe MB/s |',
-  '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+  '| P | N | Target/s | Achieved/s | Dropped/s | Agg CPU cores | Batch done p50 | Batch done p99 | e2e p99 ms | pushMany p99 | fanout record p99 | fanout serialize p99 | fanout send p99 | GC major | GC minor | Heap peak | Avg batch | Residual | Probe MB/s |',
+  '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
 ].join('\n');
 
 function formatRow(r: Result): string {
@@ -287,6 +295,8 @@ function formatRow(r: Result): string {
     num(r.achievedTotalRate),
     r.droppedTotalRate < 0 ? 'n/a' : num(r.droppedTotalRate),
     r.aggCpuCores < 0 ? 'n/a' : r.aggCpuCores.toFixed(2),
+    r.batchDoneP50.toFixed(2),
+    r.batchDoneP99.toFixed(2),
     r.latencyP99.toFixed(2),
     r.pushManyTotalP99.toFixed(2),
     r.fanoutRecordP99.toFixed(2),
@@ -344,6 +354,8 @@ async function main(): Promise<void> {
           arrivalQueueResidual: -1,
           pushManyAvgBatch: 0,
           pushManyMaxBatch: 0,
+          batchDoneP50: 0,
+          batchDoneP99: 0,
           pushManyTotalP99: 0,
           fanoutRecordP99: 0,
           fanoutSerializeP99: 0,

@@ -272,6 +272,7 @@ fn on_batch(app: &App, batch: proto::EventBatch) {
         frame
     };
     app.metrics.push_many(n, started.elapsed());
+    app.metrics.record_batch_done(arrived.elapsed());
     if let Some(frame) = frame {
         app.metrics.record_fanout(n, frame.len(), arrived.elapsed());
     }

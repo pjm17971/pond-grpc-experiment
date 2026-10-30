@@ -4,7 +4,7 @@ import type { RowForSchema } from 'pond-ts/types';
 import { type LiveSeries } from 'pond-ts';
 import { backoff, type Schema } from '@pond-experiment/shared';
 import { ProducerClient, SubscribeRequest } from '@pond-experiment/shared/grpc';
-import { recordIngest, recordPushMany } from './metrics.js';
+import { recordBatchDone, recordIngest, recordPushMany } from './metrics.js';
 
 type IngestRow = RowForSchema<Schema>;
 
@@ -73,6 +73,7 @@ export function startIngest(
     let firstFrame = true;
 
     call.on('data', (batch) => {
+      const arrived = performance.now();
       if (firstFrame) {
         attempt = 0;
         firstFrame = false;
@@ -94,6 +95,9 @@ export function startIngest(
         live.pushMany(rows);
         const totalMs = performance.now() - t0;
         recordPushMany(rows.length, totalMs);
+        // The `/live-agg` tick goes out from a microtask queued during
+        // `pushMany`; this one runs after it.
+        queueMicrotask(() => recordBatchDone(performance.now() - arrived));
       }
     });
 
